@@ -1,6 +1,6 @@
 --[[
     Midnight UI Library
-    Version: 1.0.0
+    Version: 2.0.0
     Credits: Original implementation by OpenAI for this project.
     Date: 2026-09-27
     License: MIT
@@ -20,10 +20,11 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "1.0.0",
+    Version = "2.0.0",
     Flags = {},
     Windows = {},
     Visible = true,
+    ReducedMotion = false,
 }
 
 local WindowMethods = {}
@@ -36,6 +37,9 @@ local Runtime = nil
 local NotificationId = 0
 local ClipboardMemory = ""
 local ScrollLocks = {}
+local animate
+local cancelCapture
+local focusStyle
 
 local function report(context, message)
     warn("[Midnight UI] " .. context .. ": " .. tostring(message))
@@ -234,8 +238,8 @@ end
 
 local DefaultTheme = {
     Background = Color3.fromRGB(10, 14, 26),
-    Panel = Color3.fromRGB(17, 24, 39),
-    Raised = Color3.fromRGB(23, 32, 51),
+    Panel = Color3.fromRGB(16, 22, 36),
+    Raised = Color3.fromRGB(23, 31, 49),
     Border = Color3.fromRGB(30, 42, 69),
     Accent = Color3.fromRGB(74, 124, 255),
     Secondary = Color3.fromRGB(139, 92, 246),
@@ -330,7 +334,8 @@ local function textBox(scope, parent, placeholder, properties)
     color(scope, result, "BackgroundColor3", "Background")
     color(scope, result, "TextColor3", "Text")
     color(scope, result, "PlaceholderColor3", "Muted")
-    stroke(scope, result, "Border", 0.35)
+    local outline = stroke(scope, result, "Border", 0.68)
+    focusStyle(scope, result, outline)
     return result
 end
 
@@ -376,7 +381,7 @@ end
 
 -- 3. Centralized animation ----------------------------------------------------
 
-local function animate(scope, object, goals, duration)
+animate = function(scope, object, goals, duration)
     if not scope.Alive then
         return
     end
@@ -389,27 +394,48 @@ local function animate(scope, object, goals, duration)
         if channels[property] then
             channels[property]:Cancel()
         end
-        local tween = TweenService:Create(object, TweenInfo.new(
-            math.clamp(duration or 0.2, 0.15, 0.35),
-            Enum.EasingStyle.Quart,
-            Enum.EasingDirection.Out
-        ), { [property] = value })
-        channels[property] = tween
-        tween:Play()
+        if Midnight.ReducedMotion then
+            object[property] = value
+            channels[property] = nil
+        else
+            local tween = TweenService:Create(object, TweenInfo.new(
+                math.clamp(duration or 0.2, 0.15, 0.35),
+                Enum.EasingStyle.Quint,
+                Enum.EasingDirection.Out
+            ), { [property] = value })
+            channels[property] = tween
+            tween:Play()
+        end
     end
 end
 
-local function hover(scope, object, outline)
+-- Hover, press and focus states share the same animation owner.
+local function hover(scope, object, outline, settings)
+    settings = settings or {}
     local over = false
-    local function render()
+    local pressed = false
+    local function render(immediate)
         local theme = Midnight.Theme
-        animate(scope, object, {
-            BackgroundColor3 = over and theme.Raised or theme.Panel,
-        })
-        if outline then
-            animate(scope, outline, {
-                Transparency = over and 0.12 or 0.7,
-            })
+        local enabled = not settings.Enabled or settings.Enabled()
+        local active = enabled and (over or pressed)
+        local goals = {
+            BackgroundColor3 = active and theme.Raised or theme.Panel,
+        }
+        local edge = {
+            Color = active and theme[settings.Accent or "Accent"] or theme.Border,
+            Transparency = active and (pressed and 0.2 or 0.5) or 0.78,
+        }
+        if immediate then
+            object.BackgroundColor3 = goals.BackgroundColor3
+            if outline then
+                outline.Color = edge.Color
+                outline.Transparency = edge.Transparency
+            end
+        else
+            animate(scope, object, goals, 0.18)
+            if outline then
+                animate(scope, outline, edge, 0.18)
+            end
         end
     end
     scope:Connect(object.MouseEnter, function()
@@ -418,30 +444,154 @@ local function hover(scope, object, outline)
     end)
     scope:Connect(object.MouseLeave, function()
         over = false
+        pressed = false
         render()
     end)
-    themed(scope, function(theme)
-        object.BackgroundColor3 = over and theme.Raised or theme.Panel
+    scope:Connect(object.InputBegan, function(input)
+        if pointer(input) then
+            pressed = true
+            render()
+        end
     end)
+    scope:Connect(object.InputEnded, function(input)
+        if pointer(input) then
+            pressed = false
+            render()
+        end
+    end)
+    themed(scope, function()
+        render(true)
+    end)
+    return render
 end
 
+-- Native vector icons avoid missing Unicode glyphs and external assets.
+local IconPaths = {
+    Home = { {2, 9, 10, 2, 18, 9}, {5, 8, 5, 18, 15, 18, 15, 8}, {8, 18, 8, 12, 12, 12, 12, 18} },
+    Moon = { {12, 2, 7, 3, 3, 7, 3, 12, 6, 16, 11, 18, 16, 16, 18, 12, 13, 13, 9, 10, 8, 6, 12, 2} },
+    Settings = { {3, 5, 17, 5}, {3, 10, 17, 10}, {3, 15, 17, 15}, {7, 3, 7, 7}, {13, 8, 13, 12}, {8, 13, 8, 17} },
+    Sliders = { {3, 5, 17, 5}, {3, 10, 17, 10}, {3, 15, 17, 15}, {7, 3, 7, 7}, {13, 8, 13, 12}, {8, 13, 8, 17} },
+    Grid = { {3, 3, 8, 3, 8, 8, 3, 8, 3, 3}, {12, 3, 17, 3, 17, 8, 12, 8, 12, 3}, {3, 12, 8, 12, 8, 17, 3, 17, 3, 12}, {12, 12, 17, 12, 17, 17, 12, 17, 12, 12} },
+    Palette = { {10, 2, 5, 3, 2, 8, 3, 14, 7, 18, 12, 18, 12, 14, 17, 13, 18, 8, 15, 3, 10, 2}, {6, 7, 6.2, 7}, {10, 5, 10.2, 5}, {14, 8, 14.2, 8} },
+    Bell = { {4, 14, 6, 12, 6, 7, 8, 4, 12, 4, 14, 7, 14, 12, 16, 14, 4, 14}, {8, 17, 12, 17} },
+    Keyboard = { {2, 5, 18, 5, 18, 15, 2, 15, 2, 5}, {5, 8, 6, 8}, {9, 8, 10, 8}, {13, 8, 14, 8}, {6, 12, 14, 12} },
+    Chevron = { {6, 8, 10, 12, 14, 8} },
+    Arrow = { {4, 10, 16, 10}, {11, 5, 16, 10, 11, 15} },
+    Close = { {5, 5, 15, 15}, {15, 5, 5, 15} },
+    Minimize = { {5, 10, 15, 10} },
+    Resize = { {5, 16, 16, 5}, {10, 16, 16, 10} },
+    Check = { {4, 10, 8, 14, 16, 6} },
+    Search = { {8, 3, 4, 5, 3, 9, 5, 12, 9, 13, 12, 11, 13, 7, 11, 4, 8, 3}, {12, 12, 17, 17} },
+    Save = { {3, 3, 15, 3, 17, 5, 17, 17, 3, 17, 3, 3}, {6, 3, 6, 8, 13, 8, 13, 3}, {6, 17, 6, 12, 14, 12, 14, 17} },
+}
+
+local function icon(scope, parent, name, position, size, token)
+    local aliases = { ["☾"] = "Moon", ["⚙"] = "Settings" }
+    name = aliases[name] or name or "Grid"
+    local root = frame(scope, parent, {
+        Name = "Icon",
+        BackgroundTransparency = 1,
+        Position = position or UDim2.new(),
+        Size = UDim2.fromOffset(size or 18, size or 18),
+    })
+    local segments = {}
+    local scale = (size or 18) / 20
+    for _, path in ipairs(IconPaths[name] or IconPaths.Grid) do
+        for index = 1, #path - 2, 2 do
+            local x1, y1 = path[index], path[index + 1]
+            local x2, y2 = path[index + 2], path[index + 3]
+            local dx, dy = x2 - x1, y2 - y1
+            local line = frame(scope, root, {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromOffset((x1 + x2) * scale / 2, (y1 + y2) * scale / 2),
+                Size = UDim2.fromOffset(math.max(1.6, math.sqrt(dx * dx + dy * dy) * scale), 1.6),
+                Rotation = math.deg(math.atan2(dy, dx)),
+            })
+            corner(line, 1)
+            table.insert(segments, line)
+        end
+    end
+    local result = { Root = root, Token = token or "Muted" }
+    function result:SetToken(nextToken, immediate)
+        self.Token = nextToken
+        for _, line in ipairs(segments) do
+            if immediate then
+                line.BackgroundColor3 = Midnight.Theme[self.Token]
+            else
+                animate(scope, line, { BackgroundColor3 = Midnight.Theme[self.Token] })
+            end
+        end
+    end
+    themed(scope, function()
+        result:SetToken(result.Token, true)
+    end)
+    return result
+end
+
+-- Broad strokes share one contour: no concentric hard-edged rings.
 local function glow(scope, object)
     local lines = {}
-    for index = 1, 3 do
+    for index, width in ipairs({ 16, 11, 7, 4 }) do
         local halo = frame(scope, object, {
-            Name = "Glow",
-            Position = UDim2.fromOffset(-index * 3, -index * 3),
-            Size = UDim2.new(1, index * 6, 1, index * 6),
+            Name = "SoftGlow",
+            Position = UDim2.fromOffset(0, 0),
+            Size = UDim2.fromScale(1, 1),
             BackgroundTransparency = 1,
-            ZIndex = object.ZIndex,
+            ZIndex = 1,
         })
-        corner(halo, 10 + index * 2)
-        lines[index] = stroke(scope, halo, "Accent", 0.88 + index * 0.025, 2)
+        corner(halo, 10)
+        local base = ({ 0.985, 0.978, 0.965, 0.94 })[index]
+        lines[index] = { Stroke = stroke(scope, halo, "Accent", base, width), Base = base }
     end
     return lines
 end
 
+focusStyle = function(scope, input, outline)
+    local focused = false
+    local function render(immediate)
+        local goals = {
+            Color = focused and Midnight.Theme.Accent or Midnight.Theme.Border,
+            Transparency = focused and 0.18 or 0.68,
+        }
+        if immediate then
+            outline.Color = goals.Color
+            outline.Transparency = goals.Transparency
+        else
+            animate(scope, outline, goals, 0.2)
+        end
+    end
+    scope:Connect(input.Focused, function()
+        focused = true
+        render()
+    end)
+    scope:Connect(input.FocusLost, function()
+        focused = false
+        render()
+    end)
+    themed(scope, function()
+        render(true)
+    end)
+end
+
+function Midnight:SetReducedMotion(enabled)
+    self.ReducedMotion = enabled == true
+end
+
 -- 4. Pointer dragging: mouse and touch ---------------------------------------
+
+local function isVisible(object)
+    local current = object
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then
+            return false
+        end
+        if current:IsA("ScreenGui") and not current.Enabled then
+            return false
+        end
+        current = current.Parent
+    end
+    return true
+end
 
 local function drag(scope, target, begin, update, finish)
     local active = nil
@@ -467,7 +617,7 @@ local function drag(scope, target, begin, update, finish)
     table.insert(scope.Cleanups, unlock)
     target.Active = true
     scope:Connect(target.InputBegan, function(input)
-        if not pointer(input) or active then
+        if not pointer(input) or active or not isVisible(target) then
             return
         end
         origin = point(input)
@@ -494,6 +644,10 @@ local function drag(scope, target, begin, update, finish)
     end)
     scope:Connect(UserInputService.InputChanged, function(input)
         if not active then
+            return
+        end
+        if not isVisible(target) then
+            unlock()
             return
         end
         local touch = active.UserInputType == Enum.UserInputType.Touch
@@ -654,11 +808,21 @@ function WindowMethods:LoadConfig(fireCallbacks)
             report("Load failed; using memory", result)
         end
     end
-    self.ConfigData = values
+    self.ConfigData = copy(values)
     self.Loading = true
+    local restored = {}
     for flag, control in pairs(self.Controls) do
         if values[flag] ~= nil then
-            control:Set(copy(values[flag]), fireCallbacks ~= true)
+            control:Set(copy(values[flag]), true)
+            table.insert(restored, control)
+        end
+    end
+    -- Callbacks observe the complete restored snapshot, never half-loaded flags.
+    if fireCallbacks == true then
+        for _, control in ipairs(restored) do
+            if control.Scope.Alive then
+                safe(control.Callback, control:Get())
+            end
         end
     end
     self.Loading = false
@@ -723,16 +887,34 @@ local function releaseBindings(window)
     end
 end
 
+cancelCapture = function(window)
+    if window.Capture then
+        local capture = window.Capture
+        window.Capture = nil
+        capture.Scope:Cancel(capture.CaptureJob)
+        capture:Refresh()
+    end
+end
+
 local function installKeyboard(window)
     local scope = window.Scope
     scope:Connect(UserInputService.InputBegan, function(input, processed)
         local key = input.KeyCode
+        if pointer(input) and window.OpenPopover then
+            local root = window.OpenPopover.Root
+            local p = point(input)
+            local start, size = root.AbsolutePosition, root.AbsoluteSize
+            if p.X < start.X or p.Y < start.Y or p.X > start.X + size.X or p.Y > start.Y + size.Y then
+                window.OpenPopover:SetOpen(false)
+            end
+        end
         if window.Capture then
             if key == Enum.KeyCode.Unknown then
                 return
             end
             local control = window.Capture
             window.Capture = nil
+            control.Scope:Cancel(control.CaptureJob)
             if key == Enum.KeyCode.Escape then
                 control:Refresh()
             else
@@ -740,10 +922,17 @@ local function installKeyboard(window)
             end
             return
         end
-        if processed or UserInputService:GetFocusedTextBox() then
+        if window.Modal then
+            if key == Enum.KeyCode.Escape then
+                window.Modal:Close(false)
+            end
             return
         end
-        if window.Modal then
+        if key == Enum.KeyCode.Escape and window.OpenPopover then
+            window.OpenPopover:SetOpen(false)
+            return
+        end
+        if processed or UserInputService:GetFocusedTextBox() then
             return
         end
         if key == window.Keybind then
@@ -774,6 +963,7 @@ local function installKeyboard(window)
     end)
     scope:Connect(UserInputService.WindowFocusReleased, function()
         releaseBindings(window)
+        cancelCapture(window)
     end)
     scope:Connect(UserInputService.TextBoxFocused, function()
         releaseBindings(window)
@@ -800,7 +990,7 @@ function Midnight:CreateWindow(options)
     }, { __index = WindowMethods })
     local scope = window.Scope
     window.Gui = screen("MidnightUI", 100 + #self.Windows)
-    window.Gui.Enabled = self.Visible
+    window.Gui.Enabled = true
     table.insert(self.Windows, window)
     configure(window, options)
 
@@ -812,18 +1002,17 @@ function Midnight:CreateWindow(options)
         Size = UDim2.fromOffset(582, 432),
         GroupTransparency = 1,
     }, window.Gui)
-    window.Scale = new("UIScale", { Scale = 0.94 }, window.Root)
-    local shadow = frame(scope, window.Root, {
-        Position = UDim2.fromOffset(9, 19),
-        Size = UDim2.new(1, -18, 1, -25),
-        BackgroundTransparency = 0.45,
-    }, "Shadow")
-    corner(shadow, 12)
-    local shadowGradient = new("UIGradient", { Rotation = 90 }, shadow)
-    shadowGradient.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.7),
-        NumberSequenceKeypoint.new(1, 0.2),
-    })
+    window.Scale = new("UIScale", { Scale = 0.985 }, window.Root)
+    for index = 6, 1, -1 do
+        local spread = index * 2
+        local shadow = frame(scope, window.Root, {
+            Name = "SoftShadow",
+            Position = UDim2.fromOffset(16 - spread, 19 - spread),
+            Size = UDim2.new(1, -32 + spread * 2, 1, -32 + spread * 2),
+            BackgroundTransparency = 0.965,
+        }, "Shadow")
+        corner(shadow, 10 + spread)
+    end
     window.Shell = frame(scope, window.Root, {
         Position = UDim2.fromOffset(16, 16),
         Size = UDim2.new(1, -32, 1, -32),
@@ -831,12 +1020,12 @@ function Midnight:CreateWindow(options)
         ClipsDescendants = false,
     }, "Background")
     corner(window.Shell, 10)
-    stroke(scope, window.Shell, "Border", 0.15)
+    stroke(scope, window.Shell, "Border", 0.42)
     window.Glow = glow(scope, window.Shell)
 
     local title = frame(scope, window.Shell, {
-        Size = UDim2.new(1, 0, 0, 54),
-        BackgroundTransparency = 0.88,
+        Size = UDim2.new(1, 0, 0, 68),
+        BackgroundTransparency = 0.96,
         ZIndex = 3,
     }, "Text")
     corner(title, 10)
@@ -844,32 +1033,47 @@ function Midnight:CreateWindow(options)
     local titleHit = button(scope, title, "", {
         Size = UDim2.new(1, -92, 1, 0),
     })
-    label(scope, titleHit, options.Title or "Midnight UI", {
-        Position = UDim2.fromOffset(16, 6),
-        Size = UDim2.new(1, -20, 0, 22),
+    local mark = frame(scope, titleHit, {
+        Position = UDim2.fromOffset(16, 17),
+        Size = UDim2.fromOffset(34, 34),
+        BackgroundTransparency = 0.9,
+    }, "Accent")
+    corner(mark, 10)
+    icon(scope, mark, "Moon", UDim2.fromOffset(7, 7), 20, "Accent")
+    window.TitleLabel = label(scope, titleHit, options.Title or "Midnight UI", {
+        Position = UDim2.fromOffset(62, 13),
+        Size = UDim2.new(1, -70, 0, 23),
         Font = Enum.Font.GothamBold,
         TextSize = 16,
     })
-    label(scope, titleHit, options.SubTitle or "Made for the night", {
-        Position = UDim2.fromOffset(16, 29),
-        Size = UDim2.new(1, -20, 0, 17),
+    window.SubTitleLabel = label(scope, titleHit, options.SubTitle or "Your space after dark", {
+        Position = UDim2.fromOffset(62, 36),
+        Size = UDim2.new(1, -70, 0, 18),
         TextSize = 11,
     }, "Muted")
-    local minimize = button(scope, title, "−", {
-        Position = UDim2.new(1, -84, 0, 7),
-        Size = UDim2.fromOffset(36, 38),
-        BackgroundTransparency = 0,
-        TextSize = 22,
+    local headerRule = frame(scope, title, {
+        Position = UDim2.new(0, 16, 1, -1),
+        Size = UDim2.new(1, -32, 0, 1),
+        BackgroundTransparency = 0.85,
+    }, "Text")
+    gradient(scope, headerRule)
+    local minimize = button(scope, title, "", {
+        Position = UDim2.new(1, -86, 0, 17),
+        Size = UDim2.fromOffset(32, 32),
+        BackgroundTransparency = 0.5,
     })
-    local close = button(scope, title, "×", {
-        Position = UDim2.new(1, -44, 0, 7),
-        Size = UDim2.fromOffset(36, 38),
-        BackgroundTransparency = 0,
-        TextSize = 22,
+    local close = button(scope, title, "", {
+        Position = UDim2.new(1, -46, 0, 17),
+        Size = UDim2.fromOffset(32, 32),
+        BackgroundTransparency = 0.5,
     })
+    icon(scope, minimize, "Minimize", UDim2.fromOffset(7, 7), 18, "Muted")
+    icon(scope, close, "Close", UDim2.fromOffset(7, 7), 18, "Muted")
     for _, item in ipairs({ minimize, close }) do
         corner(item, 8)
-        hover(scope, item, stroke(scope, item, "Accent", 0.7))
+        hover(scope, item, stroke(scope, item, "Border", 0.85), {
+            Accent = item == close and "Error" or "Accent",
+        })
     end
     scope:Connect(minimize.Activated, function()
         window:SetMinimized(not window.Minimized)
@@ -879,43 +1083,71 @@ function Midnight:CreateWindow(options)
     end)
 
     window.Body = frame(scope, window.Shell, {
-        Position = UDim2.fromOffset(10, 64),
-        Size = UDim2.new(1, -20, 1, -89),
+        Position = UDim2.fromOffset(14, 80),
+        Size = UDim2.new(1, -28, 1, -112),
         BackgroundTransparency = 1,
         ZIndex = 3,
     })
-    local top = window.TabPosition == "Top"
+    window.NavLabel = label(scope, window.Body, "WORKSPACE", {
+        Size = UDim2.fromOffset(128, 16),
+        Position = UDim2.fromOffset(10, 0),
+        TextSize = 9,
+        Font = Enum.Font.GothamBold,
+        TextTransparency = 0.25,
+    }, "Muted")
     window.TabBar = new("ScrollingFrame", {
-        Size = top and UDim2.new(1, 0, 0, 38) or UDim2.new(0, 132, 1, 0),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
         CanvasSize = UDim2.new(),
-        AutomaticCanvasSize = top and Enum.AutomaticSize.X or Enum.AutomaticSize.Y,
-        ScrollingDirection = top and Enum.ScrollingDirection.X or Enum.ScrollingDirection.Y,
         ScrollBarThickness = 2,
     }, window.Body)
     color(scope, window.TabBar, "ScrollBarImageColor3", "Accent")
-    layout(window.TabBar, 6, top and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical)
+    window.TabLayout = layout(window.TabBar, 5)
+    window.NavDivider = frame(scope, window.Body, {
+        Size = UDim2.new(0, 1, 1, -4),
+        BackgroundTransparency = 0.55,
+    }, "Border")
     window.Pages = frame(scope, window.Body, {
-        Position = top and UDim2.fromOffset(0, 46) or UDim2.fromOffset(142, 0),
-        Size = top and UDim2.new(1, 0, 1, -46) or UDim2.new(1, -142, 1, 0),
         BackgroundTransparency = 1,
+        ClipsDescendants = true,
     })
-    window.Watermark = label(scope, window.Shell, "Midnight UI", {
+    window.StatusLabel = label(scope, window.Shell, options.Status or "READY", {
+        Position = UDim2.new(0, 24, 1, -24),
+        Size = UDim2.new(0.5, -24, 0, 16),
+        TextSize = 9,
+        ZIndex = 3,
+    }, "Muted")
+    window.Watermark = label(scope, window.Shell, "Midnight UI  /  2.0", {
         AnchorPoint = Vector2.new(1, 1),
-        Position = UDim2.new(1, -24, 1, -5),
-        Size = UDim2.fromOffset(110, 16),
-        TextSize = 10,
+        Position = UDim2.new(1, -30, 1, -8),
+        Size = UDim2.fromOffset(126, 16),
+        TextSize = 9,
         TextXAlignment = Enum.TextXAlignment.Right,
         ZIndex = 3,
     }, "Muted")
-    window.ResizeHandle = button(scope, window.Shell, "⋱", {
+    window.ResizeHandle = button(scope, window.Shell, "", {
         AnchorPoint = Vector2.new(1, 1),
         Position = UDim2.fromScale(1, 1),
-        Size = UDim2.fromOffset(28, 28),
-        TextSize = 22,
+        Size = UDim2.fromOffset(30, 30),
         ZIndex = 5,
     })
+    icon(scope, window.ResizeHandle, "Resize", UDim2.fromOffset(9, 9), 13, "Muted")
+    window.Responsive = options.Responsive ~= false
+    window.MobileReopen = button(scope, window.Gui, "", {
+        Position = UDim2.new(0, 16, 0.5, -22),
+        Size = UDim2.fromOffset(44, 44),
+        BackgroundTransparency = 0,
+        Visible = false,
+        ZIndex = 100,
+    })
+    corner(window.MobileReopen, 12)
+    color(scope, window.MobileReopen, "BackgroundColor3", "Panel")
+    stroke(scope, window.MobileReopen, "Accent", 0.4)
+    icon(scope, window.MobileReopen, "Moon", UDim2.fromOffset(11, 11), 22, "Accent")
+    scope:Connect(window.MobileReopen.Activated, function()
+        Midnight:ToggleUI(true)
+        window:SetVisible(true)
+    end)
     drag(scope, titleHit, function()
         return window.Root.Position
     end, function(_, delta, start)
@@ -946,8 +1178,8 @@ function Midnight:CreateWindow(options)
                 Name = "Star" .. index,
                 Position = UDim2.fromScale(random:NextNumber(0.02, 0.98), random:NextNumber(0.18, 0.96)),
                 Size = UDim2.fromOffset(2, 2),
-                BackgroundTransparency = random:NextNumber(0.8, 0.95),
-                ZIndex = 2,
+                BackgroundTransparency = random:NextNumber(0.94, 0.985),
+                ZIndex = 1,
             }, "Accent")
             corner(star, 2)
         end
@@ -958,10 +1190,10 @@ function Midnight:CreateWindow(options)
             return
         end
         bright = not bright
-        if window.Visible and Midnight.Visible then
-            for index, line in ipairs(window.Glow) do
-                animate(scope, line, {
-                    Transparency = (bright and 0.82 or 0.89) + index * 0.025,
+        if window.Visible and Midnight.Visible and not Midnight.ReducedMotion then
+            for _, layer in ipairs(window.Glow) do
+                animate(scope, layer.Stroke, {
+                    Transparency = math.clamp(layer.Base - (bright and 0.006 or 0), 0, 1),
                 }, 0.35)
             end
         end
@@ -970,6 +1202,9 @@ function Midnight:CreateWindow(options)
     pulse()
     animate(scope, window.Root, { GroupTransparency = 0 }, 0.3)
     animate(scope, window.Scale, { Scale = 1 }, 0.3)
+    if not self.Visible then
+        window:_RenderVisibility()
+    end
     return window
 end
 
@@ -991,7 +1226,64 @@ function WindowMethods:SetSize(size)
     width = math.clamp(width, math.min(420, maxWidth), maxWidth)
     height = math.clamp(height, math.min(300, maxHeight), maxHeight)
     self.FullSize = Vector2.new(width, height)
-    self.Root.Size = UDim2.fromOffset(width + 32, (self.Minimized and 54 or height) + 32)
+    self.Root.Size = UDim2.fromOffset(width + 32, (self.Minimized and 68 or height) + 32)
+    self:_UpdateLayout()
+end
+
+function WindowMethods:_UpdateLayout()
+    local top = self.TabPosition == "Top" or (self.Responsive and self.FullSize.X < 480)
+    self.TopTabs = top
+    self.NavLabel.Visible = not top
+    self.NavDivider.Visible = not top
+    self.NavDivider.Position = UDim2.fromOffset(137, 0)
+    self.TabBar.Position = top and UDim2.new() or UDim2.fromOffset(0, 26)
+    self.TabBar.Size = top and UDim2.new(1, 0, 0, 40) or UDim2.new(0, 128, 1, -26)
+    self.TabBar.AutomaticCanvasSize = top and Enum.AutomaticSize.X or Enum.AutomaticSize.Y
+    self.TabBar.ScrollingDirection = top and Enum.ScrollingDirection.X or Enum.ScrollingDirection.Y
+    self.TabLayout.FillDirection = top and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
+    self.Pages.Position = top and UDim2.fromOffset(0, 50) or UDim2.fromOffset(151, 0)
+    self.Pages.Size = top and UDim2.new(1, 0, 1, -50) or UDim2.new(1, -151, 1, 0)
+    for _, tab in ipairs(self.Tabs) do
+        tab.NavButton.Size = top and UDim2.fromOffset(128, 38) or UDim2.new(1, -3, 0, 40)
+    end
+end
+
+function WindowMethods:SetTitle(title, subtitle)
+    if self.Destroyed then
+        return
+    end
+    self.TitleLabel.Text = tostring(title)
+    if subtitle ~= nil then
+        self.SubTitleLabel.Text = tostring(subtitle)
+    end
+end
+
+function WindowMethods:SetStatus(text)
+    if not self.Destroyed then
+        self.StatusLabel.Text = tostring(text)
+    end
+end
+
+function WindowMethods:_RenderVisibility()
+    local effective = self.Visible and Midnight.Visible
+    self.MobileReopen.Visible = UserInputService.TouchEnabled and not effective
+    self.Scope:Cancel(self.HideJob)
+    if effective then
+        self.Root.Visible = true
+        animate(self.Scope, self.Root, { GroupTransparency = 0 }, 0.25)
+        animate(self.Scope, self.Scale, { Scale = 1 }, 0.25)
+    else
+        releaseBindings(self)
+        cancelCapture(self)
+        if self.OpenPopover then
+            self.OpenPopover:SetOpen(false)
+        end
+        animate(self.Scope, self.Root, { GroupTransparency = 1 }, 0.2)
+        animate(self.Scope, self.Scale, { Scale = 0.985 }, 0.2)
+        self.HideJob = self.Scope:Delay(0.21, function()
+            self.Root.Visible = false
+        end)
+    end
 end
 
 function WindowMethods:SetVisible(visible)
@@ -999,24 +1291,7 @@ function WindowMethods:SetVisible(visible)
         return
     end
     self.Visible = visible == true
-    self.Scope:Cancel(self.HideJob)
-    if self.Visible then
-        self.Root.Visible = true
-        animate(self.Scope, self.Root, { GroupTransparency = 0 }, 0.25)
-        animate(self.Scope, self.Scale, { Scale = 1 }, 0.25)
-    else
-        releaseBindings(self)
-        if self.Capture then
-            local capture = self.Capture
-            self.Capture = nil
-            capture:Refresh()
-        end
-        animate(self.Scope, self.Root, { GroupTransparency = 1 }, 0.2)
-        animate(self.Scope, self.Scale, { Scale = 0.96 }, 0.2)
-        self.HideJob = self.Scope:Delay(0.21, function()
-            self.Root.Visible = false
-        end)
-    end
+    self:_RenderVisibility()
 end
 
 function WindowMethods:SetMinimized(minimized)
@@ -1024,11 +1299,19 @@ function WindowMethods:SetMinimized(minimized)
         return
     end
     self.Minimized = minimized == true
+    if self.Minimized then
+        releaseBindings(self)
+        cancelCapture(self)
+        if self.OpenPopover then
+            self.OpenPopover:SetOpen(false)
+        end
+    end
     self.Body.Visible = not self.Minimized
     self.ResizeHandle.Visible = not self.Minimized
     self.Watermark.Visible = not self.Minimized
+    self.StatusLabel.Visible = not self.Minimized
     animate(self.Scope, self.Root, {
-        Size = UDim2.fromOffset(self.FullSize.X + 32, (self.Minimized and 54 or self.FullSize.Y) + 32),
+        Size = UDim2.fromOffset(self.FullSize.X + 32, (self.Minimized and 68 or self.FullSize.Y) + 32),
     }, 0.25)
 end
 
@@ -1057,12 +1340,13 @@ function WindowMethods:Destroy()
 end
 
 function Midnight:ToggleUI(value)
-    self.Visible = value == nil and not self.Visible or value == true
+    if value == nil then
+        self.Visible = not self.Visible
+    else
+        self.Visible = value == true
+    end
     for _, window in ipairs(self.Windows) do
-        window.Gui.Enabled = self.Visible
-        if not self.Visible then
-            releaseBindings(window)
-        end
+        window:_RenderVisibility()
     end
     if Runtime then
         Runtime.Gui.Enabled = self.Visible
@@ -1082,27 +1366,42 @@ function WindowMethods:CreateTab(options)
         Scope = scope,
         Order = 0,
     }, { __index = ContainerMethods })
-    local top = self.TabPosition == "Top"
-    tab.Button = button(scope, self.TabBar, "", {
-        Size = top and UDim2.fromOffset(126, 36) or UDim2.new(1, -4, 0, 40),
-        BackgroundTransparency = 0,
+    tab.NavButton = button(scope, self.TabBar, "", {
+        Name = "TabButton",
+        Size = self.TopTabs and UDim2.fromOffset(128, 38) or UDim2.new(1, -3, 0, 40),
+        BackgroundTransparency = 1,
         LayoutOrder = #self.Tabs + 1,
     })
-    corner(tab.Button, 8)
-    local outline = stroke(scope, tab.Button, "Accent", 0.85)
-    local text = (options.Icon and tostring(options.Icon) .. "  " or "")
-        .. (options.Title or "Tab")
-    local caption = label(scope, tab.Button, text, {
-        Position = UDim2.fromOffset(12, 0),
-        Size = UDim2.new(1, -20, 1, 0),
-        TextSize = 12,
-    })
-    local indicator = frame(scope, tab.Button, {
-        Position = UDim2.fromOffset(0, 8),
-        Size = UDim2.new(0, 3, 1, -16),
+    corner(tab.NavButton, 8)
+    local outline = stroke(scope, tab.NavButton, "Border", 1)
+    local selectedWash = frame(scope, tab.NavButton, {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
     }, "Accent")
-    corner(indicator, 3)
+    corner(selectedWash, 8)
+    local symbol = icon(scope, tab.NavButton, options.Icon or "Grid", UDim2.fromOffset(11, 11), 18, "Muted")
+    local caption = label(scope, tab.NavButton, options.Title or "Tab", {
+        Position = UDim2.fromOffset(39, 0),
+        Size = UDim2.new(1, -48, 1, 0),
+        TextSize = 12,
+        Font = Enum.Font.GothamMedium,
+    })
+    local indicator = frame(scope, tab.NavButton, {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        Size = UDim2.fromOffset(2, 0),
+        BackgroundTransparency = 1,
+    }, "Accent")
+    corner(indicator, 2)
+    tab.Page = new("CanvasGroup", {
+        Name = "TabPage",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        GroupTransparency = 1,
+        Visible = false,
+    }, self.Pages)
     tab.Content = new("ScrollingFrame", {
+        Name = "TabContent",
         Size = UDim2.fromScale(1, 1),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -1110,37 +1409,90 @@ function WindowMethods:CreateTab(options)
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollingDirection = Enum.ScrollingDirection.Y,
         ScrollBarThickness = 3,
-        ScrollBarImageTransparency = 0.25,
-        Visible = false,
-    }, self.Pages)
+        ScrollBarImageTransparency = 0.5,
+    }, tab.Page)
     color(scope, tab.Content, "ScrollBarImageColor3", "Accent")
-    padding(tab.Content, 4)
-    layout(tab.Content, 8)
-    function tab:Refresh()
+    padding(tab.Content, 3)
+    layout(tab.Content, 12)
+    local over = false
+    function tab:Refresh(immediate)
         local selected = self.Window.SelectedTab == self
-        self.Content.Visible = selected
-        indicator.Visible = selected
-        outline.Transparency = selected and 0.28 or 0.88
-        self.Button.BackgroundColor3 = selected and Midnight.Theme.Raised or Midnight.Theme.Panel
-        caption.TextColor3 = selected and Midnight.Theme.Text or Midnight.Theme.Muted
+        local function set(object, goals)
+            if immediate then
+                for key, value in pairs(goals) do
+                    object[key] = value
+                end
+            else
+                animate(scope, object, goals, 0.22)
+            end
+        end
+        set(self.NavButton, {
+            BackgroundColor3 = Midnight.Theme.Raised,
+            BackgroundTransparency = selected and 0.25 or (over and 0.6 or 1),
+        })
+        set(selectedWash, { BackgroundTransparency = selected and 0.94 or 1 })
+        set(outline, { Transparency = selected and 0.65 or 1 })
+        set(caption, { TextColor3 = selected and Midnight.Theme.Text or Midnight.Theme.Muted })
+        set(indicator, {
+            Size = UDim2.fromOffset(2, selected and 18 or 0),
+            BackgroundTransparency = selected and 0 or 1,
+        })
+        symbol:SetToken(selected and "Accent" or "Muted", immediate)
     end
     function tab:Select()
-        self.Window.SelectedTab = self
-        for _, item in ipairs(self.Window.Tabs) do
-            item:Refresh()
+        if not scope.Alive or self.Window.SelectedTab == self then
+            return self
         end
+        cancelCapture(self.Window)
+        if self.Window.OpenPopover then
+            self.Window.OpenPopover:SetOpen(false)
+        end
+        local previous = self.Window.SelectedTab
+        self.Window.SelectedTab = self
+        if previous then
+            previous.Scope:Cancel(previous.HideJob)
+            animate(previous.Scope, previous.Page, { GroupTransparency = 1 }, 0.15)
+            previous.HideJob = previous.Scope:Delay(0.16, function()
+                if self.Window.SelectedTab ~= previous then
+                    previous.Page.Visible = false
+                end
+            end)
+        end
+        scope:Cancel(self.HideJob)
+        self.Page.Visible = true
+        self.Page.ZIndex = 2
+        if previous then
+            previous.Page.ZIndex = 1
+        end
+        self.Page.Position = UDim2.fromOffset(0, Midnight.ReducedMotion and 0 or 6)
+        animate(scope, self.Page, {
+            GroupTransparency = 0,
+            Position = UDim2.fromOffset(0, 0),
+        }, 0.25)
+        for _, entry in ipairs(self.Window.Tabs) do
+            entry:Refresh(false)
+        end
+        return self
     end
     themed(scope, function()
+        tab:Refresh(true)
+    end)
+    scope:Connect(tab.NavButton.MouseEnter, function()
+        over = true
         tab:Refresh()
     end)
-    scope:Connect(tab.Button.Activated, function()
+    scope:Connect(tab.NavButton.MouseLeave, function()
+        over = false
+        tab:Refresh()
+    end)
+    scope:Connect(tab.NavButton.Activated, function()
         tab:Select()
     end)
     table.insert(self.Tabs, tab)
     if #self.Tabs == 1 then
         tab:Select()
     else
-        tab:Refresh()
+        tab:Refresh(true)
     end
     return tab
 end
@@ -1156,22 +1508,22 @@ local function row(container, height)
         LayoutOrder = container.Order,
     }, "Panel")
     corner(object, 8)
-    local outline = stroke(scope, object, "Border", 0.7)
+    local outline = stroke(scope, object, "Border", 0.8)
     return scope, object, outline
 end
 
 local function captions(scope, object, options, reserve)
     local hasDescription = options.Description and options.Description ~= ""
     local title = label(scope, object, options.Title or "Control", {
-        Position = UDim2.fromOffset(12, hasDescription and 7 or 0),
+        Position = UDim2.fromOffset(14, hasDescription and 9 or 0),
         Size = UDim2.new(1, -(reserve or 24), 0, hasDescription and 21 or 44),
         Font = Enum.Font.GothamMedium,
     })
     local description
     if hasDescription then
         description = label(scope, object, options.Description, {
-            Position = UDim2.fromOffset(12, 28),
-            Size = UDim2.new(1, -24, 0, 19),
+            Position = UDim2.fromOffset(14, 30),
+            Size = UDim2.new(1, -28, 0, 19),
             TextSize = 11,
         }, "Muted")
     end
@@ -1205,7 +1557,27 @@ function ControlMethods:SetVisible(visible)
 end
 
 function ControlMethods:SetDisabled(disabled)
+    if not self.Scope.Alive then
+        return self
+    end
     self.Disabled = disabled == true
+    if not self.DisabledVeil then
+        self.DisabledVeil = frame(self.Scope, self.Root, {
+            Name = "DisabledVeil",
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 0.48,
+            ZIndex = 50,
+            Active = true,
+        }, "Panel")
+        corner(self.DisabledVeil, 8)
+    end
+    self.DisabledVeil.Visible = self.Disabled
+    if self.Disabled and self.SetOpen then
+        self:SetOpen(false)
+    end
+    if self.Disabled and self.Window.Capture == self then
+        cancelCapture(self.Window)
+    end
     if self.Binding then
         self.Binding.Enabled = not self.Disabled
         if self.Disabled and self.Binding.Active and self.Binding.Mode == "Hold" then
@@ -1229,6 +1601,9 @@ function ControlMethods:Destroy()
     if self.Window.Capture == self then
         self.Window.Capture = nil
     end
+    if self.Window.OpenPopover == self then
+        self.Window.OpenPopover = nil
+    end
     if self.Flag and FlagOwners[self.Flag] == self then
         FlagOwners[self.Flag] = nil
         Midnight.Flags[self.Flag] = nil
@@ -1242,56 +1617,115 @@ end
 
 function ContainerMethods:Section(options)
     options = option(options)
-    local scope, root = row(self, 40)
-    root.AutomaticSize = Enum.AutomaticSize.Y
-    root.Size = UDim2.new(1, -6, 0, 0)
-    root.BackgroundTransparency = 1
-    local header = button(scope, root, "", {
-        Size = UDim2.new(1, 0, 0, 36),
-        BackgroundTransparency = 0,
+    self.Order = self.Order + 1
+    local scope = Scope.new(self.Scope)
+    local root = frame(scope, self.Content, {
+        Name = "Section",
+        Size = UDim2.new(1, -6, 0, 38),
+        BackgroundTransparency = 1,
+        LayoutOrder = self.Order,
+        ClipsDescendants = true,
     })
-    corner(header, 8)
-    color(scope, header, "BackgroundColor3", "Raised")
-    label(scope, header, options.Title or "Section", {
-        Position = UDim2.fromOffset(10, 0),
-        Size = UDim2.new(1, -44, 1, 0),
+    local header = button(scope, root, "", {
+        Name = "SectionHeader",
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundTransparency = 1,
+    })
+    local marker = frame(scope, header, {
+        Position = UDim2.fromOffset(1, 11),
+        Size = UDim2.fromOffset(3, 14),
+        BackgroundTransparency = 0.15,
+    }, "Accent")
+    corner(marker, 2)
+    local title = label(scope, header, options.Title or "Section", {
+        Position = UDim2.fromOffset(13, 0),
+        Size = UDim2.new(1, -48, 1, 0),
         Font = Enum.Font.GothamBold,
         TextSize = 12,
     })
-    local arrow = label(scope, header, "−", {
-        Position = UDim2.new(1, -30, 0, 0),
-        Size = UDim2.fromOffset(24, 36),
-        TextXAlignment = Enum.TextXAlignment.Center,
-    }, "Accent")
+    local arrow = icon(scope, header, "Chevron", UDim2.new(1, -26, 0, 9), 18, "Muted")
+    arrow.Root.Visible = options.Collapsible ~= false
     local content = frame(scope, root, {
-        Position = UDim2.fromOffset(0, 44),
+        Name = "SectionContent",
+        Position = UDim2.fromOffset(0, 42),
         Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1,
     })
-    layout(content, 8)
+    local list = layout(content, 8)
     local section = setmetatable({
         Window = self.Window,
         Scope = scope,
         Content = content,
         Root = root,
+        Layout = list,
         Order = 0,
-        Collapsed = false,
+        Collapsed = options.Collapsed == true,
+        ExpandedHeight = 42,
+        Transitioning = false,
     }, { __index = ContainerMethods })
-    function section:SetCollapsed(value)
-        self.Collapsed = value == true
-        content.Visible = not self.Collapsed
-        root.AutomaticSize = self.Collapsed and Enum.AutomaticSize.None or Enum.AutomaticSize.Y
-        root.Size = UDim2.new(1, -6, 0, self.Collapsed and 36 or 0)
-        content.Position = UDim2.fromOffset(0, self.Collapsed and 36 or 44)
-        arrow.Text = self.Collapsed and "+" or "−"
+    local function measure(updateRoot)
+        if not scope.Alive then
+            return
+        end
+        local scale = math.max(section.Window.Scale.Scale, 0.01)
+        local height = math.max(0, list.AbsoluteContentSize.Y / scale)
+        section.ExpandedHeight = 42 + height + (height > 0 and 2 or 0)
+        content.Size = UDim2.new(1, 0, 0, height)
+        -- Content-driven changes follow child animations without a second tween.
+        if updateRoot ~= false and not section.Collapsed and not section.Transitioning then
+            root.Size = UDim2.new(1, -6, 0, section.ExpandedHeight)
+        end
     end
+    function section:SetCollapsed(value, immediate)
+        if not scope.Alive then
+            return self
+        end
+        self.Collapsed = value == true
+        scope:Cancel(self.CollapseJob)
+        measure(false)
+        local target = UDim2.new(1, -6, 0, self.Collapsed and 36 or self.ExpandedHeight)
+        content.Visible = true
+        if immediate or Midnight.ReducedMotion then
+            self.Transitioning = false
+            root.Size = target
+            content.Visible = not self.Collapsed
+            arrow.Root.Rotation = self.Collapsed and -90 or 0
+        else
+            self.Transitioning = true
+            animate(scope, root, { Size = target }, 0.26)
+            animate(scope, arrow.Root, { Rotation = self.Collapsed and -90 or 0 }, 0.22)
+            self.CollapseJob = scope:Delay(0.27, function()
+                self.Transitioning = false
+                content.Visible = not self.Collapsed
+                if not self.Collapsed then
+                    measure()
+                end
+            end)
+        end
+        return self
+    end
+    function section:SetTitle(text)
+        title.Text = tostring(text)
+        return self
+    end
+    function section:SetVisible(visible)
+        root.Visible = visible == true
+        return self
+    end
+    scope:Connect(list:GetPropertyChangedSignal("AbsoluteContentSize"), measure)
+    scope:Connect(section.Window.Scale:GetPropertyChangedSignal("Scale"), measure)
     scope:Connect(header.Activated, function()
         if options.Collapsible ~= false then
             section:SetCollapsed(not section.Collapsed)
         end
     end)
-    section:SetCollapsed(options.Collapsed == true)
+    scope:Connect(header.MouseEnter, function()
+        arrow:SetToken("Accent")
+    end)
+    scope:Connect(header.MouseLeave, function()
+        arrow:SetToken("Muted")
+    end)
+    section:SetCollapsed(section.Collapsed, true)
     return section
 end
 
@@ -1331,6 +1765,18 @@ function ContainerMethods:Label(options)
         end
         return self
     end
+    if options.Style == "Hero" then
+        title.TextSize = 20
+        title.Font = Enum.Font.GothamBold
+        description.TextSize = 12
+        local wash = new("UIGradient", {
+            Rotation = 25,
+        }, root)
+        themed(scope, function(theme)
+            root.BackgroundColor3 = Color3.new(1, 1, 1)
+            wash.Color = ColorSequence.new(theme.Panel:Lerp(theme.Accent, 0.13), theme.Panel)
+        end)
+    end
     item.Value = title.Text
     return item
 end
@@ -1341,31 +1787,70 @@ ContainerMethods.Paragraph = ContainerMethods.Label
 
 function ContainerMethods:Button(options)
     options = option(options)
-    local item, scope, root = control(self, options, options.Description and 58 or 44)
-    captions(scope, root, options, 48)
-    local symbol = label(scope, root, "›", {
-        Position = UDim2.new(1, -32, 0, 0),
-        Size = UDim2.fromOffset(24, 44),
-        TextSize = 22,
-        TextXAlignment = Enum.TextXAlignment.Center,
-    }, "Accent")
-    local hit = button(scope, root, "", { Size = UDim2.fromScale(1, 1) })
-    local scale = new("UIScale", { Scale = 1 }, symbol)
-    hover(scope, root, item.Outline)
-    scope:Connect(hit.InputBegan, function(input)
-        if pointer(input) and not item.Disabled then
-            animate(scope, scale, { Scale = 0.8 }, 0.15)
+    local item, scope, root = control(self, options, options.Description and 64 or 48)
+    local title = captions(scope, root, options, 66)
+    local token = options.Style == "Danger" and "Error" or "Accent"
+    local badge = frame(scope, root, {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -14, 0.5, 0),
+        Size = UDim2.fromOffset(28, 28),
+        BackgroundTransparency = 0.91,
+    }, token)
+    corner(badge, 8)
+    local symbol = icon(scope, badge, options.Icon or "Arrow", UDim2.fromOffset(5, 5), 18, token)
+    local scale = new("UIScale", { Scale = 1 }, symbol.Root)
+    local wash = frame(scope, root, {
+        Name = "PressHighlight",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+    }, token)
+    corner(wash, 8)
+    local hit = button(scope, root, "", {
+        Name = "ButtonHit",
+        Size = UDim2.fromScale(1, 1),
+        ZIndex = 4,
+    })
+    hover(scope, root, item.Outline, {
+        Accent = token,
+        Enabled = function()
+            return not item.Disabled and not item.Loading
+        end,
+    })
+    if options.Style == "Primary" then
+        themed(scope, function(theme)
+            root.BackgroundColor3 = theme.Panel:Lerp(theme.Accent, 0.12)
+            item.Outline.Color = theme.Accent
+            item.Outline.Transparency = 0.7
+        end)
+    end
+    function item:SetLoading(value)
+        if not scope.Alive then
+            return self
         end
-    end)
-    scope:Connect(hit.InputEnded, function(input)
-        if pointer(input) then
-            animate(scope, scale, { Scale = 1 }, 0.15)
+        self.Loading = value == true
+        title.Text = self.Loading and (options.LoadingText or "Working...") or (options.Title or "Button")
+        symbol.Root.Visible = not self.Loading
+        return self
+    end
+    function item:SetText(text)
+        options.Title = tostring(text)
+        if not self.Loading then
+            title.Text = options.Title
         end
-    end)
+        return self
+    end
     function item:Press()
-        if self.Scope.Alive and not self.Disabled then
-            safe(self.Callback)
+        if not scope.Alive or self.Disabled or self.Loading then
+            return
         end
+        scope:Cancel(self.PressJob)
+        animate(scope, scale, { Scale = 0.87 }, 0.15)
+        animate(scope, wash, { BackgroundTransparency = 0.94 }, 0.15)
+        self.PressJob = scope:Delay(0.15, function()
+            animate(scope, scale, { Scale = 1 }, 0.2)
+            animate(scope, wash, { BackgroundTransparency = 1 }, 0.25)
+        end)
+        safe(self.Callback)
     end
     scope:Connect(hit.Activated, function()
         item:Press()
@@ -1514,68 +1999,152 @@ end
 
 function ContainerMethods:Dropdown(options)
     options = option(options)
-    local baseHeight = options.Description and 94 or 76
+    local baseHeight = options.Description and 98 or 80
     local item, scope, root = control(self, options, baseHeight)
+    root.ClipsDescendants = true
     captions(scope, root, options)
     item.Multi = options.Multi == true
     item.Items = stringOptions(options.Options or options.Values)
     item.Open = false
-    local selected = button(scope, root, "Select...", {
-        Position = UDim2.fromOffset(12, baseHeight - 38),
-        Size = UDim2.new(1, -24, 0, 30),
+    local selected = button(scope, root, "", {
+        Name = "DropdownTrigger",
+        Position = UDim2.fromOffset(12, baseHeight - 42),
+        Size = UDim2.new(1, -24, 0, 34),
         BackgroundTransparency = 0,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    corner(selected, 7)
+    color(scope, selected, "BackgroundColor3", "Background")
+    local selectedOutline = stroke(scope, selected, "Border", 0.65)
+    local selectedText = label(scope, selected, "Select...", {
+        Position = UDim2.fromOffset(10, 0),
+        Size = UDim2.new(1, -44, 1, 0),
         TextSize = 12,
     })
-    corner(selected, 6)
-    padding(selected, 8)
-    color(scope, selected, "BackgroundColor3", "Background")
-    stroke(scope, selected, "Accent", 0.65)
+    local arrow = icon(scope, selected, "Chevron", UDim2.new(1, -27, 0, 8), 18, "Muted")
     local panel = frame(scope, root, {
-        Position = UDim2.fromOffset(12, baseHeight),
-        Size = UDim2.new(1, -24, 0, 178),
+        Name = "DropdownPanel",
+        Position = UDim2.fromOffset(12, baseHeight + 2),
+        Size = UDim2.new(1, -24, 0, 170),
         BackgroundTransparency = 1,
         Visible = false,
     })
     local searchable = options.Searchable ~= false
     local search = textBox(scope, panel, "Search options...", {
-        Size = UDim2.new(1, 0, 0, 30),
+        Name = "DropdownSearch",
+        Size = UDim2.new(1, 0, 0, 32),
         Visible = searchable,
     })
     local list = new("ScrollingFrame", {
-        Position = UDim2.fromOffset(0, searchable and 36 or 0),
-        Size = UDim2.new(1, 0, 1, searchable and -36 or 0),
+        Name = "DropdownList",
+        Position = UDim2.fromOffset(0, searchable and 40 or 0),
+        Size = UDim2.new(1, 0, 1, searchable and -40 or 0),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
         ScrollBarThickness = 3,
+        ScrollBarImageTransparency = 0.35,
         CanvasSize = UDim2.new(),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollingDirection = Enum.ScrollingDirection.Y,
     }, panel)
     color(scope, list, "ScrollBarImageColor3", "Accent")
     layout(list, 4)
+    local empty = label(scope, panel, "No matching options", {
+        Position = UDim2.fromOffset(4, searchable and 48 or 8),
+        Size = UDim2.new(1, -8, 0, 32),
+        TextSize = 12,
+        Visible = false,
+    }, "Muted")
     local listScope
     local entries = {}
-    function item:Refresh()
-        if self.Multi then
-            selected.Text = #self.Value > 0 and table.concat(self.Value, ", ") or "Select..."
+    local function selectedValue(value)
+        return item.Multi and table.find(item.Value, value) ~= nil or item.Value == value
+    end
+    local function renderEntry(entry, immediate)
+        local active = selectedValue(entry.Value)
+        local theme = Midnight.Theme
+        local goals = {
+            BackgroundColor3 = active and theme.Panel:Lerp(theme.Accent, 0.13) or theme.Raised,
+            BackgroundTransparency = active and 0 or (entry.Hovered and 0.5 or 1),
+        }
+        if immediate then
+            for key, value in pairs(goals) do
+                entry.Root[key] = value
+            end
+            entry.Caption.TextColor3 = active and theme.Text or theme.Muted
         else
-            selected.Text = self.Value ~= "" and self.Value or "Select..."
+            animate(listScope, entry.Root, goals, 0.18)
+            animate(listScope, entry.Caption, { TextColor3 = active and theme.Text or theme.Muted })
         end
+        entry.Check.Root.Visible = active
+    end
+    function item:Refresh(immediate)
+        if self.Multi then
+            selectedText.Text = #self.Value > 0 and table.concat(self.Value, ", ") or "Select..."
+        else
+            selectedText.Text = self.Value ~= "" and self.Value or "Select..."
+        end
+        for _, entry in pairs(entries) do
+            renderEntry(entry, immediate)
+        end
+        selectedOutline.Color = self.Open and Midnight.Theme.Accent or Midnight.Theme.Border
+        selectedOutline.Transparency = self.Open and 0.25 or 0.65
+    end
+    local function updateFilter()
+        local query = string.lower(search.Text)
+        local count = 0
         for value, entry in pairs(entries) do
-            local active = self.Multi and table.find(self.Value, value) ~= nil or self.Value == value
-            entry.Text = (active and "✓  " or "    ") .. value
-            entry.TextColor3 = active and Midnight.Theme.Accent or Midnight.Theme.Text
-            entry.BackgroundColor3 = active and Midnight.Theme.Raised or Midnight.Theme.Panel
+            entry.Root.Visible = string.find(string.lower(value), query, 1, true) ~= nil
+            if entry.Root.Visible then
+                count = count + 1
+            end
         end
+        empty.Visible = count == 0
+        local rows = math.clamp(count, 1, math.clamp(math.floor(finite(options.MaxVisible, 4)), 1, 8))
+        item.PanelHeight = (searchable and 40 or 0) + rows * 34 + math.max(0, rows - 1) * 4
+        panel.Size = UDim2.new(1, -24, 0, item.PanelHeight)
+        if item.Open then
+            animate(scope, root, {
+                Size = UDim2.new(1, -6, 0, baseHeight + item.PanelHeight + 12),
+            }, 0.2)
+        end
+        list.CanvasPosition = Vector2.zero
     end
     function item:SetOpen(value)
-        self.Open = value == true
-        panel.Visible = self.Open
-        animate(scope, root, {
-            Size = UDim2.new(1, -6, 0, baseHeight + (self.Open and 190 or 0)),
+        if not scope.Alive then
+            return self
+        end
+        value = value == true and not self.Disabled
+        if value and self.Window.OpenPopover and self.Window.OpenPopover ~= self then
+            self.Window.OpenPopover:SetOpen(false)
+        end
+        self.Open = value
+        scope:Cancel(self.CloseJob)
+        if self.Open then
+            self.Window.OpenPopover = self
+            panel.Visible = true
+            updateFilter()
+        else
+            if self.Window.OpenPopover == self then
+                self.Window.OpenPopover = nil
+            end
+            if search:IsFocused() then
+                search:ReleaseFocus()
+            end
+            self.CloseJob = scope:Delay(0.23, function()
+                if not self.Open then
+                    panel.Visible = false
+                end
+            end)
+        end
+        animate(scope, arrow.Root, { Rotation = self.Open and 180 or 0 }, 0.2)
+        animate(scope, selectedOutline, {
+            Color = self.Open and Midnight.Theme.Accent or Midnight.Theme.Border,
+            Transparency = self.Open and 0.25 or 0.65,
         })
+        animate(scope, root, {
+            Size = UDim2.new(1, -6, 0, baseHeight + (self.Open and (self.PanelHeight + 12) or 0)),
+        }, 0.22)
+        return self
     end
     function item:Set(value, silent)
         if not scope.Alive then
@@ -1593,11 +2162,19 @@ function ContainerMethods:Dropdown(options)
         else
             nextValue = type(value) == "string" and table.find(self.Items, value) and value or ""
         end
-        local old = self.Multi and table.concat(self.Value or {}, "\0") or self.Value
-        local current = self.Multi and table.concat(nextValue, "\0") or nextValue
+        local changed = self.Value ~= nextValue
+        if self.Multi then
+            local old = self.Value or {}
+            changed = #old ~= #nextValue
+            for index, entry in ipairs(nextValue) do
+                if old[index] ~= entry then
+                    changed = true
+                end
+            end
+        end
         self.Value = nextValue
-        self:Refresh()
-        self:_Commit(silent, old ~= current)
+        self:Refresh(false)
+        self:_Commit(silent, changed)
         return self
     end
     local function build()
@@ -1605,23 +2182,38 @@ function ContainerMethods:Dropdown(options)
             listScope:Destroy()
         end
         for _, entry in pairs(entries) do
-            entry:Destroy()
+            entry.Root:Destroy()
         end
         entries = {}
         listScope = Scope.new(scope)
-        local query = string.lower(search.Text)
         for index, value in ipairs(item.Items) do
-            local entry = button(listScope, list, value, {
-                Size = UDim2.new(1, -6, 0, 32),
-                BackgroundTransparency = 0,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                TextSize = 12,
+            local entryRoot = button(listScope, list, "", {
+                Size = UDim2.new(1, -6, 0, 34),
+                BackgroundTransparency = 1,
                 LayoutOrder = index,
-                Visible = string.find(string.lower(value), query, 1, true) ~= nil,
             })
-            corner(entry, 6)
+            corner(entryRoot, 6)
+            local entry = {
+                Root = entryRoot,
+                Value = value,
+                Hovered = false,
+                Caption = label(listScope, entryRoot, value, {
+                    Position = UDim2.fromOffset(10, 0),
+                    Size = UDim2.new(1, -44, 1, 0),
+                    TextSize = 12,
+                }),
+                Check = icon(listScope, entryRoot, "Check", UDim2.new(1, -26, 0, 8), 18, "Accent"),
+            }
             entries[value] = entry
-            listScope:Connect(entry.Activated, function()
+            listScope:Connect(entryRoot.MouseEnter, function()
+                entry.Hovered = true
+                renderEntry(entry)
+            end)
+            listScope:Connect(entryRoot.MouseLeave, function()
+                entry.Hovered = false
+                renderEntry(entry)
+            end)
+            listScope:Connect(entryRoot.Activated, function()
                 if item.Disabled then
                     return
                 end
@@ -1641,8 +2233,9 @@ function ContainerMethods:Dropdown(options)
             end)
         end
         themed(listScope, function()
-            item:Refresh()
+            item:Refresh(true)
         end)
+        updateFilter()
     end
     function item:SetOptions(values)
         self.Items = stringOptions(values)
@@ -1650,21 +2243,16 @@ function ContainerMethods:Dropdown(options)
         build()
         return self
     end
-    scope:Connect(search:GetPropertyChangedSignal("Text"), function()
-        local query = string.lower(search.Text)
-        for value, entry in pairs(entries) do
-            entry.Visible = string.find(string.lower(value), query, 1, true) ~= nil
-        end
-        list.CanvasPosition = Vector2.zero
-    end)
+    scope:Connect(search:GetPropertyChangedSignal("Text"), updateFilter)
     scope:Connect(selected.Activated, function()
         if not item.Disabled then
             item:SetOpen(not item.Open)
         end
     end)
     item.Value = item.Multi and {} or ""
+    item.PanelHeight = 170
     themed(scope, function()
-        item:Refresh()
+        item:Refresh(true)
     end)
     item:_Register(options.Flag, options.Default or (item.Multi and {} or ""))
     build()
@@ -1693,7 +2281,7 @@ function ContainerMethods:Keybind(options)
     })
     corner(keyButton, 6)
     color(scope, keyButton, "BackgroundColor3", "Raised")
-    stroke(scope, keyButton, "Accent", 0.6)
+    local keyOutline = stroke(scope, keyButton, "Border", 0.65)
     item.Binding = {
         Key = Enum.KeyCode.Unknown,
         Mode = options.Mode == "Hold" and "Hold" or "Toggle",
@@ -1705,8 +2293,13 @@ function ContainerMethods:Keybind(options)
     -- The main callback is reserved for key activation, not key assignment.
     item.Callback = options.Changed
     function item:Refresh()
-        keyButton.Text = self.Window.Capture == self and "Press a key..."
+        local capturing = self.Window.Capture == self
+        keyButton.Text = capturing and "Press a key..."
             or (self.Value == Enum.KeyCode.Unknown and "None" or self.Value.Name)
+        animate(scope, keyOutline, {
+            Color = capturing and Midnight.Theme.Accent or Midnight.Theme.Border,
+            Transparency = capturing and 0.15 or 0.65,
+        })
     end
     function item:Set(value, silent)
         if not scope.Alive then
@@ -1736,12 +2329,19 @@ function ContainerMethods:Keybind(options)
         if item.Disabled then
             return
         end
-        local previous = item.Window.Capture
-        item.Window.Capture = item
-        if previous and previous ~= item then
-            previous:Refresh()
+        if item.Window.Capture == item then
+            cancelCapture(item.Window)
+            return
         end
+        cancelCapture(item.Window)
+        releaseBindings(item.Window)
+        item.Window.Capture = item
         item:Refresh()
+        item.CaptureJob = scope:Delay(8, function()
+            if item.Window.Capture == item then
+                cancelCapture(item.Window)
+            end
+        end)
     end)
     item.Value = Enum.KeyCode.Unknown
     item:_Register(options.Flag, keyCode(options.Default))
@@ -1829,6 +2429,7 @@ function ContainerMethods:ColorPicker(options)
     local baseHeight = options.Description and 60 or 46
     local item, scope, root = control(self, options, baseHeight)
     captions(scope, root, options, 76)
+    root.ClipsDescendants = true
     item.Open = false
     local preview = button(scope, root, "", {
         Position = UDim2.new(1, -60, 0, 10),
@@ -1959,11 +2560,32 @@ function ContainerMethods:ColorPicker(options)
         return self
     end
     function item:SetOpen(open)
-        self.Open = open == true
-        panel.Visible = self.Open
+        if not scope.Alive then
+            return self
+        end
+        open = open == true and not self.Disabled
+        if open and self.Window.OpenPopover and self.Window.OpenPopover ~= self then
+            self.Window.OpenPopover:SetOpen(false)
+        end
+        self.Open = open
+        scope:Cancel(self.CloseJob)
+        if self.Open then
+            self.Window.OpenPopover = self
+            panel.Visible = true
+        else
+            if self.Window.OpenPopover == self then
+                self.Window.OpenPopover = nil
+            end
+            self.CloseJob = scope:Delay(0.23, function()
+                if not self.Open then
+                    panel.Visible = false
+                end
+            end)
+        end
         animate(scope, root, {
             Size = UDim2.new(1, -6, 0, baseHeight + (self.Open and 278 or 0)),
-        })
+        }, 0.22)
+        return self
     end
     scope:Connect(preview.Activated, function()
         if not item.Disabled then
@@ -2107,6 +2729,7 @@ local function runtime()
         Gui = gui,
         Holder = holder,
         Count = 0,
+        Handles = {},
     }
     return Runtime
 end
@@ -2125,14 +2748,16 @@ function Midnight:Notify(options)
     local token = tokens[options.Type] or "Accent"
     NotificationId = NotificationId + 1
     host.Count = host.Count + 1
+    local width = math.min(328, math.max(180, host.Gui.AbsoluteSize.X - 32))
     local slot = frame(scope, host.Holder, {
-        Size = UDim2.new(0, math.min(320, math.max(180, host.Gui.AbsoluteSize.X - 32)), 0, 100),
+        Name = "NotificationSlot",
+        Size = UDim2.fromOffset(width, 100),
         BackgroundTransparency = 1,
         LayoutOrder = NotificationId,
     })
     local group = new("CanvasGroup", {
         Size = UDim2.fromScale(1, 1),
-        Position = UDim2.fromOffset(30, 0),
+        Position = UDim2.fromOffset(24, 0),
         BackgroundTransparency = 1,
         GroupTransparency = 1,
     }, slot)
@@ -2141,35 +2766,59 @@ function Midnight:Notify(options)
         Size = UDim2.new(1, -8, 1, -8),
     }, "Panel")
     corner(card, 10)
-    stroke(scope, card, token, 0.15, 1.5)
-    local tint = frame(scope, card, {
-        Size = UDim2.fromScale(1, 1),
-        BackgroundTransparency = 0.94,
+    stroke(scope, card, "Border", 0.45)
+    local accent = frame(scope, card, {
+        Position = UDim2.fromOffset(0, 12),
+        Size = UDim2.new(0, 2, 1, -24),
+        BackgroundTransparency = 0.05,
     }, token)
-    corner(tint, 10)
+    corner(accent, 2)
+    local badge = frame(scope, card, {
+        Position = UDim2.fromOffset(12, 13),
+        Size = UDim2.fromOffset(28, 28),
+        BackgroundTransparency = 0.9,
+    }, token)
+    corner(badge, 8)
+    icon(scope, badge, options.Type == "Success" and "Check" or "Bell", UDim2.fromOffset(5, 5), 18, token)
     label(scope, card, options.Title or "Notification", {
-        Position = UDim2.fromOffset(12, 9),
-        Size = UDim2.new(1, -45, 0, 20),
+        Position = UDim2.fromOffset(50, 12),
+        Size = UDim2.new(1, -84, 0, 21),
         Font = Enum.Font.GothamBold,
+        TextSize = 12,
     })
-    label(scope, card, options.Content or "", {
-        Position = UDim2.fromOffset(12, 32),
-        Size = UDim2.new(1, -24, 0, 46),
+    local message = label(scope, card, options.Content or "", {
+        Position = UDim2.fromOffset(50, 36),
+        Size = UDim2.new(1, -64, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
         TextWrapped = true,
         TextTruncate = Enum.TextTruncate.None,
         TextYAlignment = Enum.TextYAlignment.Top,
-        TextSize = 12,
+        TextSize = 11,
     }, "Muted")
-    local dismiss = button(scope, card, "×", {
-        Position = UDim2.new(1, -32, 0, 4),
-        Size = UDim2.fromOffset(28, 28),
-        TextSize = 18,
+    local dismiss = button(scope, card, "", {
+        Position = UDim2.new(1, -30, 0, 8),
+        Size = UDim2.fromOffset(24, 24),
     })
-    local progress = frame(scope, card, {
-        Position = UDim2.new(0, 8, 1, -5),
-        Size = UDim2.new(1, -16, 0, 2),
+    icon(scope, dismiss, "Close", UDim2.fromOffset(5, 5), 14, "Muted")
+    local progressTrack = frame(scope, card, {
+        Position = UDim2.new(0, 12, 1, -7),
+        Size = UDim2.new(1, -24, 0, 2),
+        BackgroundTransparency = 0.4,
+    }, "Border")
+    corner(progressTrack, 2)
+    local progress = frame(scope, progressTrack, {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 0.1,
     }, token)
     corner(progress, 2)
+    local function measure()
+        slot.Size = UDim2.fromOffset(width, math.max(88, 36 + message.AbsoluteSize.Y + 26))
+    end
+    scope:Connect(message:GetPropertyChangedSignal("AbsoluteSize"), measure)
+    scope:Connect(host.Gui:GetPropertyChangedSignal("AbsoluteSize"), function()
+        width = math.min(328, math.max(180, host.Gui.AbsoluteSize.X - 32))
+        measure()
+    end)
     local handle = { Closed = false }
     function handle:Close()
         if self.Closed or not scope.Alive then
@@ -2177,35 +2826,66 @@ function Midnight:Notify(options)
         end
         self.Closed = true
         animate(scope, group, {
-            Position = UDim2.fromOffset(30, 0),
+            Position = UDim2.fromOffset(24, 0),
             GroupTransparency = 1,
         }, 0.2)
-        scope:Delay(0.22, function()
-            scope:Destroy()
-            slot:Destroy()
-            host.Count = host.Count - 1
-            if host.Count == 0 and Runtime == host then
-                host.Scope:Destroy()
-                host.Gui:Destroy()
-                Runtime = nil
-            end
+        scope:Delay(0.21, function()
+            animate(scope, slot, { Size = UDim2.fromOffset(width, 0) }, 0.18)
+            scope:Delay(0.19, function()
+                scope:Destroy()
+                slot:Destroy()
+                host.Count = host.Count - 1
+                local index = table.find(host.Handles, self)
+                if index then
+                    table.remove(host.Handles, index)
+                end
+                if host.Count == 0 and Runtime == host then
+                    host.Scope:Destroy()
+                    host.Gui:Destroy()
+                    Runtime = nil
+                end
+            end)
         end)
     end
     scope:Connect(dismiss.Activated, function()
         handle:Close()
     end)
-    local started = os.clock()
-    -- Duration tracking is not a tween; all visual easing uses animate().
-    scope:Connect(RunService.Heartbeat, function()
+    local paused = false
+    local elapsed = 0
+    scope:Connect(card.MouseEnter, function()
+        paused = true
+    end)
+    scope:Connect(card.MouseLeave, function()
+        paused = false
+    end)
+    scope:Connect(RunService.Heartbeat, function(delta)
         if handle.Closed then
             return
         end
-        local remaining = math.clamp(1 - (os.clock() - started) / duration, 0, 1)
-        progress.Size = UDim2.new(remaining, -16 * remaining, 0, 2)
+        if not paused and Midnight.Visible then
+            elapsed = elapsed + delta
+        end
+        local remaining = math.clamp(1 - elapsed / duration, 0, 1)
+        progress.Size = UDim2.fromScale(remaining, 1)
         if remaining == 0 then
             handle:Close()
         end
     end)
+    table.insert(host.Handles, handle)
+    local live = 0
+    for _, entry in ipairs(host.Handles) do
+        if not entry.Closed then
+            live = live + 1
+        end
+    end
+    if live > 4 then
+        for _, entry in ipairs(host.Handles) do
+            if not entry.Closed then
+                entry:Close()
+                break
+            end
+        end
+    end
     animate(scope, group, {
         Position = UDim2.fromOffset(0, 0),
         GroupTransparency = 0,
@@ -2233,6 +2913,12 @@ function WindowMethods:Confirm(options)
         self.Modal:Close(false)
     end
     releaseBindings(self)
+    cancelCapture(self)
+    if self.OpenPopover then
+        self.OpenPopover:SetOpen(false)
+    end
+    self:SetMinimized(false)
+    self:SetVisible(true)
     local scope = Scope.new(self.Scope)
     local overlay = new("CanvasGroup", {
         Size = UDim2.fromScale(1, 1),
@@ -2280,17 +2966,19 @@ function WindowMethods:Confirm(options)
     color(scope, cancel, "BackgroundColor3", "Raised")
     color(scope, confirm, "BackgroundColor3", "Accent")
     local window = self
+    local modalScale = new("UIScale", { Scale = 0.97 }, panel)
     local handle = { Closed = false }
     function handle:Close(accepted)
         if self.Closed or not scope.Alive then
             return
         end
         self.Closed = true
-        if window.Modal == self then
-            window.Modal = nil
-        end
+        animate(scope, modalScale, { Scale = 0.97 }, 0.2)
         animate(scope, overlay, { GroupTransparency = 1 }, 0.2)
         scope:Delay(0.21, function()
+            if window.Modal == self then
+                window.Modal = nil
+            end
             scope:Destroy()
             overlay:Destroy()
             if accepted then
@@ -2309,6 +2997,7 @@ function WindowMethods:Confirm(options)
         handle:Close(false)
     end)
     animate(scope, overlay, { GroupTransparency = 0 }, 0.2)
+    animate(scope, modalScale, { Scale = 1 }, 0.25)
     return handle
 end
 
