@@ -1,6 +1,6 @@
 --[[
     Midnight UI Library
-    Version: 2.1.0
+    Version: 2.2.0
     Credits: Original implementation by OpenAI for this project.
     Date: 2026-09-28
     License: MIT
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.1.0",
+    Version = "2.2.0",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -92,10 +92,29 @@ local function capability(name)
     return nil
 end
 
+local InstanceNames = setmetatable({}, { __mode = "k" })
+local DefaultNames = {
+    Frame = "Surface", CanvasGroup = "TransitionLayer", TextLabel = "Caption",
+    TextButton = "Action", TextBox = "Input", ImageLabel = "Icon",
+    ScrollingFrame = "ScrollRegion", UICorner = "CornerRadius", UIStroke = "Border",
+    UIGradient = "ColorGradient", UIListLayout = "ContentLayout", UIPadding = "ContentPadding",
+    UIScale = "AnimationScale", UISizeConstraint = "SizeLimits", ScreenGui = "MidnightScreen",
+}
 local function new(className, properties, parent)
     local object = Instance.new(className)
+    local baseName = properties and properties.Name or DefaultNames[className] or ("Midnight" .. className)
+    if parent then
+        local names = InstanceNames[parent] or {}
+        InstanceNames[parent] = names
+        names[baseName] = (names[baseName] or 0) + 1
+        object.Name = baseName .. (names[baseName] > 1 and tostring(names[baseName]) or "")
+    else
+        object.Name = baseName
+    end
     for key, value in pairs(properties or {}) do
-        object[key] = value
+        if key ~= "Name" then
+            object[key] = value
+        end
     end
     object.Parent = parent
     return object
@@ -250,7 +269,112 @@ local DefaultTheme = {
     Shadow = Color3.fromRGB(0, 0, 0),
 }
 
-Midnight.Theme = copy(DefaultTheme)
+-- Contrast is computed in linear sRGB; saved colors remain unmodified.
+local function luminance(value)
+    local function linear(channel)
+        return channel <= 0.04045 and channel / 12.92 or ((channel + 0.055) / 1.055) ^ 2.4
+    end
+    return 0.2126 * linear(value.R) + 0.7152 * linear(value.G) + 0.0722 * linear(value.B)
+end
+
+local function contrast(a, b)
+    local x, y = luminance(a), luminance(b)
+    return (math.max(x, y) + 0.05) / (math.min(x, y) + 0.05)
+end
+
+local function readable(value, surfaces, ratio)
+    local function score(candidate)
+        local minimum = math.huge
+        for _, surface in ipairs(surfaces) do
+            minimum = math.min(minimum, contrast(candidate, surface))
+        end
+        return minimum
+    end
+    if score(value) >= ratio then return value end
+    local black, white = Color3.new(0, 0, 0), Color3.new(1, 1, 1)
+    local target = score(black) > score(white) and black or white
+    for step = 1, 100 do
+        local candidate = value:Lerp(target, step / 100)
+        if score(candidate) >= ratio then return candidate end
+    end
+    return target
+end
+
+local function resolveTheme(requested)
+    local theme = copy(requested)
+    local light = luminance(theme.Background) >= 0.179
+    local opposite = light and Color3.new(0, 0, 0) or Color3.new(1, 1, 1)
+    for _, token in ipairs({ "Panel", "Raised" }) do
+        -- Keep shared text roles usable on all nested surfaces.
+        if (luminance(theme[token]) >= 0.179) ~= light then
+            theme[token] = theme.Background:Lerp(opposite, token == "Panel" and 0.035 or 0.08)
+        end
+        theme[token] = readable(theme[token], { opposite }, 4.5)
+    end
+    local surfaces = { theme.Background, theme.Panel, theme.Raised }
+    theme.Text = readable(theme.Text, surfaces, 4.5)
+    theme.Muted = readable(theme.Muted, surfaces, 4.5)
+    for _, token in ipairs({ "Accent", "Secondary", "Error", "Warning" }) do
+        theme[token] = readable(theme[token], surfaces, 3)
+    end
+    theme.OnAccent = readable(theme.Text, { theme.Accent }, 4.5)
+    theme.Border = readable(theme.Border, surfaces, 1.4)
+    theme.IsLight = light
+    return theme
+end
+
+local ThemePresets = { Midnight = copy(DefaultTheme) }
+local function preset(name, background, accent, secondary)
+    local values = copy(DefaultTheme)
+    values.Background = Color3.fromRGB(table.unpack(background))
+    local light = luminance(values.Background) >= 0.179
+    local opposite = light and Color3.new(0, 0, 0) or Color3.new(1, 1, 1)
+    values.Panel = values.Background:Lerp(opposite, 0.035)
+    values.Raised = values.Background:Lerp(opposite, 0.08)
+    values.Border = values.Background:Lerp(opposite, 0.2)
+    values.Accent = Color3.fromRGB(table.unpack(accent))
+    values.Secondary = Color3.fromRGB(table.unpack(secondary))
+    values.Text = light and Color3.fromRGB(24, 29, 39) or DefaultTheme.Text
+    values.Muted = light and Color3.fromRGB(83, 92, 108) or DefaultTheme.Muted
+    ThemePresets[name] = values
+end
+preset("Amethyst", { 16, 11, 27 }, { 165, 122, 255 }, { 222, 132, 238 })
+preset("Glacier", { 8, 18, 27 }, { 94, 208, 238 }, { 105, 146, 255 })
+preset("Emerald", { 8, 20, 18 }, { 69, 211, 157 }, { 69, 178, 205 })
+preset("Rose", { 25, 12, 20 }, { 246, 128, 176 }, { 178, 135, 252 })
+preset("Ember", { 24, 15, 10 }, { 249, 167, 91 }, { 234, 108, 118 })
+preset("Graphite", { 16, 17, 20 }, { 197, 204, 220 }, { 153, 164, 189 })
+preset("Snow", { 246, 248, 252 }, { 55, 96, 217 }, { 121, 65, 197 })
+preset("Ivory", { 249, 246, 238 }, { 110, 88, 190 }, { 168, 98, 50 })
+
+Midnight.CustomThemes = {}
+Midnight.ThemeName = "Midnight"
+Midnight.RequestedTheme = copy(DefaultTheme)
+Midnight.Theme = resolveTheme(DefaultTheme)
+
+function Midnight:GetTheme(requested)
+    return copy(requested and self.RequestedTheme or self.Theme)
+end
+
+function Midnight:ListThemes()
+    local names = {}
+    for name in pairs(ThemePresets) do table.insert(names, name) end
+    for name in pairs(self.CustomThemes) do
+        if not ThemePresets[name] then table.insert(names, name) end
+    end
+    table.sort(names)
+    return names
+end
+
+function Midnight:GetThemePreset(name)
+    local theme = ThemePresets[name] or self.CustomThemes[name]
+    return theme and copy(theme) or nil
+end
+
+function Midnight:GetContrast(a, b)
+    return contrast(a, b)
+end
+
 
 local function themed(scope, callback)
     table.insert(scope.Theme, callback)
@@ -351,17 +475,34 @@ local function gradient(scope, object)
 end
 
 function Midnight:SetTheme(values)
-    if values == "Midnight" then
-        values = DefaultTheme
-    end
-    if type(values) ~= "table" then
-        return false
+    local name = type(values) == "string" and values or nil
+    if name then
+        values = ThemePresets[name] or self.CustomThemes[name]
+        if not values then
+            return false, "Unknown theme"
+        end
+        self.RequestedTheme = copy(DefaultTheme)
+        self.ThemeName = name
+    elseif type(values) ~= "table" then
+        return false, "Expected a theme name or color table"
+    else
+        self.ThemeName = "Custom"
     end
     for key, value in pairs(values) do
         if DefaultTheme[key] and typeof(value) == "Color3" then
-            self.Theme[key] = value
+            self.RequestedTheme[key] = value
         end
     end
+    -- Changing only the canvas color derives matching surfaces automatically.
+    if typeof(values.Background) == "Color3" then
+        local base = values.Background
+        local light = luminance(base) >= 0.179
+        local mix = light and Color3.new(0, 0, 0) or Color3.new(1, 1, 1)
+        if not values.Panel then self.RequestedTheme.Panel = base:Lerp(mix, 0.035) end
+        if not values.Raised then self.RequestedTheme.Raised = base:Lerp(mix, 0.08) end
+        if not values.Border then self.RequestedTheme.Border = base:Lerp(mix, 0.2) end
+    end
+    self.Theme = resolveTheme(self.RequestedTheme)
     for scope in pairs(ThemeScopes) do
         if scope.Alive then
             -- Cancel color interpolation before assigning the new palette.
@@ -420,8 +561,9 @@ local function hover(scope, object, outline, settings)
         local theme = Midnight.Theme
         local enabled = not settings.Enabled or settings.Enabled()
         local active = enabled and (over or pressed)
+        local base = settings.Primary and theme.Panel:Lerp(theme.Accent, 0.08) or theme.Panel
         local goals = {
-            BackgroundColor3 = active and theme.Raised or theme.Panel,
+            BackgroundColor3 = active and base:Lerp(theme.Raised, 0.8) or base,
         }
         -- Hover changes the surface only. Borders never light up on hover.
         if immediate then
@@ -2210,28 +2352,34 @@ end
 -- A diffuse light inside the surface, built without an image or a hard outline.
 local function aura(scope, parent, token)
     local layers = {}
-    for index = 1, 9 do
+    for index = 1, 18 do
         local layer = frame(scope, parent, {
-            Name = "DiffuseLight",
+            Name = "DiffuseLight" .. index,
             AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = UDim2.fromScale(0.43, 0.5),
-            Size = UDim2.fromScale(0.98 - index * 0.035, 1 - index * 0.07),
+            Position = UDim2.fromScale(0.4, 0.5),
+            Size = UDim2.fromScale(1.02 - index * 0.014, 1.05 - index * 0.047),
             BackgroundTransparency = 1,
         }, token or "Accent")
-        corner(layer, 12)
-        new("UIGradient", {
+        corner(layer, 24)
+        local washGradient = new("UIGradient", {
+            Name = "DiffuseFalloff",
             Transparency = NumberSequence.new({
                 NumberSequenceKeypoint.new(0, 1),
-                NumberSequenceKeypoint.new(0.35, 0.05),
-                NumberSequenceKeypoint.new(0.65, 0.3),
+                NumberSequenceKeypoint.new(0.3, 0.05),
+                NumberSequenceKeypoint.new(0.62, 0.42),
                 NumberSequenceKeypoint.new(1, 1),
             }),
         }, layer)
+        themed(scope, function(theme)
+            local tint = theme[token or "Accent"]
+            layer.BackgroundColor3 = Color3.new(1, 1, 1)
+            washGradient.Color = ColorSequence.new(tint, tint:Lerp(theme.Secondary, 0.3))
+        end)
         table.insert(layers, layer)
     end
     return function(visible, immediate, strength)
         for _, layer in ipairs(layers) do
-            local transparency = visible and (1 - (strength or 0.035)) or 1
+            local transparency = visible and (1 - (strength or 0.035) * 0.48) or 1
             if immediate then
                 layer.BackgroundTransparency = transparency
             else
@@ -2252,23 +2400,24 @@ local function revealText(scope, object, text, enabled)
     end
 end
 
--- Closely spaced, low-opacity contours approximate a smooth falloff.
+-- Filled, nested layers sit behind the shell. Its opaque surface hides their
+-- centers, leaving a soft falloff without doubled borders or hard rings.
 local function glow(scope, object)
-    local lines = {}
-    for index = 1, 14 do
-        local width = 30 - index * 2
-        local halo = frame(scope, object, {
-            Name = "SoftGlow",
-            Position = UDim2.fromOffset(0, 0),
-            Size = UDim2.fromScale(1, 1),
-            BackgroundTransparency = 1,
+    local layers = {}
+    for index = 14, 1, -1 do
+        local spread = index
+        local base = 0.982 + 0.017 * (index / 14)
+        local surface = frame(scope, object.Parent, {
+            Name = "WindowHalo" .. index,
+            Position = UDim2.fromOffset(16 - spread, 16 - spread),
+            Size = UDim2.new(1, -32 + spread * 2, 1, -32 + spread * 2),
+            BackgroundTransparency = base,
             ZIndex = 1,
-        })
-        corner(halo, 10)
-        local base = 0.998 - (index / 14) ^ 2 * 0.014
-        lines[index] = { Stroke = stroke(scope, halo, "Accent", base, width), Base = base }
+        }, "Accent")
+        corner(surface, 10 + spread)
+        table.insert(layers, { Surface = surface, Base = base })
     end
-    return lines
+    return layers
 end
 
 focusStyle = function(scope, input, outline)
@@ -2457,27 +2606,110 @@ local function configName(value)
     return cleaned ~= "" and cleaned or "default"
 end
 
+local CatalogMemory = {}
+
+local function displayName(value)
+    if type(value) ~= "string" then return nil, "Enter a name" end
+    local name = value:match("^%s*(.-)%s*$")
+    if name == "" or #name > 64 then return nil, "Use a name between 1 and 64 bytes" end
+    if name:find("[%c/\\]") then return nil, "Names cannot contain slashes or control characters" end
+    return name
+end
+
+local function profileFile(name)
+    -- Hex encoding is reversible and avoids collisions between user-visible names.
+    return "profile_" .. name:gsub(".", function(character)
+        return string.format("%02x", string.byte(character))
+    end) .. ".json"
+end
+
+local function storeDocument(window, path, document)
+    if not window.FileMode then return true end
+    local ok, err = pcall(function()
+        window.FileWrite(path, HttpService:JSONEncode(encode(document)))
+    end)
+    if not ok then
+        window.FileMode = false
+        report("Save failed; using memory", err)
+    end
+    return true
+end
+
+local function readDocument(window, path)
+    if not window.FileMode then return nil end
+    local ok, document = pcall(function()
+        if not window.FileExists(path) then return nil end
+        local decoded = decode(HttpService:JSONDecode(window.FileRead(path)))
+        assert(type(decoded) == "table", "Invalid document")
+        return decoded
+    end)
+    if not ok then return nil, tostring(document) end
+    return document
+end
+
+function WindowMethods:_SaveCatalog()
+    if not self.SaveEnabled then return false end
+    CatalogMemory[self.ConfigFolder] = self.Catalog
+    return storeDocument(self, self.ConfigFolder .. "/_midnight_catalog.json", self.Catalog)
+end
+
+local function configDocument(window)
+    local values = copy(window.ConfigData)
+    for flag, control in pairs(window.Controls) do values[flag] = control:Get() end
+    return { Version = 2, Values = values, Theme = Midnight:GetTheme(true), ThemeName = Midnight.ThemeName }
+end
+
+local function readConfig(window, path)
+    local document, err = readDocument(window, path)
+    if err then return nil, err end
+    document = document or copy(MemoryConfigs[path])
+    if not document then return nil, "Profile has not been saved yet" end
+    if (document.Version ~= 1 and document.Version ~= 2) or type(document.Values) ~= "table" then
+        return nil, "Invalid profile document"
+    end
+    return document
+end
+
+function WindowMethods:_ApplyConfig(document, fireCallbacks)
+    self.ConfigData = copy(document.Values)
+    self.Loading = true
+    local restored = {}
+    for flag, control in pairs(self.Controls) do
+        local value = document.Values[flag]
+        if value == nil then value = control.Default end
+        control:Set(copy(value), true)
+        table.insert(restored, control)
+    end
+    -- All flags are restored before any callback can observe them.
+    if fireCallbacks then
+        for _, control in ipairs(restored) do
+            if control.Scope.Alive then safe(control.Callback, control:Get()) end
+        end
+    end
+    if type(document.Theme) == "table" then
+        Midnight:SetTheme(document.Theme)
+        Midnight.ThemeName = document.ThemeName or "Custom"
+    end
+    self.Loading = false
+end
+
 local function configure(window, options)
     window.SaveEnabled = options.SaveConfig == true
-    window.ConfigPath = configName(options.ConfigFolder or "MidnightConfigs")
-        .. "/" .. configName(options.ConfigName or tostring(game.PlaceId)) .. ".json"
+    window.ConfigFolder = configName(options.ConfigFolder or "MidnightConfigs")
+    window.ConfigBase = tostring(options.ConfigName or game.PlaceId)
+    window.ProfileName = window.ConfigBase
+    window.ConfigPath = window.ConfigFolder .. "/" .. configName(window.ConfigBase) .. ".json"
     window.ConfigData = {}
     window.FileRead = capability("readfile")
     window.FileWrite = capability("writefile")
     window.FileExists = capability("isfile")
-    window.FileMode = window.FileRead ~= nil
-        and window.FileWrite ~= nil
-        and window.FileExists ~= nil
-    if not window.SaveEnabled then
-        return
-    end
+    window.FileMode = window.SaveEnabled and window.FileRead ~= nil
+        and window.FileWrite ~= nil and window.FileExists ~= nil
     if window.FileMode then
-        local makeFolder = capability("makefolder")
-        local isFolder = capability("isfolder")
-        local folder = configName(options.ConfigFolder or "MidnightConfigs")
+        local makeFolder, isFolder = capability("makefolder"), capability("isfolder")
         local ok, err = pcall(function()
-            if makeFolder and (not isFolder or not isFolder(folder)) then
-                makeFolder(folder)
+            if makeFolder and (not isFolder or not isFolder(window.ConfigFolder)) then
+                makeFolder(window.ConfigFolder)
             end
         end)
         if not ok then
@@ -2485,81 +2717,143 @@ local function configure(window, options)
             window.FileMode = false
         end
     end
-    if not window.FileMode then
+    if window.SaveEnabled and not window.FileMode then
         report("Configuration", "File access is unavailable; using session memory")
     end
-    window:LoadConfig(false)
+    local catalog, err = readDocument(window, window.ConfigFolder .. "/_midnight_catalog.json")
+    if err then report("Catalog load failed; using memory", err) end
+    if type(catalog) ~= "table" or catalog.Version ~= 1 then
+        catalog = CatalogMemory[window.ConfigFolder] or { Version = 1 }
+    end
+    catalog.Profiles = type(catalog.Profiles) == "table" and catalog.Profiles or {}
+    catalog.Themes = type(catalog.Themes) == "table" and catalog.Themes or {}
+    catalog.Settings = type(catalog.Settings) == "table" and catalog.Settings or {}
+    catalog.Active = type(catalog.Active) == "table" and catalog.Active or {}
+    window.Catalog = catalog
+    CatalogMemory[window.ConfigFolder] = catalog
+    -- Catalog entries contain basenames only; never accept paths from a config file.
+    for name, filename in pairs(catalog.Profiles) do
+        if type(name) ~= "string" or type(filename) ~= "string"
+            or not filename:match("^[%w_%-]+%.json$") then
+            catalog.Profiles[name] = nil
+        end
+    end
+    catalog.Profiles[window.ConfigBase] = catalog.Profiles[window.ConfigBase]
+        or (configName(window.ConfigBase) .. ".json")
+    local remembered = catalog.Active[window.ConfigBase]
+    if options.RememberProfile ~= false and remembered and catalog.Profiles[remembered] then
+        window.ProfileName = remembered
+    end
+    window.ConfigPath = window.ConfigFolder .. "/" .. catalog.Profiles[window.ProfileName]
+    window.LoadingEnabled = options.LoadingEnabled ~= false
+    if type(catalog.Settings.LoadingEnabled) == "boolean" then
+        window.LoadingEnabled = catalog.Settings.LoadingEnabled
+    end
+    for name, values in pairs(catalog.Themes) do
+        if type(name) == "string" and type(values) == "table" and not ThemePresets[name] then
+            local clean = copy(DefaultTheme)
+            for key, value in pairs(values) do
+                if DefaultTheme[key] and typeof(value) == "Color3" then clean[key] = value end
+            end
+            Midnight.CustomThemes[name] = clean
+        end
+    end
+    if window.SaveEnabled then window:LoadConfig(false) end
 end
 
 function WindowMethods:SaveConfig()
-    if not self.SaveEnabled then
-        return false
-    end
-    local values = copy(self.ConfigData)
-    for flag, control in pairs(self.Controls) do
-        values[flag] = control:Get()
-    end
-    self.ConfigData = values
-    MemoryConfigs[self.ConfigPath] = copy(values)
-    if not self.FileMode then
-        return true
-    end
-    local ok, err = pcall(function()
-        self.FileWrite(self.ConfigPath, HttpService:JSONEncode({
-            Version = 1,
-            Values = encode(values),
-        }))
-    end)
-    if not ok then
-        self.FileMode = false
-        report("Save failed; using memory", err)
-    end
+    if not self.SaveEnabled or self.Destroyed then return false, "Configuration is disabled" end
+    local document = configDocument(self)
+    self.ConfigData = copy(document.Values)
+    MemoryConfigs[self.ConfigPath] = copy(document)
+    storeDocument(self, self.ConfigPath, document)
+    self.Catalog.Active[self.ConfigBase] = self.ProfileName
+    self:_SaveCatalog()
     return true
 end
 
 function WindowMethods:LoadConfig(fireCallbacks)
-    local values = copy(MemoryConfigs[self.ConfigPath] or {})
-    if self.FileMode then
-        local ok, result = pcall(function()
-            if not self.FileExists(self.ConfigPath) then
-                return nil
-            end
-            local document = HttpService:JSONDecode(self.FileRead(self.ConfigPath))
-            assert(type(document) == "table" and document.Version == 1, "Invalid config version")
-            assert(type(document.Values) == "table", "Invalid config values")
-            return decode(document.Values)
-        end)
-        if ok and result then
-            values = result
-        elseif not ok then
-            report("Load failed; using memory", result)
-        end
-    end
-    self.ConfigData = copy(values)
-    self.Loading = true
-    local restored = {}
-    for flag, control in pairs(self.Controls) do
-        if values[flag] ~= nil then
-            control:Set(copy(values[flag]), true)
-            table.insert(restored, control)
-        end
-    end
-    -- Callbacks observe the complete restored snapshot, never half-loaded flags.
-    if fireCallbacks == true then
-        for _, control in ipairs(restored) do
-            if control.Scope.Alive then
-                safe(control.Callback, control:Get())
-            end
-        end
-    end
-    self.Loading = false
+    local document, err = readConfig(self, self.ConfigPath)
+    if not document then return false, err end
+    self.Scope:Cancel(self.SaveJob)
+    self.SaveJob = nil
+    self:_ApplyConfig(document, fireCallbacks == true)
     return true
 end
 
-function WindowMethods:_ScheduleSave()
-    if not self.SaveEnabled or self.Loading or self.Destroyed then
-        return
+function WindowMethods:ListProfiles()
+    local result = {}
+    for name in pairs(self.Catalog.Profiles) do table.insert(result, name) end
+    table.sort(result)
+    return result
+end
+
+function WindowMethods:GetProfileName()
+    return self.ProfileName
+end
+
+function WindowMethods:CreateProfile(name, useCurrentValues)
+    if self.Destroyed or not self.SaveEnabled then return false, "Configuration is disabled" end
+    local cleaned, err = displayName(name)
+    if not cleaned then return false, err end
+    if self.Catalog.Profiles[cleaned] then return false, "A profile with this name already exists" end
+    local document = configDocument(self)
+    if useCurrentValues == false then
+        document.Values = {}
+        for flag, control in pairs(self.Controls) do document.Values[flag] = copy(control.Default) end
+        document.Theme = copy(DefaultTheme)
+        document.ThemeName = "Midnight"
     end
+    local filename = profileFile(cleaned)
+    local path = self.ConfigFolder .. "/" .. filename
+    MemoryConfigs[path] = copy(document)
+    storeDocument(self, path, document)
+    self.Catalog.Profiles[cleaned] = filename
+    self:_SaveCatalog()
+    return true, cleaned
+end
+
+function WindowMethods:SelectProfile(name, fireCallbacks)
+    if self.Destroyed or not self.SaveEnabled then return false, "Configuration is disabled" end
+    if name == self.ProfileName then return true end
+    local filename = self.Catalog.Profiles[name]
+    if not filename then return false, "Unknown profile" end
+    local path = self.ConfigFolder .. "/" .. filename
+    local document, err = readConfig(self, path)
+    if not document then return false, err end
+    self.Scope:Cancel(self.SaveJob)
+    self.SaveJob = nil
+    self:SaveConfig()
+    self.ProfileName, self.ConfigPath = name, path
+    self:_ApplyConfig(document, fireCallbacks ~= false)
+    self.Catalog.Active[self.ConfigBase] = name
+    self:_SaveCatalog()
+    return true
+end
+
+function WindowMethods:SaveTheme(name, overwrite)
+    if self.Destroyed then return false, "Window is destroyed" end
+    local cleaned, err = displayName(name)
+    if not cleaned then return false, err end
+    if ThemePresets[cleaned] or cleaned == "Custom" then return false, "Built-in theme names are reserved" end
+    if self.Catalog.Themes[cleaned] and not overwrite then return false, "A theme with this name already exists" end
+    local values = Midnight:GetTheme(true)
+    self.Catalog.Themes[cleaned] = values
+    Midnight.CustomThemes[cleaned] = copy(values)
+    Midnight.ThemeName = cleaned
+    self:_SaveCatalog()
+    self:_ScheduleSave()
+    return true, cleaned
+end
+
+function WindowMethods:LoadTheme(name)
+    local ok, err = Midnight:SetTheme(name)
+    if ok then self:_ScheduleSave() end
+    return ok, err
+end
+
+function WindowMethods:_ScheduleSave()
+    if not self.SaveEnabled or self.Loading or self.Destroyed then return end
     self.Scope:Cancel(self.SaveJob)
     self.SaveJob = self.Scope:Delay(0.3, function()
         self.SaveJob = nil
@@ -2649,6 +2943,10 @@ local function installKeyboard(window)
             end
             return
         end
+        if window.LoadingOverlay then
+            if key == window.Keybind and not processed then window:SetVisible(not window.Visible) end
+            return
+        end
         if window.Modal then
             if key == Enum.KeyCode.Escape then
                 window.Modal:Close(false)
@@ -2699,10 +2997,10 @@ end
 
 function Midnight:CreateWindow(options)
     options = option(options)
-    if options.Theme == "Midnight" then
-        self:SetTheme("Midnight")
-    elseif options.Theme == "Custom" then
+    if options.Theme == "Custom" then
         self:SetTheme(options.CustomTheme or {})
+    elseif options.Theme then
+        self:SetTheme(options.Theme)
     end
     local window = setmetatable({
         Scope = Scope.new(),
@@ -2741,16 +3039,18 @@ function Midnight:CreateWindow(options)
         corner(shadow, 10 + spread)
     end
     window.Shell = frame(scope, window.Root, {
+        Name = "Shell",
         Position = UDim2.fromOffset(16, 16),
         Size = UDim2.new(1, -32, 1, -32),
         ZIndex = 2,
         ClipsDescendants = false,
     }, "Background")
     corner(window.Shell, 10)
-    stroke(scope, window.Shell, "Border", 0.42)
+    stroke(scope, window.Shell, "Border", 0.65)
     window.Glow = glow(scope, window.Shell)
 
     local title = frame(scope, window.Shell, {
+        Name = "Title",
         Size = UDim2.new(1, 0, 0, 68),
         BackgroundTransparency = 0.96,
         ZIndex = 3,
@@ -2758,9 +3058,11 @@ function Midnight:CreateWindow(options)
     corner(title, 10)
     gradient(scope, title)
     local titleHit = button(scope, title, "", {
+        Name = "TitleHit",
         Size = UDim2.new(1, -92, 1, 0),
     })
     local mark = frame(scope, titleHit, {
+        Name = "Mark",
         Position = UDim2.fromOffset(16, 17),
         Size = UDim2.fromOffset(34, 34),
         BackgroundTransparency = 0.9,
@@ -2768,28 +3070,33 @@ function Midnight:CreateWindow(options)
     corner(mark, 10)
     icon(scope, mark, "Moon", UDim2.fromOffset(7, 7), 20, "Accent")
     window.TitleLabel = label(scope, titleHit, options.Title or "Midnight UI", {
+        Name = "TitleLabel",
         Position = UDim2.fromOffset(62, 13),
         Size = UDim2.new(1, -70, 0, 23),
         Font = Enum.Font.GothamBold,
         TextSize = 16,
     })
     window.SubTitleLabel = label(scope, titleHit, options.SubTitle or "Your space after dark", {
+        Name = "SubTitleLabel",
         Position = UDim2.fromOffset(62, 36),
         Size = UDim2.new(1, -70, 0, 18),
         TextSize = 11,
     }, "Muted")
     local headerRule = frame(scope, title, {
-        Position = UDim2.new(0, 16, 1, -1),
-        Size = UDim2.new(1, -32, 0, 1),
+        Name = "HeaderRule",
+        Position = UDim2.new(0, 1, 1, -1),
+        Size = UDim2.new(1, -2, 0, 1),
         BackgroundTransparency = 0.85,
     }, "Text")
     gradient(scope, headerRule)
     local minimize = button(scope, title, "", {
+        Name = "Minimize",
         Position = UDim2.new(1, -86, 0, 17),
         Size = UDim2.fromOffset(32, 32),
         BackgroundTransparency = 0.5,
     })
     local close = button(scope, title, "", {
+        Name = "Close",
         Position = UDim2.new(1, -46, 0, 17),
         Size = UDim2.fromOffset(32, 32),
         BackgroundTransparency = 0.5,
@@ -2810,12 +3117,14 @@ function Midnight:CreateWindow(options)
     end)
 
     window.Body = frame(scope, window.Shell, {
+        Name = "Body",
         Position = UDim2.fromOffset(14, 80),
         Size = UDim2.new(1, -28, 1, -102),
         BackgroundTransparency = 1,
         ZIndex = 3,
     })
     window.NavLabel = label(scope, window.Body, "WORKSPACE", {
+        Name = "NavLabel",
         Size = UDim2.fromOffset(128, 16),
         Position = UDim2.fromOffset(10, 0),
         TextSize = 9,
@@ -2823,6 +3132,7 @@ function Midnight:CreateWindow(options)
         TextTransparency = 0.25,
     }, "Muted")
     window.TabBar = new("ScrollingFrame", {
+        Name = "TabBar",
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
         CanvasSize = UDim2.new(),
@@ -2831,15 +3141,18 @@ function Midnight:CreateWindow(options)
     color(scope, window.TabBar, "ScrollBarImageColor3", "Accent")
     window.TabLayout = layout(window.TabBar, 5)
     window.NavDivider = frame(scope, window.Body, {
-        Size = UDim2.new(0, 1, 1, -4),
+        Name = "NavDivider",
+        Size = UDim2.new(0, 1, 1, 24),
         BackgroundTransparency = 0.55,
     }, "Border")
     window.Pages = frame(scope, window.Body, {
+        Name = "Pages",
         BackgroundTransparency = 1,
         ClipsDescendants = true,
     })
     -- The footer intentionally contains only the resize handle.
     window.ResizeHandle = button(scope, window.Shell, "", {
+        Name = "ResizeHandle",
         AnchorPoint = Vector2.new(1, 1),
         Position = UDim2.fromScale(1, 1),
         Size = UDim2.fromOffset(30, 30),
@@ -2848,6 +3161,7 @@ function Midnight:CreateWindow(options)
     icon(scope, window.ResizeHandle, "Resize", UDim2.fromOffset(9, 9), 13, "Muted")
     window.Responsive = options.Responsive ~= false
     window.MobileReopen = button(scope, window.Gui, "", {
+        Name = "MobileReopen",
         Position = UDim2.new(0, 16, 0.5, -22),
         Size = UDim2.fromOffset(44, 44),
         BackgroundTransparency = 0,
@@ -2906,8 +3220,8 @@ function Midnight:CreateWindow(options)
         bright = not bright
         if window.Visible and Midnight.Visible and not Midnight.ReducedMotion then
             for _, layer in ipairs(window.Glow) do
-                animate(scope, layer.Stroke, {
-                    Transparency = math.clamp(layer.Base - (bright and 0.001 or 0), 0, 1),
+                animate(scope, layer.Surface, {
+                    BackgroundTransparency = math.clamp(layer.Base - (bright and 0.001 or 0), 0, 1),
                 }, 0.35)
             end
         end
@@ -2949,7 +3263,7 @@ function WindowMethods:_UpdateLayout()
     self.TopTabs = top
     self.NavLabel.Visible = not top
     self.NavDivider.Visible = not top
-    self.NavDivider.Position = UDim2.fromOffset(137, 0)
+    self.NavDivider.Position = UDim2.fromOffset(137, -12)
     self.TabBar.Position = top and UDim2.new() or UDim2.fromOffset(0, 26)
     self.TabBar.Size = top and UDim2.new(1, 0, 0, 40) or UDim2.new(0, 128, 1, -26)
     self.TabBar.AutomaticCanvasSize = top and Enum.AutomaticSize.X or Enum.AutomaticSize.Y
@@ -2970,6 +3284,12 @@ function WindowMethods:SetTitle(title, subtitle)
     if subtitle ~= nil then
         self.SubTitleLabel.Text = tostring(subtitle)
     end
+end
+
+-- Schedule work that is automatically canceled when this window is destroyed.
+function WindowMethods:Delay(seconds, callback)
+    if self.Destroyed then return nil end
+    return self.Scope:Delay(math.max(0, finite(seconds, 0)), callback)
 end
 
 function WindowMethods:SetStatus(text)
@@ -3079,7 +3399,7 @@ function WindowMethods:CreateTab(options)
         Order = 0,
     }, { __index = ContainerMethods })
     tab.NavButton = button(scope, self.TabBar, "", {
-        Name = "TabButton",
+        Name = "Tab_" .. tostring(options.Title or "Untitled"):gsub("[^%w_%-]", ""),
         Size = self.TopTabs and UDim2.fromOffset(128, 38) or UDim2.new(1, -3, 0, 40),
         BackgroundTransparency = 1,
         LayoutOrder = #self.Tabs + 1,
@@ -3095,13 +3415,14 @@ function WindowMethods:CreateTab(options)
         return symbol:SetIcon(name)
     end
     local caption = label(scope, tab.NavButton, options.Title or "Tab", {
+        Name = "Caption",
         Position = UDim2.fromOffset(39, 0),
         Size = UDim2.new(1, -48, 1, 0),
         TextSize = 12,
         Font = Enum.Font.GothamMedium,
     })
     tab.Page = new("CanvasGroup", {
-        Name = "TabPage",
+        Name = "Page_" .. tostring(options.Title or "Untitled"):gsub("[^%w_%-]", ""),
         Size = UDim2.fromScale(1, 1),
         BackgroundTransparency = 1,
         GroupTransparency = 1,
@@ -3206,17 +3527,26 @@ local function row(container, height)
     container.Order = container.Order + 1
     local scope = Scope.new(container.Scope)
     local object = frame(scope, container.Content, {
+        Name = "Object",
         Size = UDim2.new(1, -6, 0, height),
         LayoutOrder = container.Order,
     }, "Panel")
     corner(object, 8)
-    local outline = stroke(scope, object, "Border", 0.8)
+    local borderHost = frame(scope, object, {
+        Name = "InsetBorder",
+        Position = UDim2.fromOffset(1, 1),
+        Size = UDim2.new(1, -2, 1, -2),
+        BackgroundTransparency = 1,
+    })
+    corner(borderHost, 7)
+    local outline = stroke(scope, borderHost, "Border", 0.8)
     return scope, object, outline
 end
 
 local function captions(scope, object, options, reserve)
     local hasDescription = options.Description and options.Description ~= ""
     local title = label(scope, object, options.Title or "Control", {
+        Name = "Title",
         Position = UDim2.fromOffset(14, hasDescription and 9 or 0),
         Size = UDim2.new(1, -(reserve or 24), 0, hasDescription and 21 or 44),
         Font = Enum.Font.GothamMedium,
@@ -3224,6 +3554,7 @@ local function captions(scope, object, options, reserve)
     local description
     if hasDescription then
         description = label(scope, object, options.Description, {
+            Name = "Description",
             Position = UDim2.fromOffset(14, 30),
             Size = UDim2.new(1, -28, 0, 19),
             TextSize = 11,
@@ -3234,6 +3565,10 @@ end
 
 local function control(container, options, height)
     local scope, object, outline = row(container, height)
+    object.Name = tostring(options.Name or options.Flag or options.Title or "Control"):gsub("[^%w_%-]", "")
+    if object.Name == "" then
+        object.Name = "Control" .. tostring(container.Order)
+    end
     local result = setmetatable({
         Scope = scope,
         Root = object,
@@ -3322,7 +3657,7 @@ function ContainerMethods:Section(options)
     self.Order = self.Order + 1
     local scope = Scope.new(self.Scope)
     local root = frame(scope, self.Content, {
-        Name = "Section",
+        Name = "Section_" .. tostring(options.Title or "Untitled"):gsub("[^%w_%-]", ""),
         Size = UDim2.new(1, -6, 0, 38),
         BackgroundTransparency = 1,
         LayoutOrder = self.Order,
@@ -3334,12 +3669,14 @@ function ContainerMethods:Section(options)
         BackgroundTransparency = 1,
     })
     local marker = frame(scope, header, {
+        Name = "Marker",
         Position = UDim2.fromOffset(1, 11),
         Size = UDim2.fromOffset(3, 14),
         BackgroundTransparency = 0.15,
     }, "Accent")
     corner(marker, 2)
     local title = label(scope, header, options.Title or "Section", {
+        Name = "Title",
         Position = UDim2.fromOffset(13, 0),
         Size = UDim2.new(1, -48, 1, 0),
         Font = Enum.Font.GothamBold,
@@ -3443,6 +3780,7 @@ function ContainerMethods:Label(options)
     padding(root, 12)
     layout(root, 5)
     local title = label(scope, root, options.Title or "Label", {
+        Name = "Title",
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
         TextWrapped = true,
@@ -3450,6 +3788,7 @@ function ContainerMethods:Label(options)
         LayoutOrder = 1,
     })
     local description = label(scope, root, options.Description or "", {
+        Name = "Description",
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
         TextWrapped = true,
@@ -3472,6 +3811,7 @@ function ContainerMethods:Label(options)
         title.Font = Enum.Font.GothamBold
         description.TextSize = 12
         local wash = new("UIGradient", {
+            Name = "Wash",
             Rotation = 25,
         }, root)
         themed(scope, function(theme)
@@ -3493,6 +3833,7 @@ function ContainerMethods:Button(options)
     local title = captions(scope, root, options, 66)
     local token = options.Style == "Danger" and "Error" or "Accent"
     local badge = frame(scope, root, {
+        Name = "Badge",
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -14, 0.5, 0),
         Size = UDim2.fromOffset(28, 28),
@@ -3514,6 +3855,7 @@ function ContainerMethods:Button(options)
     })
     hover(scope, root, item.Outline, {
         Accent = token,
+        Primary = options.Style == "Primary",
         Enabled = function()
             return not item.Disabled and not item.Loading
         end,
@@ -3567,12 +3909,14 @@ function ContainerMethods:Toggle(options)
     local item, scope, root = control(self, options, options.Description and 58 or 44)
     captions(scope, root, options, 76)
     local track = frame(scope, root, {
+        Name = "Track",
         Position = UDim2.new(1, -58, 0, 12),
         Size = UDim2.fromOffset(44, 22),
     }, "Raised")
     corner(track, 11)
     local border = stroke(scope, track, "Accent", 0.8)
     local knob = frame(scope, track, {
+        Name = "Knob",
         Position = UDim2.fromOffset(3, 3),
         Size = UDim2.fromOffset(16, 16),
     }, "Text")
@@ -3583,13 +3927,15 @@ function ContainerMethods:Toggle(options)
         local theme = Midnight.Theme
         local goals = { BackgroundColor3 = self.Value and theme.Accent or theme.Raised }
         local position = self.Value and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)
+        local thumbColor = self.Value and theme.OnAccent or theme.Text
         if immediate then
             track.BackgroundColor3 = goals.BackgroundColor3
             knob.Position = position
+            knob.BackgroundColor3 = thumbColor
             border.Transparency = self.Value and 0.05 or 0.8
         else
             animate(scope, track, goals)
-            animate(scope, knob, { Position = position })
+            animate(scope, knob, { Position = position, BackgroundColor3 = thumbColor })
             animate(scope, border, { Transparency = self.Value and 0.05 or 0.8 })
         end
     end
@@ -3645,10 +3991,12 @@ function ContainerMethods:Slider(options)
         Font = Enum.Font.GothamBold,
     }, "Text")
     local hit = button(scope, root, "", {
+        Name = "Hit",
         Position = UDim2.new(0, 14, 1, -38),
         Size = UDim2.new(1, -28, 0, 32),
     })
     local track = frame(scope, hit, {
+        Name = "Track",
         Position = UDim2.new(0, 0, 0.5, -3),
         Size = UDim2.new(1, 0, 0, 6),
     }, "Raised")
@@ -3657,6 +4005,7 @@ function ContainerMethods:Slider(options)
     corner(fill, 6)
     gradient(scope, fill)
     local knob = frame(scope, track, {
+        Name = "Knob",
         AnchorPoint = Vector2.new(0.5, 0.5),
         Position = UDim2.fromScale(0, 0.5),
         Size = UDim2.fromOffset(16, 16),
@@ -3695,6 +4044,289 @@ function ContainerMethods:Slider(options)
     return item
 end
 
+-- Progress bars --------------------------------------------------------------
+
+local function progressSurface(scope, parent, properties, backdrop)
+    local track = frame(scope, parent, properties, "Raised")
+    track.Name = "ProgressTrack"
+    track.ClipsDescendants = true
+    corner(track, 6)
+    local fill = frame(scope, track, {
+        Name = "ProgressFill",
+        Size = UDim2.fromScale(0, 1),
+    }, "Accent")
+    corner(fill, 6)
+    local sheen = new("UIGradient", { Name = "ProgressGradient" }, fill)
+    themed(scope, function(theme)
+        local a, b = theme.Accent, theme.Secondary
+        if backdrop then
+            a, b = readable(a, { backdrop }, 3), readable(b, { backdrop }, 3)
+            track.BackgroundColor3 = Color3.fromRGB(37, 41, 52)
+        end
+        fill.BackgroundColor3 = Color3.new(1, 1, 1)
+        sheen.Color = ColorSequence.new(a, b)
+    end)
+    local state = { Indeterminate = false, Alpha = 0 }
+    function state:Set(alpha)
+        self.Alpha = math.clamp(alpha, 0, 1)
+        self.Indeterminate = false
+        animate(scope, fill, { Position = UDim2.new(), Size = UDim2.fromScale(self.Alpha, 1) }, 0.25)
+    end
+    function state:SetIndeterminate(enabled)
+        self.Indeterminate = enabled == true
+        if not self.Indeterminate then self:Set(self.Alpha) end
+    end
+    local elapsed, update = 0, 0
+    scope:Connect(RunService.Heartbeat, function(delta)
+        if not state.Indeterminate or not Midnight.Visible or not isVisible(parent) then return end
+        elapsed, update = elapsed + delta, update + delta
+        if update < 0.12 then return end
+        update = 0
+        local x = Midnight.ReducedMotion and 0.32 or (0.32 + math.sin(elapsed * 2.2) * 0.32)
+        animate(scope, fill, { Position = UDim2.fromScale(x, 0), Size = UDim2.fromScale(0.36, 1) }, 0.15)
+    end)
+    return state, track, fill
+end
+
+function ContainerMethods:ProgressBar(options)
+    options = option(options)
+    local item, scope, root = control(self, options, options.Description and 98 or 76)
+    local title, description = captions(scope, root, options, 94)
+    title.Name = "ProgressTitle"
+    local percentage = label(scope, root, "0%", {
+        Name = "ProgressValue",
+        Position = UDim2.new(1, -76, 0, 9),
+        Size = UDim2.fromOffset(62, 26),
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextSize = 14,
+        Font = Enum.Font.GothamBold,
+    })
+    local bar = progressSurface(scope, root, {
+        Position = UDim2.new(0, 14, 1, -23),
+        Size = UDim2.new(1, -28, 0, 7),
+    })
+    local minimum, maximum = finite(options.Min, 0), finite(options.Max, 100)
+    if maximum <= minimum then maximum = minimum + 1 end
+    local completed = false
+    function item:Set(value, silent)
+        if not scope.Alive then return self end
+        value = finite(value, nil)
+        if not value then return self end
+        value = math.clamp(value, minimum, maximum)
+        local changed = self.Value ~= value
+        self.Value = value
+        local alpha = (value - minimum) / (maximum - minimum)
+        bar:Set(alpha)
+        percentage.Text = tostring(math.round(alpha * 100)) .. "%"
+        self:_Commit(silent == true, changed)
+        if alpha == 1 and not completed and not silent then safe(options.OnComplete, value) end
+        completed = alpha == 1
+        return self
+    end
+    function item:SetIndeterminate(enabled)
+        if scope.Alive then
+            bar:SetIndeterminate(enabled)
+            percentage.Text = enabled and "..." or (tostring(math.round(bar.Alpha * 100)) .. "%")
+        end
+        return self
+    end
+    function item:SetText(text, details)
+        if scope.Alive then
+            revealText(scope, title, text)
+            if description and details ~= nil then revealText(scope, description, details) end
+        end
+        return self
+    end
+    function item:Complete(text)
+        self:Set(maximum)
+        if text then self:SetText(text) end
+        return self
+    end
+    item:_Register(options.Flag, finite(options.Default, minimum))
+    item:SetIndeterminate(options.Indeterminate == true)
+    return item
+end
+
+ContainerMethods.Progress = ContainerMethods.ProgressBar
+
+-- Window loading overlay -----------------------------------------------------
+
+function WindowMethods:SetLoadingEnabled(enabled)
+    if self.Destroyed then return end
+    self.LoadingEnabled = enabled == true
+    self.Catalog.Settings.LoadingEnabled = self.LoadingEnabled
+    self:_SaveCatalog()
+    if not self.LoadingEnabled and self.LoadingOverlay then self.LoadingOverlay:Close() end
+end
+
+function WindowMethods:ShowLoading(options)
+    options = option(options)
+    if self.LoadingOverlay then self.LoadingOverlay:Close(true) end
+    local handle = { Closed = false, Skipped = self.Destroyed or not self.LoadingEnabled }
+    if handle.Skipped then
+        function handle:Set() return self end
+        function handle:SetInfo() return self end
+        function handle:Close() self.Closed = true end
+        function handle:Complete() self:Close() return self end
+        return handle
+    end
+    releaseBindings(self)
+    cancelCapture(self)
+    local focusedInput = UserInputService:GetFocusedTextBox()
+    if focusedInput then focusedInput:ReleaseFocus() end
+    if self.OpenPopover then self.OpenPopover:SetOpen(false) end
+    if self.Modal then self.Modal:Close(false) end
+    self:SetMinimized(false)
+    self:SetVisible(true)
+    local window = self
+    local scope = Scope.new(self.Scope)
+    local overlay = new("CanvasGroup", {
+        Name = "LoadingOverlay",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.new(0, 0, 0),
+        BackgroundTransparency = 0.08,
+        GroupTransparency = 1,
+        ZIndex = 80,
+        Active = true,
+        ClipsDescendants = true,
+    }, self.Shell)
+    corner(overlay, 10)
+    button(scope, overlay, "", {
+        Name = "LoadingInputBlocker",
+        Size = UDim2.fromScale(1, 1),
+        Active = true,
+        ZIndex = 1,
+    })
+    local panel = frame(scope, overlay, {
+        Name = "LoadingContent",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.new(0.84, 0, 0, 206),
+        BackgroundTransparency = 1,
+        ZIndex = 2,
+    })
+    new("UISizeConstraint", { MaxSize = Vector2.new(430, 206) }, panel)
+    local spinner = frame(scope, panel, {
+        Name = "LoadingSpinner",
+        AnchorPoint = Vector2.new(0.5, 0),
+        Position = UDim2.fromScale(0.5, 0),
+        Size = UDim2.fromOffset(64, 64),
+        BackgroundTransparency = 1,
+    })
+    local dots = {}
+    for index = 1, 12 do
+        local angle = (index - 1) * math.pi / 6 - math.pi / 2
+        local dot = frame(scope, spinner, {
+            Name = "SpinnerDot" .. index,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromOffset(32 + math.cos(angle) * 23, 32 + math.sin(angle) * 23),
+            Size = UDim2.fromOffset(4, 4),
+            BackgroundTransparency = 0.2 + (index - 1) / 16,
+        })
+        corner(dot, 3)
+        themed(scope, function(theme)
+            dot.BackgroundColor3 = readable(theme.Accent, { Color3.new(0, 0, 0) }, 4.5)
+        end)
+        table.insert(dots, dot)
+    end
+    local heading = label(scope, panel, options.Title or "Preparing your workspace", {
+        Name = "LoadingTitle",
+        Position = UDim2.fromOffset(0, 77),
+        Size = UDim2.new(1, 0, 0, 25),
+        Font = Enum.Font.GothamBold,
+        TextSize = 17,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    })
+    local detail = label(scope, panel, options.Content or "Getting everything ready...", {
+        Name = "LoadingStep",
+        Position = UDim2.fromOffset(0, 110),
+        Size = UDim2.new(1, 0, 0, 20),
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    })
+    local info = label(scope, panel, options.Info or "", {
+        Name = "LoadingInfo",
+        Position = UDim2.fromOffset(0, 174),
+        Size = UDim2.new(1, -55, 0, 20),
+        TextSize = 11,
+    })
+    local percent = label(scope, panel, "", {
+        Name = "LoadingPercentage",
+        Position = UDim2.new(1, -50, 0, 174),
+        Size = UDim2.fromOffset(50, 20),
+        TextSize = 12,
+        Font = Enum.Font.GothamBold,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    })
+    themed(scope, function()
+        heading.TextColor3 = Color3.fromRGB(240, 243, 250)
+        detail.TextColor3 = Color3.fromRGB(184, 192, 210)
+        info.TextColor3 = Color3.fromRGB(154, 163, 184)
+        percent.TextColor3 = Color3.fromRGB(240, 243, 250)
+    end)
+    local bar = progressSurface(scope, panel, {
+        Position = UDim2.fromOffset(0, 155),
+        Size = UDim2.new(1, 0, 0, 5),
+    }, Color3.new(0, 0, 0))
+    local elapsed, phase = 0, 0
+    scope:Connect(RunService.Heartbeat, function(delta)
+        if handle.Closed or Midnight.ReducedMotion or not Midnight.Visible or not window.Visible then return end
+        elapsed = elapsed + delta
+        if elapsed < 0.09 then return end
+        elapsed = 0
+        phase = (phase + 1) % 12
+        for index, dot in ipairs(dots) do
+            animate(scope, dot, { BackgroundTransparency = 0.12 + ((index - phase) % 12) / 14 }, 0.15)
+        end
+    end)
+    function handle:Set(value, text, information)
+        if self.Closed or not scope.Alive then return self end
+        local number = finite(value, nil)
+        if number then
+            number = math.clamp(number, 0, 100)
+            bar:Set(number / 100)
+            percent.Text = tostring(math.round(number)) .. "%"
+        else
+            bar:SetIndeterminate(true)
+            percent.Text = "..."
+        end
+        if text ~= nil then revealText(scope, detail, text) end
+        if information ~= nil then revealText(scope, info, information) end
+        return self
+    end
+    function handle:SetInfo(text)
+        if scope.Alive and not self.Closed then revealText(scope, info, text) end
+        return self
+    end
+    function handle:Close(immediate)
+        if not scope.Alive then return end
+        if self.Closed and not immediate then return end
+        self.Closed = true
+        local function dispose()
+            if window.LoadingOverlay == self then window.LoadingOverlay = nil end
+            scope:Destroy()
+            overlay:Destroy()
+        end
+        if immediate or Midnight.ReducedMotion then
+            dispose()
+        else
+            animate(scope, overlay, { GroupTransparency = 1 }, 0.25)
+            scope:Delay(0.26, dispose)
+        end
+    end
+    function handle:Complete(text)
+        if self.Closed then return self end
+        self:Set(100, text or "Ready")
+        scope:Delay(0.3, function() self:Close() end)
+        return self
+    end
+    handle.Root = overlay
+    self.LoadingOverlay = handle
+    handle:Set(options.Progress, options.Content, options.Info)
+    animate(scope, overlay, { GroupTransparency = 0 }, 0.25)
+    return handle
+end
+
 -- Dropdowns ------------------------------------------------------------------
 
 local function stringOptions(values)
@@ -3729,6 +4361,7 @@ function ContainerMethods:Dropdown(options)
     color(scope, selected, "BackgroundColor3", "Background")
     local selectedOutline = stroke(scope, selected, "Border", 0.65)
     local selectedText = label(scope, selected, "Select...", {
+        Name = "SelectedText",
         Position = UDim2.fromOffset(10, 0),
         Size = UDim2.new(1, -44, 1, 0),
         TextSize = 12,
@@ -3762,6 +4395,7 @@ function ContainerMethods:Dropdown(options)
     color(scope, list, "ScrollBarImageColor3", "Accent")
     layout(list, 4)
     local empty = label(scope, panel, "No matching options", {
+        Name = "Empty",
         Position = UDim2.fromOffset(4, searchable and 48 or 8),
         Size = UDim2.new(1, -8, 0, 32),
         TextSize = 12,
@@ -3901,6 +4535,7 @@ function ContainerMethods:Dropdown(options)
         listScope = Scope.new(scope)
         for index, value in ipairs(item.Items) do
             local entryRoot = button(listScope, list, "", {
+                Name = "EntryRoot",
                 Size = UDim2.new(1, -6, 0, 34),
                 BackgroundTransparency = 1,
                 LayoutOrder = index,
@@ -3911,6 +4546,7 @@ function ContainerMethods:Dropdown(options)
                 Value = value,
                 Hovered = false,
                 Caption = label(listScope, entryRoot, value, {
+                    Name = "Caption",
                     Position = UDim2.fromOffset(10, 0),
                     Size = UDim2.new(1, -44, 1, 0),
                     TextSize = 12,
@@ -3987,6 +4623,7 @@ function ContainerMethods:Keybind(options)
     local item, scope, root = control(self, options, options.Description and 60 or 46)
     captions(scope, root, options, 132)
     local keyButton = button(scope, root, "None", {
+        Name = "KeyButton",
         Position = UDim2.new(1, -120, 0, 8),
         Size = UDim2.fromOffset(108, 30),
         BackgroundTransparency = 0,
@@ -4068,6 +4705,7 @@ function ContainerMethods:Textbox(options)
     local item, scope, root = control(self, options, options.Description and 96 or 78)
     captions(scope, root, options)
     local input = textBox(scope, root, options.Placeholder or "Enter text...", {
+        Name = "Input",
         Position = UDim2.new(0, 12, 1, -40),
         Size = UDim2.new(1, -24, 0, 32),
         MultiLine = options.MultiLine == true,
@@ -4155,6 +4793,7 @@ function ContainerMethods:ColorPicker(options)
     root.ClipsDescendants = true
     item.Open = false
     local preview = button(scope, root, "", {
+        Name = "Preview",
         Position = UDim2.new(1, -60, 0, 10),
         Size = UDim2.fromOffset(46, 26),
         BackgroundTransparency = 0,
@@ -4162,17 +4801,20 @@ function ContainerMethods:ColorPicker(options)
     corner(preview, 6)
     stroke(scope, preview, "Text", 0.65)
     local panel = frame(scope, root, {
+        Name = "Panel",
         Position = UDim2.fromOffset(12, baseHeight),
         Size = UDim2.new(1, -24, 0, 278),
         BackgroundTransparency = 1,
         Visible = false,
     })
     local sv = frame(scope, panel, {
+        Name = "Sv",
         Size = UDim2.new(1, 0, 0, 144),
         ClipsDescendants = true,
     })
     corner(sv, 8)
     local white = frame(scope, sv, {
+        Name = "White",
         Size = UDim2.fromScale(1, 1),
         BackgroundColor3 = Color3.new(1, 1, 1),
     })
@@ -4180,6 +4822,7 @@ function ContainerMethods:ColorPicker(options)
     local whiteGradient = new("UIGradient", {}, white)
     whiteGradient.Transparency = NumberSequence.new(0, 1)
     local black = frame(scope, sv, {
+        Name = "Black",
         Size = UDim2.fromScale(1, 1),
         BackgroundColor3 = Color3.new(0, 0, 0),
     })
@@ -4187,6 +4830,7 @@ function ContainerMethods:ColorPicker(options)
     local blackGradient = new("UIGradient", { Rotation = 90 }, black)
     blackGradient.Transparency = NumberSequence.new(1, 0)
     local svCursor = frame(scope, sv, {
+        Name = "SvCursor",
         AnchorPoint = Vector2.new(0.5, 0.5),
         Size = UDim2.fromOffset(10, 10),
         BackgroundTransparency = 1,
@@ -4195,14 +4839,17 @@ function ContainerMethods:ColorPicker(options)
     corner(svCursor, 5)
     new("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2 }, svCursor)
     local svHit = button(scope, sv, "", {
+        Name = "SvHit",
         Size = UDim2.fromScale(1, 1),
         ZIndex = 4,
     })
     local hueHit = button(scope, panel, "", {
+        Name = "HueHit",
         Position = UDim2.fromOffset(0, 150),
         Size = UDim2.new(1, 0, 0, 30),
     })
     local hueTrack = frame(scope, hueHit, {
+        Name = "HueTrack",
         Position = UDim2.fromOffset(0, 5),
         Size = UDim2.new(1, 0, 0, 20),
         BackgroundColor3 = Color3.new(1, 1, 1),
@@ -4214,6 +4861,7 @@ function ContainerMethods:ColorPicker(options)
     end
     new("UIGradient", { Color = ColorSequence.new(rainbow) }, hueTrack)
     local hueCursor = frame(scope, hueTrack, {
+        Name = "HueCursor",
         AnchorPoint = Vector2.new(0.5, 0.5),
         Position = UDim2.fromScale(0, 0.5),
         Size = UDim2.fromOffset(5, 26),
@@ -4230,17 +4878,20 @@ function ContainerMethods:ColorPicker(options)
         })
     end
     local hex = textBox(scope, panel, "#RRGGBB", {
+        Name = "Hex",
         Position = UDim2.fromOffset(0, 229),
         Size = UDim2.new(1, -120, 0, 32),
         TextSize = 11,
     })
     local copyButton = button(scope, panel, "Copy", {
+        Name = "CopyButton",
         Position = UDim2.new(1, -114, 0, 229),
         Size = UDim2.fromOffset(54, 32),
         BackgroundTransparency = 0,
         TextSize = 11,
     })
     local pasteButton = button(scope, panel, "Paste", {
+        Name = "PasteButton",
         Position = UDim2.new(1, -54, 0, 229),
         Size = UDim2.fromOffset(54, 32),
         BackgroundTransparency = 0,
@@ -4440,6 +5091,7 @@ local function runtime()
     local gui = screen("MidnightNotifications", 10000)
     gui.Enabled = Midnight.Visible
     local holder = frame(scope, gui, {
+        Name = "Holder",
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, -16, 0, 20),
         Size = UDim2.new(1, -32, 1, -40),
@@ -4479,12 +5131,14 @@ function Midnight:Notify(options)
         LayoutOrder = NotificationId,
     })
     local group = new("CanvasGroup", {
+        Name = "Group",
         Size = UDim2.fromScale(1, 1),
         Position = UDim2.fromOffset(24, 0),
         BackgroundTransparency = 1,
         GroupTransparency = 1,
     }, slot)
     local card = frame(scope, group, {
+        Name = "Card",
         Position = UDim2.fromOffset(4, 4),
         Size = UDim2.new(1, -8, 1, -8),
     }, "Panel")
@@ -4493,6 +5147,7 @@ function Midnight:Notify(options)
     local setLight = aura(scope, card, token)
     setLight(true, true, 0.018)
     local badge = frame(scope, card, {
+        Name = "Badge",
         Position = UDim2.fromOffset(12, 13),
         Size = UDim2.fromOffset(28, 28),
         BackgroundTransparency = 0.9,
@@ -4527,17 +5182,20 @@ function Midnight:Notify(options)
     revealText(scope, heading, heading.Text)
     revealText(scope, message, message.Text)
     local dismiss = button(scope, card, "", {
+        Name = "Dismiss",
         Position = UDim2.new(1, -30, 0, 8),
         Size = UDim2.fromOffset(24, 24),
     })
     icon(scope, dismiss, "Close", UDim2.fromOffset(5, 5), 14, "Muted")
     local progressTrack = frame(scope, card, {
+        Name = "ProgressTrack",
         Position = UDim2.new(0, 12, 1, -7),
         Size = UDim2.new(1, -24, 0, 2),
         BackgroundTransparency = 0.4,
     }, "Border")
     corner(progressTrack, 2)
     local progress = frame(scope, progressTrack, {
+        Name = "Progress",
         Size = UDim2.fromScale(1, 1),
         BackgroundTransparency = 0.1,
     }, token)
@@ -4646,6 +5304,7 @@ function WindowMethods:Confirm(options)
     if self.Destroyed then
         return nil
     end
+    if self.LoadingOverlay then self.LoadingOverlay:Close(true) end
     if self.Modal then
         self.Modal:Close(false)
     end
@@ -4658,6 +5317,7 @@ function WindowMethods:Confirm(options)
     self:SetVisible(true)
     local scope = Scope.new(self.Scope)
     local overlay = new("CanvasGroup", {
+        Name = "Overlay",
         Size = UDim2.fromScale(1, 1),
         BackgroundColor3 = Color3.new(0, 0, 0),
         BackgroundTransparency = 0.35,
@@ -4668,6 +5328,7 @@ function WindowMethods:Confirm(options)
     corner(overlay, 10)
     button(scope, overlay, "", { Size = UDim2.fromScale(1, 1), ZIndex = 1 })
     local panel = frame(scope, overlay, {
+        Name = "Panel",
         AnchorPoint = Vector2.new(0.5, 0.5),
         Position = UDim2.fromScale(0.5, 0.5),
         Size = UDim2.new(1, -36, 0, 210),
@@ -4689,11 +5350,13 @@ function WindowMethods:Confirm(options)
         TextYAlignment = Enum.TextYAlignment.Top,
     }, "Muted")
     local cancel = button(scope, panel, options.CancelText or "Cancel", {
+        Name = "Cancel",
         Position = UDim2.new(0, 16, 1, -51),
         Size = UDim2.new(0.5, -22, 0, 36),
         BackgroundTransparency = 0,
     })
     local confirm = button(scope, panel, options.ConfirmText or "Confirm", {
+        Name = "Confirm",
         Position = UDim2.new(0.5, 6, 1, -51),
         Size = UDim2.new(0.5, -22, 0, 36),
         BackgroundTransparency = 0,
@@ -4702,6 +5365,7 @@ function WindowMethods:Confirm(options)
     corner(confirm, 8)
     color(scope, cancel, "BackgroundColor3", "Raised")
     color(scope, confirm, "BackgroundColor3", "Accent")
+    color(scope, confirm, "TextColor3", "OnAccent")
     local window = self
     local modalScale = new("UIScale", { Scale = 0.97 }, panel)
     local handle = { Closed = false }
@@ -4760,6 +5424,7 @@ function ControlMethods:_Commit(silent, changed)
 end
 
 function ControlMethods:_Register(flag, default)
+    self.Default = copy(default)
     if flag ~= nil then
         assert(type(flag) == "string" and #flag > 0, "Flag must be a non-empty string")
         assert(not FlagOwners[flag], "Duplicate flag: " .. flag)
