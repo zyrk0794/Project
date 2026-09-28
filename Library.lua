@@ -1,14 +1,14 @@
 --[[
     Midnight UI Library
-    Version: 2.0.0
+    Version: 2.1.0
     Credits: Original implementation by OpenAI for this project.
-    Date: 2026-09-27
+    Date: 2026-09-28
     License: MIT
 
     Client-side Roblox Luau module with optional host capabilities.
     Studio: put this file in a ModuleScript and require it from a LocalScript.
     External hosts: this file returns the library for a loadstring loader.
-    No external assets or runtime dependencies are required.
+    Lucide icons use Roblox-hosted atlases; no remote Lua modules are executed.
 ]]
 
 -- 1. Services and utilities ----------------------------------------------------
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.0.0",
+    Version = "2.1.0",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -325,6 +325,8 @@ local function textBox(scope, parent, placeholder, properties)
         TextSize = 13,
         BorderSizePixel = 0,
         TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ClipsDescendants = true,
     }, parent)
     for key, value in pairs(properties or {}) do
         result[key] = value
@@ -421,21 +423,11 @@ local function hover(scope, object, outline, settings)
         local goals = {
             BackgroundColor3 = active and theme.Raised or theme.Panel,
         }
-        local edge = {
-            Color = active and theme[settings.Accent or "Accent"] or theme.Border,
-            Transparency = active and (pressed and 0.2 or 0.5) or 0.78,
-        }
+        -- Hover changes the surface only. Borders never light up on hover.
         if immediate then
             object.BackgroundColor3 = goals.BackgroundColor3
-            if outline then
-                outline.Color = edge.Color
-                outline.Transparency = edge.Transparency
-            end
         else
             animate(scope, object, goals, 0.18)
-            if outline then
-                animate(scope, outline, edge, 0.18)
-            end
         end
     end
     scope:Connect(object.MouseEnter, function()
@@ -465,62 +457,1749 @@ local function hover(scope, object, outline, settings)
     return render
 end
 
--- Native vector icons avoid missing Unicode glyphs and external assets.
-local IconPaths = {
-    Home = { {2, 9, 10, 2, 18, 9}, {5, 8, 5, 18, 15, 18, 15, 8}, {8, 18, 8, 12, 12, 12, 12, 18} },
-    Moon = { {12, 2, 7, 3, 3, 7, 3, 12, 6, 16, 11, 18, 16, 16, 18, 12, 13, 13, 9, 10, 8, 6, 12, 2} },
-    Settings = { {3, 5, 17, 5}, {3, 10, 17, 10}, {3, 15, 17, 15}, {7, 3, 7, 7}, {13, 8, 13, 12}, {8, 13, 8, 17} },
-    Sliders = { {3, 5, 17, 5}, {3, 10, 17, 10}, {3, 15, 17, 15}, {7, 3, 7, 7}, {13, 8, 13, 12}, {8, 13, 8, 17} },
-    Grid = { {3, 3, 8, 3, 8, 8, 3, 8, 3, 3}, {12, 3, 17, 3, 17, 8, 12, 8, 12, 3}, {3, 12, 8, 12, 8, 17, 3, 17, 3, 12}, {12, 12, 17, 12, 17, 17, 12, 17, 12, 12} },
-    Palette = { {10, 2, 5, 3, 2, 8, 3, 14, 7, 18, 12, 18, 12, 14, 17, 13, 18, 8, 15, 3, 10, 2}, {6, 7, 6.2, 7}, {10, 5, 10.2, 5}, {14, 8, 14.2, 8} },
-    Bell = { {4, 14, 6, 12, 6, 7, 8, 4, 12, 4, 14, 7, 14, 12, 16, 14, 4, 14}, {8, 17, 12, 17} },
-    Keyboard = { {2, 5, 18, 5, 18, 15, 2, 15, 2, 5}, {5, 8, 6, 8}, {9, 8, 10, 8}, {13, 8, 14, 8}, {6, 12, 14, 12} },
-    Chevron = { {6, 8, 10, 12, 14, 8} },
-    Arrow = { {4, 10, 16, 10}, {11, 5, 16, 10, 11, 15} },
-    Close = { {5, 5, 15, 15}, {15, 5, 5, 15} },
-    Minimize = { {5, 10, 15, 10} },
-    Resize = { {5, 16, 16, 5}, {10, 16, 16, 10} },
-    Check = { {4, 10, 8, 14, 16, 6} },
-    Search = { {8, 3, 4, 5, 3, 9, 5, 12, 9, 13, 12, 11, 13, 7, 11, 4, 8, 3}, {12, 12, 17, 17} },
-    Save = { {3, 3, 15, 3, 17, 5, 17, 17, 3, 17, 3, 3}, {6, 3, 6, 8, 13, 8, 13, 3}, {6, 17, 6, 12, 14, 12, 14, 17} },
+-- Lucide Roblox atlas snapshot: package 0.1.3, Lucide 0.363.0.
+-- Source: https://github.com/latte-soft/lucide-roblox
+-- Embedded data only: icons load as Roblox images, never remote executable code.
+-- Each entry is { assetId, cropX, cropY }; all crops are 48 x 48 pixels.
+--[[
+# MIT License
+
+Copyright (c) 2023 Latte Softworks <https://latte.to>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+# Lucide License (ISC)
+
+Lucide Icons (this package's icon sources) are licensed under ISC License. You can view it online directly at <https://lucide.dev/license>.
+
+## ISC License
+
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+]]
+local LucideAtlas = {
+    ["a-arrow-down"] = { 16898612629, 771, 0 },
+    ["a-arrow-up"] = { 16898612629, 0, 771 },
+    ["a-large-small"] = { 16898612629, 771, 257 },
+    ["accessibility"] = { 16898612629, 257, 771 },
+    ["activity-square"] = { 16898612629, 771, 514 },
+    ["activity"] = { 16898612629, 514, 771 },
+    ["air-vent"] = { 16898612629, 820, 0 },
+    ["airplay"] = { 16898612629, 771, 49 },
+    ["alarm-check"] = { 16898612629, 49, 771 },
+    ["alarm-clock-check"] = { 16898612629, 0, 820 },
+    ["alarm-clock-minus"] = { 16898612629, 820, 257 },
+    ["alarm-clock-off"] = { 16898612629, 771, 306 },
+    ["alarm-clock-plus"] = { 16898612629, 306, 771 },
+    ["alarm-clock"] = { 16898612629, 257, 820 },
+    ["alarm-minus"] = { 16898612629, 820, 514 },
+    ["alarm-plus"] = { 16898612629, 771, 563 },
+    ["alarm-smoke"] = { 16898612629, 563, 771 },
+    ["album"] = { 16898612629, 514, 820 },
+    ["alert-circle"] = { 16898612629, 869, 0 },
+    ["alert-octagon"] = { 16898612629, 820, 49 },
+    ["alert-triangle"] = { 16898612629, 771, 98 },
+    ["align-center-horizontal"] = { 16898612629, 98, 771 },
+    ["align-center-vertical"] = { 16898612629, 49, 820 },
+    ["align-center"] = { 16898612629, 0, 869 },
+    ["align-end-horizontal"] = { 16898612629, 869, 257 },
+    ["align-end-vertical"] = { 16898612629, 820, 306 },
+    ["align-horizontal-distribute-center"] = { 16898612629, 771, 355 },
+    ["align-horizontal-distribute-end"] = { 16898612629, 355, 771 },
+    ["align-horizontal-distribute-start"] = { 16898612629, 306, 820 },
+    ["align-horizontal-justify-center"] = { 16898612629, 257, 869 },
+    ["align-horizontal-justify-end"] = { 16898612629, 869, 514 },
+    ["align-horizontal-justify-start"] = { 16898612629, 820, 563 },
+    ["align-horizontal-space-around"] = { 16898612629, 771, 612 },
+    ["align-horizontal-space-between"] = { 16898612629, 612, 771 },
+    ["align-justify"] = { 16898612629, 563, 820 },
+    ["align-left"] = { 16898612629, 514, 869 },
+    ["align-right"] = { 16898612629, 918, 0 },
+    ["align-start-horizontal"] = { 16898612629, 869, 49 },
+    ["align-start-vertical"] = { 16898612629, 820, 98 },
+    ["align-vertical-distribute-center"] = { 16898612629, 771, 147 },
+    ["align-vertical-distribute-end"] = { 16898612629, 147, 771 },
+    ["align-vertical-distribute-start"] = { 16898612629, 98, 820 },
+    ["align-vertical-justify-center"] = { 16898612629, 49, 869 },
+    ["align-vertical-justify-end"] = { 16898612629, 0, 918 },
+    ["align-vertical-justify-start"] = { 16898612629, 918, 257 },
+    ["align-vertical-space-around"] = { 16898612629, 869, 306 },
+    ["align-vertical-space-between"] = { 16898612629, 820, 355 },
+    ["ambulance"] = { 16898612629, 771, 404 },
+    ["ampersand"] = { 16898612629, 404, 771 },
+    ["ampersands"] = { 16898612629, 355, 820 },
+    ["anchor"] = { 16898612629, 306, 869 },
+    ["angry"] = { 16898612629, 257, 918 },
+    ["annoyed"] = { 16898612629, 918, 514 },
+    ["antenna"] = { 16898612629, 869, 563 },
+    ["anvil"] = { 16898612629, 820, 612 },
+    ["aperture"] = { 16898612629, 771, 661 },
+    ["app-window-mac"] = { 16898612629, 661, 771 },
+    ["app-window"] = { 16898612629, 612, 820 },
+    ["apple"] = { 16898612629, 563, 869 },
+    ["archive-restore"] = { 16898612629, 514, 918 },
+    ["archive-x"] = { 16898612629, 967, 0 },
+    ["archive"] = { 16898612629, 918, 49 },
+    ["area-chart"] = { 16898612629, 869, 98 },
+    ["armchair"] = { 16898612629, 820, 147 },
+    ["arrow-big-down-dash"] = { 16898612629, 771, 196 },
+    ["arrow-big-down"] = { 16898612629, 196, 771 },
+    ["arrow-big-left-dash"] = { 16898612629, 147, 820 },
+    ["arrow-big-left"] = { 16898612629, 98, 869 },
+    ["arrow-big-right-dash"] = { 16898612629, 49, 918 },
+    ["arrow-big-right"] = { 16898612629, 0, 967 },
+    ["arrow-big-up-dash"] = { 16898612629, 967, 257 },
+    ["arrow-big-up"] = { 16898612629, 918, 306 },
+    ["arrow-down-0-1"] = { 16898612629, 869, 355 },
+    ["arrow-down-1-0"] = { 16898612629, 820, 404 },
+    ["arrow-down-a-z"] = { 16898612629, 771, 453 },
+    ["arrow-down-circle"] = { 16898612629, 453, 771 },
+    ["arrow-down-from-line"] = { 16898612629, 404, 820 },
+    ["arrow-down-left-from-circle"] = { 16898612629, 355, 869 },
+    ["arrow-down-left-square"] = { 16898612629, 306, 918 },
+    ["arrow-down-left"] = { 16898612629, 257, 967 },
+    ["arrow-down-narrow-wide"] = { 16898612629, 967, 514 },
+    ["arrow-down-right-from-circle"] = { 16898612629, 918, 563 },
+    ["arrow-down-right-square"] = { 16898612629, 869, 612 },
+    ["arrow-down-right"] = { 16898612629, 820, 661 },
+    ["arrow-down-square"] = { 16898612629, 771, 710 },
+    ["arrow-down-to-dot"] = { 16898612629, 710, 771 },
+    ["arrow-down-to-line"] = { 16898612629, 661, 820 },
+    ["arrow-down-up"] = { 16898612629, 612, 869 },
+    ["arrow-down-wide-narrow"] = { 16898612629, 563, 918 },
+    ["arrow-down-z-a"] = { 16898612629, 514, 967 },
+    ["arrow-down"] = { 16898612629, 967, 49 },
+    ["arrow-left-circle"] = { 16898612629, 918, 98 },
+    ["arrow-left-from-line"] = { 16898612629, 869, 147 },
+    ["arrow-left-right"] = { 16898612629, 820, 196 },
+    ["arrow-left-square"] = { 16898612629, 196, 820 },
+    ["arrow-left-to-line"] = { 16898612629, 147, 869 },
+    ["arrow-left"] = { 16898612629, 98, 918 },
+    ["arrow-right-circle"] = { 16898612629, 49, 967 },
+    ["arrow-right-from-line"] = { 16898612629, 967, 306 },
+    ["arrow-right-left"] = { 16898612629, 918, 355 },
+    ["arrow-right-square"] = { 16898612629, 869, 404 },
+    ["arrow-right-to-line"] = { 16898612629, 820, 453 },
+    ["arrow-right"] = { 16898612629, 453, 820 },
+    ["arrow-up-0-1"] = { 16898612629, 404, 869 },
+    ["arrow-up-1-0"] = { 16898612629, 355, 918 },
+    ["arrow-up-a-z"] = { 16898612629, 306, 967 },
+    ["arrow-up-circle"] = { 16898612629, 967, 563 },
+    ["arrow-up-down"] = { 16898612629, 918, 612 },
+    ["arrow-up-from-dot"] = { 16898612629, 869, 661 },
+    ["arrow-up-from-line"] = { 16898612629, 820, 710 },
+    ["arrow-up-left-from-circle"] = { 16898612629, 771, 759 },
+    ["arrow-up-left-square"] = { 16898612629, 710, 820 },
+    ["arrow-up-left"] = { 16898612629, 661, 869 },
+    ["arrow-up-narrow-wide"] = { 16898612629, 612, 918 },
+    ["arrow-up-right-from-circle"] = { 16898612629, 563, 967 },
+    ["arrow-up-right-square"] = { 16898612629, 967, 98 },
+    ["arrow-up-right"] = { 16898612629, 918, 147 },
+    ["arrow-up-square"] = { 16898612629, 869, 196 },
+    ["arrow-up-to-line"] = { 16898612629, 196, 869 },
+    ["arrow-up-wide-narrow"] = { 16898612629, 147, 918 },
+    ["arrow-up-z-a"] = { 16898612629, 98, 967 },
+    ["arrow-up"] = { 16898612629, 967, 355 },
+    ["arrows-up-from-line"] = { 16898612629, 918, 404 },
+    ["asterisk"] = { 16898612629, 869, 453 },
+    ["at-sign"] = { 16898612629, 453, 869 },
+    ["atom"] = { 16898612629, 404, 918 },
+    ["audio-lines"] = { 16898612629, 355, 967 },
+    ["audio-waveform"] = { 16898612629, 967, 612 },
+    ["award"] = { 16898612629, 918, 661 },
+    ["axe"] = { 16898612629, 869, 710 },
+    ["axis-3d"] = { 16898612629, 820, 759 },
+    ["baby"] = { 16898612629, 771, 808 },
+    ["backpack"] = { 16898612629, 710, 869 },
+    ["badge-alert"] = { 16898612629, 661, 918 },
+    ["badge-cent"] = { 16898612629, 612, 967 },
+    ["badge-check"] = { 16898612629, 967, 147 },
+    ["badge-dollar-sign"] = { 16898612629, 918, 196 },
+    ["badge-euro"] = { 16898612629, 196, 918 },
+    ["badge-help"] = { 16898612629, 147, 967 },
+    ["badge-indian-rupee"] = { 16898612629, 967, 404 },
+    ["badge-info"] = { 16898612629, 918, 453 },
+    ["badge-japanese-yen"] = { 16898612629, 453, 918 },
+    ["badge-minus"] = { 16898612629, 404, 967 },
+    ["badge-percent"] = { 16898612629, 967, 661 },
+    ["badge-plus"] = { 16898612629, 918, 710 },
+    ["badge-pound-sterling"] = { 16898612629, 869, 759 },
+    ["badge-russian-ruble"] = { 16898612629, 820, 808 },
+    ["badge-swiss-franc"] = { 16898612629, 771, 857 },
+    ["badge-x"] = { 16898612629, 710, 918 },
+    ["badge"] = { 16898612629, 661, 967 },
+    ["baggage-claim"] = { 16898612629, 967, 196 },
+    ["ban"] = { 16898612629, 196, 967 },
+    ["banana"] = { 16898612629, 967, 453 },
+    ["banknote"] = { 16898612629, 453, 967 },
+    ["bar-chart-2"] = { 16898612629, 967, 710 },
+    ["bar-chart-3"] = { 16898612629, 918, 759 },
+    ["bar-chart-4"] = { 16898612629, 869, 808 },
+    ["bar-chart-big"] = { 16898612629, 820, 857 },
+    ["bar-chart-horizontal-big"] = { 16898612629, 771, 906 },
+    ["bar-chart-horizontal"] = { 16898612629, 710, 967 },
+    ["bar-chart"] = { 16898612629, 967, 759 },
+    ["barcode"] = { 16898612629, 918, 808 },
+    ["baseline"] = { 16898612629, 869, 857 },
+    ["bath"] = { 16898612629, 820, 906 },
+    ["battery-charging"] = { 16898612629, 771, 955 },
+    ["battery-full"] = { 16898612629, 967, 808 },
+    ["battery-low"] = { 16898612629, 918, 857 },
+    ["battery-medium"] = { 16898612629, 869, 906 },
+    ["battery-warning"] = { 16898612629, 820, 955 },
+    ["battery"] = { 16898612629, 967, 857 },
+    ["beaker"] = { 16898612629, 918, 906 },
+    ["bean-off"] = { 16898612629, 869, 955 },
+    ["bean"] = { 16898612629, 967, 906 },
+    ["bed-double"] = { 16898612629, 918, 955 },
+    ["bed-single"] = { 16898612629, 967, 955 },
+    ["bed"] = { 16898612819, 771, 0 },
+    ["beef"] = { 16898612819, 0, 771 },
+    ["beer-off"] = { 16898612819, 771, 257 },
+    ["beer"] = { 16898612819, 257, 771 },
+    ["bell-dot"] = { 16898612819, 771, 514 },
+    ["bell-electric"] = { 16898612819, 514, 771 },
+    ["bell-minus"] = { 16898612819, 820, 0 },
+    ["bell-off"] = { 16898612819, 771, 49 },
+    ["bell-plus"] = { 16898612819, 49, 771 },
+    ["bell-ring"] = { 16898612819, 0, 820 },
+    ["bell"] = { 16898612819, 820, 257 },
+    ["between-horizontal-end"] = { 16898612819, 771, 306 },
+    ["between-horizontal-start"] = { 16898612819, 306, 771 },
+    ["between-vertical-end"] = { 16898612819, 257, 820 },
+    ["between-vertical-start"] = { 16898612819, 820, 514 },
+    ["bike"] = { 16898612819, 771, 563 },
+    ["binary"] = { 16898612819, 563, 771 },
+    ["biohazard"] = { 16898612819, 514, 820 },
+    ["bird"] = { 16898612819, 869, 0 },
+    ["bitcoin"] = { 16898612819, 820, 49 },
+    ["blend"] = { 16898612819, 771, 98 },
+    ["blinds"] = { 16898612819, 98, 771 },
+    ["blocks"] = { 16898612819, 49, 820 },
+    ["bluetooth-connected"] = { 16898612819, 0, 869 },
+    ["bluetooth-off"] = { 16898612819, 869, 257 },
+    ["bluetooth-searching"] = { 16898612819, 820, 306 },
+    ["bluetooth"] = { 16898612819, 771, 355 },
+    ["bold"] = { 16898612819, 355, 771 },
+    ["bolt"] = { 16898612819, 306, 820 },
+    ["bomb"] = { 16898612819, 257, 869 },
+    ["bone"] = { 16898612819, 869, 514 },
+    ["book-a"] = { 16898612819, 820, 563 },
+    ["book-audio"] = { 16898612819, 771, 612 },
+    ["book-check"] = { 16898612819, 612, 771 },
+    ["book-copy"] = { 16898612819, 563, 820 },
+    ["book-dashed"] = { 16898612819, 514, 869 },
+    ["book-down"] = { 16898612819, 918, 0 },
+    ["book-headphones"] = { 16898612819, 869, 49 },
+    ["book-heart"] = { 16898612819, 820, 98 },
+    ["book-image"] = { 16898612819, 771, 147 },
+    ["book-key"] = { 16898612819, 147, 771 },
+    ["book-lock"] = { 16898612819, 98, 820 },
+    ["book-marked"] = { 16898612819, 49, 869 },
+    ["book-minus"] = { 16898612819, 0, 918 },
+    ["book-open-check"] = { 16898612819, 918, 257 },
+    ["book-open-text"] = { 16898612819, 869, 306 },
+    ["book-open"] = { 16898612819, 820, 355 },
+    ["book-plus"] = { 16898612819, 771, 404 },
+    ["book-text"] = { 16898612819, 404, 771 },
+    ["book-type"] = { 16898612819, 355, 820 },
+    ["book-up-2"] = { 16898612819, 306, 869 },
+    ["book-up"] = { 16898612819, 257, 918 },
+    ["book-user"] = { 16898612819, 918, 514 },
+    ["book-x"] = { 16898612819, 869, 563 },
+    ["book"] = { 16898612819, 820, 612 },
+    ["bookmark-check"] = { 16898612819, 771, 661 },
+    ["bookmark-minus"] = { 16898612819, 661, 771 },
+    ["bookmark-plus"] = { 16898612819, 612, 820 },
+    ["bookmark-x"] = { 16898612819, 563, 869 },
+    ["bookmark"] = { 16898612819, 514, 918 },
+    ["boom-box"] = { 16898612819, 967, 0 },
+    ["bot-message-square"] = { 16898612819, 918, 49 },
+    ["bot"] = { 16898612819, 869, 98 },
+    ["box-select"] = { 16898612819, 820, 147 },
+    ["box"] = { 16898612819, 771, 196 },
+    ["boxes"] = { 16898612819, 196, 771 },
+    ["braces"] = { 16898612819, 147, 820 },
+    ["brackets"] = { 16898612819, 98, 869 },
+    ["brain-circuit"] = { 16898612819, 49, 918 },
+    ["brain-cog"] = { 16898612819, 0, 967 },
+    ["brain"] = { 16898612819, 967, 257 },
+    ["brick-wall"] = { 16898612819, 918, 306 },
+    ["briefcase-business"] = { 16898612819, 869, 355 },
+    ["briefcase-medical"] = { 16898612819, 820, 404 },
+    ["briefcase"] = { 16898612819, 771, 453 },
+    ["bring-to-front"] = { 16898612819, 453, 771 },
+    ["brush"] = { 16898612819, 404, 820 },
+    ["bug-off"] = { 16898612819, 355, 869 },
+    ["bug-play"] = { 16898612819, 306, 918 },
+    ["bug"] = { 16898612819, 257, 967 },
+    ["building-2"] = { 16898612819, 967, 514 },
+    ["building"] = { 16898612819, 918, 563 },
+    ["bus-front"] = { 16898612819, 869, 612 },
+    ["bus"] = { 16898612819, 820, 661 },
+    ["cable-car"] = { 16898612819, 771, 710 },
+    ["cable"] = { 16898612819, 710, 771 },
+    ["cake-slice"] = { 16898612819, 661, 820 },
+    ["cake"] = { 16898612819, 612, 869 },
+    ["calculator"] = { 16898612819, 563, 918 },
+    ["calendar-check-2"] = { 16898612819, 514, 967 },
+    ["calendar-check"] = { 16898612819, 967, 49 },
+    ["calendar-clock"] = { 16898612819, 918, 98 },
+    ["calendar-days"] = { 16898612819, 869, 147 },
+    ["calendar-fold"] = { 16898612819, 820, 196 },
+    ["calendar-heart"] = { 16898612819, 196, 820 },
+    ["calendar-minus-2"] = { 16898612819, 147, 869 },
+    ["calendar-minus"] = { 16898612819, 98, 918 },
+    ["calendar-off"] = { 16898612819, 49, 967 },
+    ["calendar-plus-2"] = { 16898612819, 967, 306 },
+    ["calendar-plus"] = { 16898612819, 918, 355 },
+    ["calendar-range"] = { 16898612819, 869, 404 },
+    ["calendar-search"] = { 16898612819, 820, 453 },
+    ["calendar-x-2"] = { 16898612819, 453, 820 },
+    ["calendar-x"] = { 16898612819, 404, 869 },
+    ["calendar"] = { 16898612819, 355, 918 },
+    ["camera-off"] = { 16898612819, 306, 967 },
+    ["camera"] = { 16898612819, 967, 563 },
+    ["candlestick-chart"] = { 16898612819, 918, 612 },
+    ["candy-cane"] = { 16898612819, 869, 661 },
+    ["candy-off"] = { 16898612819, 820, 710 },
+    ["candy"] = { 16898612819, 771, 759 },
+    ["cannabis"] = { 16898612819, 710, 820 },
+    ["captions-off"] = { 16898612819, 661, 869 },
+    ["captions"] = { 16898612819, 612, 918 },
+    ["car-front"] = { 16898612819, 563, 967 },
+    ["car-taxi-front"] = { 16898612819, 967, 98 },
+    ["car"] = { 16898612819, 918, 147 },
+    ["caravan"] = { 16898612819, 869, 196 },
+    ["carrot"] = { 16898612819, 196, 869 },
+    ["case-lower"] = { 16898612819, 147, 918 },
+    ["case-sensitive"] = { 16898612819, 98, 967 },
+    ["case-upper"] = { 16898612819, 967, 355 },
+    ["cassette-tape"] = { 16898612819, 918, 404 },
+    ["cast"] = { 16898612819, 869, 453 },
+    ["castle"] = { 16898612819, 453, 869 },
+    ["cat"] = { 16898612819, 404, 918 },
+    ["cctv"] = { 16898612819, 355, 967 },
+    ["check-check"] = { 16898612819, 967, 612 },
+    ["check-circle-2"] = { 16898612819, 918, 661 },
+    ["check-circle"] = { 16898612819, 869, 710 },
+    ["check-square-2"] = { 16898612819, 820, 759 },
+    ["check-square"] = { 16898612819, 771, 808 },
+    ["check"] = { 16898612819, 710, 869 },
+    ["chef-hat"] = { 16898612819, 661, 918 },
+    ["cherry"] = { 16898612819, 612, 967 },
+    ["chevron-down-circle"] = { 16898612819, 967, 147 },
+    ["chevron-down-square"] = { 16898612819, 918, 196 },
+    ["chevron-down"] = { 16898612819, 196, 918 },
+    ["chevron-first"] = { 16898612819, 147, 967 },
+    ["chevron-last"] = { 16898612819, 967, 404 },
+    ["chevron-left-circle"] = { 16898612819, 918, 453 },
+    ["chevron-left-square"] = { 16898612819, 453, 918 },
+    ["chevron-left"] = { 16898612819, 404, 967 },
+    ["chevron-right-circle"] = { 16898612819, 967, 661 },
+    ["chevron-right-square"] = { 16898612819, 918, 710 },
+    ["chevron-right"] = { 16898612819, 869, 759 },
+    ["chevron-up-circle"] = { 16898612819, 820, 808 },
+    ["chevron-up-square"] = { 16898612819, 771, 857 },
+    ["chevron-up"] = { 16898612819, 710, 918 },
+    ["chevrons-down-up"] = { 16898612819, 661, 967 },
+    ["chevrons-down"] = { 16898612819, 967, 196 },
+    ["chevrons-left-right"] = { 16898612819, 196, 967 },
+    ["chevrons-left"] = { 16898612819, 967, 453 },
+    ["chevrons-right-left"] = { 16898612819, 453, 967 },
+    ["chevrons-right"] = { 16898612819, 967, 710 },
+    ["chevrons-up-down"] = { 16898612819, 918, 759 },
+    ["chevrons-up"] = { 16898612819, 869, 808 },
+    ["chrome"] = { 16898612819, 820, 857 },
+    ["church"] = { 16898612819, 771, 906 },
+    ["cigarette-off"] = { 16898612819, 710, 967 },
+    ["cigarette"] = { 16898612819, 967, 759 },
+    ["circle-alert"] = { 16898612819, 918, 808 },
+    ["circle-arrow-down"] = { 16898612819, 869, 857 },
+    ["circle-arrow-left"] = { 16898612819, 820, 906 },
+    ["circle-arrow-out-down-left"] = { 16898612819, 771, 955 },
+    ["circle-arrow-out-down-right"] = { 16898612819, 967, 808 },
+    ["circle-arrow-out-up-left"] = { 16898612819, 918, 857 },
+    ["circle-arrow-out-up-right"] = { 16898612819, 869, 906 },
+    ["circle-arrow-right"] = { 16898612819, 820, 955 },
+    ["circle-arrow-up"] = { 16898612819, 967, 857 },
+    ["circle-check-big"] = { 16898612819, 918, 906 },
+    ["circle-check"] = { 16898612819, 869, 955 },
+    ["circle-chevron-down"] = { 16898612819, 967, 906 },
+    ["circle-chevron-left"] = { 16898612819, 918, 955 },
+    ["circle-chevron-right"] = { 16898612819, 967, 955 },
+    ["circle-chevron-up"] = { 16898613044, 771, 0 },
+    ["circle-dashed"] = { 16898613044, 0, 771 },
+    ["circle-divide"] = { 16898613044, 771, 257 },
+    ["circle-dollar-sign"] = { 16898613044, 257, 771 },
+    ["circle-dot-dashed"] = { 16898613044, 771, 514 },
+    ["circle-dot"] = { 16898613044, 514, 771 },
+    ["circle-ellipsis"] = { 16898613044, 820, 0 },
+    ["circle-equal"] = { 16898613044, 771, 49 },
+    ["circle-fading-plus"] = { 16898613044, 49, 771 },
+    ["circle-gauge"] = { 16898613044, 0, 820 },
+    ["circle-help"] = { 16898613044, 820, 257 },
+    ["circle-minus"] = { 16898613044, 771, 306 },
+    ["circle-off"] = { 16898613044, 306, 771 },
+    ["circle-parking-off"] = { 16898613044, 257, 820 },
+    ["circle-parking"] = { 16898613044, 820, 514 },
+    ["circle-pause"] = { 16898613044, 771, 563 },
+    ["circle-percent"] = { 16898613044, 563, 771 },
+    ["circle-play"] = { 16898613044, 514, 820 },
+    ["circle-plus"] = { 16898613044, 869, 0 },
+    ["circle-power"] = { 16898613044, 820, 49 },
+    ["circle-slash-2"] = { 16898613044, 771, 98 },
+    ["circle-slash"] = { 16898613044, 98, 771 },
+    ["circle-stop"] = { 16898613044, 49, 820 },
+    ["circle-user-round"] = { 16898613044, 0, 869 },
+    ["circle-user"] = { 16898613044, 869, 257 },
+    ["circle-x"] = { 16898613044, 820, 306 },
+    ["circle"] = { 16898613044, 771, 355 },
+    ["circuit-board"] = { 16898613044, 355, 771 },
+    ["citrus"] = { 16898613044, 306, 820 },
+    ["clapperboard"] = { 16898613044, 257, 869 },
+    ["clipboard-check"] = { 16898613044, 869, 514 },
+    ["clipboard-copy"] = { 16898613044, 820, 563 },
+    ["clipboard-edit"] = { 16898613044, 771, 612 },
+    ["clipboard-list"] = { 16898613044, 612, 771 },
+    ["clipboard-minus"] = { 16898613044, 563, 820 },
+    ["clipboard-paste"] = { 16898613044, 514, 869 },
+    ["clipboard-pen-line"] = { 16898613044, 918, 0 },
+    ["clipboard-pen"] = { 16898613044, 869, 49 },
+    ["clipboard-plus"] = { 16898613044, 820, 98 },
+    ["clipboard-signature"] = { 16898613044, 771, 147 },
+    ["clipboard-type"] = { 16898613044, 147, 771 },
+    ["clipboard-x"] = { 16898613044, 98, 820 },
+    ["clipboard"] = { 16898613044, 49, 869 },
+    ["clock-1"] = { 16898613044, 0, 918 },
+    ["clock-10"] = { 16898613044, 918, 257 },
+    ["clock-11"] = { 16898613044, 869, 306 },
+    ["clock-12"] = { 16898613044, 820, 355 },
+    ["clock-2"] = { 16898613044, 771, 404 },
+    ["clock-3"] = { 16898613044, 404, 771 },
+    ["clock-4"] = { 16898613044, 355, 820 },
+    ["clock-5"] = { 16898613044, 306, 869 },
+    ["clock-6"] = { 16898613044, 257, 918 },
+    ["clock-7"] = { 16898613044, 918, 514 },
+    ["clock-8"] = { 16898613044, 869, 563 },
+    ["clock-9"] = { 16898613044, 820, 612 },
+    ["clock"] = { 16898613044, 771, 661 },
+    ["cloud-cog"] = { 16898613044, 661, 771 },
+    ["cloud-download"] = { 16898613044, 612, 820 },
+    ["cloud-drizzle"] = { 16898613044, 563, 869 },
+    ["cloud-fog"] = { 16898613044, 514, 918 },
+    ["cloud-hail"] = { 16898613044, 967, 0 },
+    ["cloud-lightning"] = { 16898613044, 918, 49 },
+    ["cloud-moon-rain"] = { 16898613044, 869, 98 },
+    ["cloud-moon"] = { 16898613044, 820, 147 },
+    ["cloud-off"] = { 16898613044, 771, 196 },
+    ["cloud-rain-wind"] = { 16898613044, 196, 771 },
+    ["cloud-rain"] = { 16898613044, 147, 820 },
+    ["cloud-snow"] = { 16898613044, 98, 869 },
+    ["cloud-sun-rain"] = { 16898613044, 49, 918 },
+    ["cloud-sun"] = { 16898613044, 0, 967 },
+    ["cloud-upload"] = { 16898613044, 967, 257 },
+    ["cloud"] = { 16898613044, 918, 306 },
+    ["cloudy"] = { 16898613044, 869, 355 },
+    ["clover"] = { 16898613044, 820, 404 },
+    ["club"] = { 16898613044, 771, 453 },
+    ["code-2"] = { 16898613044, 453, 771 },
+    ["code-xml"] = { 16898613044, 404, 820 },
+    ["code"] = { 16898613044, 355, 869 },
+    ["codepen"] = { 16898613044, 306, 918 },
+    ["codesandbox"] = { 16898613044, 257, 967 },
+    ["coffee"] = { 16898613044, 967, 514 },
+    ["cog"] = { 16898613044, 918, 563 },
+    ["coins"] = { 16898613044, 869, 612 },
+    ["columns-2"] = { 16898613044, 820, 661 },
+    ["columns-3"] = { 16898613044, 771, 710 },
+    ["columns-4"] = { 16898613044, 710, 771 },
+    ["columns"] = { 16898613044, 661, 820 },
+    ["combine"] = { 16898613044, 612, 869 },
+    ["command"] = { 16898613044, 563, 918 },
+    ["compass"] = { 16898613044, 514, 967 },
+    ["component"] = { 16898613044, 967, 49 },
+    ["computer"] = { 16898613044, 918, 98 },
+    ["concierge-bell"] = { 16898613044, 869, 147 },
+    ["cone"] = { 16898613044, 820, 196 },
+    ["construction"] = { 16898613044, 196, 820 },
+    ["contact-2"] = { 16898613044, 147, 869 },
+    ["contact-round"] = { 16898613044, 98, 918 },
+    ["contact"] = { 16898613044, 49, 967 },
+    ["container"] = { 16898613044, 967, 306 },
+    ["contrast"] = { 16898613044, 918, 355 },
+    ["cookie"] = { 16898613044, 869, 404 },
+    ["cooking-pot"] = { 16898613044, 820, 453 },
+    ["copy-check"] = { 16898613044, 453, 820 },
+    ["copy-minus"] = { 16898613044, 404, 869 },
+    ["copy-plus"] = { 16898613044, 355, 918 },
+    ["copy-slash"] = { 16898613044, 306, 967 },
+    ["copy-x"] = { 16898613044, 967, 563 },
+    ["copy"] = { 16898613044, 918, 612 },
+    ["copyleft"] = { 16898613044, 869, 661 },
+    ["copyright"] = { 16898613044, 820, 710 },
+    ["corner-down-left"] = { 16898613044, 771, 759 },
+    ["corner-down-right"] = { 16898613044, 710, 820 },
+    ["corner-left-down"] = { 16898613044, 661, 869 },
+    ["corner-left-up"] = { 16898613044, 612, 918 },
+    ["corner-right-down"] = { 16898613044, 563, 967 },
+    ["corner-right-up"] = { 16898613044, 967, 98 },
+    ["corner-up-left"] = { 16898613044, 918, 147 },
+    ["corner-up-right"] = { 16898613044, 869, 196 },
+    ["cpu"] = { 16898613044, 196, 869 },
+    ["creative-commons"] = { 16898613044, 147, 918 },
+    ["credit-card"] = { 16898613044, 98, 967 },
+    ["croissant"] = { 16898613044, 967, 355 },
+    ["crop"] = { 16898613044, 918, 404 },
+    ["cross"] = { 16898613044, 869, 453 },
+    ["crosshair"] = { 16898613044, 453, 869 },
+    ["crown"] = { 16898613044, 404, 918 },
+    ["cuboid"] = { 16898613044, 355, 967 },
+    ["cup-soda"] = { 16898613044, 967, 612 },
+    ["currency"] = { 16898613044, 918, 661 },
+    ["cylinder"] = { 16898613044, 869, 710 },
+    ["database-backup"] = { 16898613044, 820, 759 },
+    ["database-zap"] = { 16898613044, 771, 808 },
+    ["database"] = { 16898613044, 710, 869 },
+    ["delete"] = { 16898613044, 661, 918 },
+    ["dessert"] = { 16898613044, 612, 967 },
+    ["diameter"] = { 16898613044, 967, 147 },
+    ["diamond-percent"] = { 16898613044, 918, 196 },
+    ["diamond"] = { 16898613044, 196, 918 },
+    ["dice-1"] = { 16898613044, 147, 967 },
+    ["dice-2"] = { 16898613044, 967, 404 },
+    ["dice-3"] = { 16898613044, 918, 453 },
+    ["dice-4"] = { 16898613044, 453, 918 },
+    ["dice-5"] = { 16898613044, 404, 967 },
+    ["dice-6"] = { 16898613044, 967, 661 },
+    ["dices"] = { 16898613044, 918, 710 },
+    ["diff"] = { 16898613044, 869, 759 },
+    ["disc-2"] = { 16898613044, 820, 808 },
+    ["disc-3"] = { 16898613044, 771, 857 },
+    ["disc-album"] = { 16898613044, 710, 918 },
+    ["disc"] = { 16898613044, 661, 967 },
+    ["divide-circle"] = { 16898613044, 967, 196 },
+    ["divide-square"] = { 16898613044, 196, 967 },
+    ["divide"] = { 16898613044, 967, 453 },
+    ["dna-off"] = { 16898613044, 453, 967 },
+    ["dna"] = { 16898613044, 967, 710 },
+    ["dock"] = { 16898613044, 918, 759 },
+    ["dog"] = { 16898613044, 869, 808 },
+    ["dollar-sign"] = { 16898613044, 820, 857 },
+    ["donut"] = { 16898613044, 771, 906 },
+    ["door-closed"] = { 16898613044, 710, 967 },
+    ["door-open"] = { 16898613044, 967, 759 },
+    ["dot"] = { 16898613044, 918, 808 },
+    ["download-cloud"] = { 16898613044, 869, 857 },
+    ["download"] = { 16898613044, 820, 906 },
+    ["drafting-compass"] = { 16898613044, 771, 955 },
+    ["drama"] = { 16898613044, 967, 808 },
+    ["dribbble"] = { 16898613044, 918, 857 },
+    ["drill"] = { 16898613044, 869, 906 },
+    ["droplet"] = { 16898613044, 820, 955 },
+    ["droplets"] = { 16898613044, 967, 857 },
+    ["drum"] = { 16898613044, 918, 906 },
+    ["drumstick"] = { 16898613044, 869, 955 },
+    ["dumbbell"] = { 16898613044, 967, 906 },
+    ["ear-off"] = { 16898613044, 918, 955 },
+    ["ear"] = { 16898613044, 967, 955 },
+    ["earth-lock"] = { 16898613353, 771, 0 },
+    ["earth"] = { 16898613353, 0, 771 },
+    ["eclipse"] = { 16898613353, 771, 257 },
+    ["egg-fried"] = { 16898613353, 257, 771 },
+    ["egg-off"] = { 16898613353, 771, 514 },
+    ["egg"] = { 16898613353, 514, 771 },
+    ["ellipsis-vertical"] = { 16898613353, 820, 0 },
+    ["ellipsis"] = { 16898613353, 771, 49 },
+    ["equal-not"] = { 16898613353, 49, 771 },
+    ["equal"] = { 16898613353, 0, 820 },
+    ["eraser"] = { 16898613353, 820, 257 },
+    ["euro"] = { 16898613353, 771, 306 },
+    ["expand"] = { 16898613353, 306, 771 },
+    ["external-link"] = { 16898613353, 257, 820 },
+    ["eye-off"] = { 16898613353, 820, 514 },
+    ["eye"] = { 16898613353, 771, 563 },
+    ["facebook"] = { 16898613353, 563, 771 },
+    ["factory"] = { 16898613353, 514, 820 },
+    ["fan"] = { 16898613353, 869, 0 },
+    ["fast-forward"] = { 16898613353, 820, 49 },
+    ["feather"] = { 16898613353, 771, 98 },
+    ["fence"] = { 16898613353, 98, 771 },
+    ["ferris-wheel"] = { 16898613353, 49, 820 },
+    ["figma"] = { 16898613353, 0, 869 },
+    ["file-archive"] = { 16898613353, 869, 257 },
+    ["file-audio-2"] = { 16898613353, 820, 306 },
+    ["file-audio"] = { 16898613353, 771, 355 },
+    ["file-axis-3d"] = { 16898613353, 355, 771 },
+    ["file-badge-2"] = { 16898613353, 306, 820 },
+    ["file-badge"] = { 16898613353, 257, 869 },
+    ["file-bar-chart-2"] = { 16898613353, 869, 514 },
+    ["file-bar-chart"] = { 16898613353, 820, 563 },
+    ["file-box"] = { 16898613353, 771, 612 },
+    ["file-check-2"] = { 16898613353, 612, 771 },
+    ["file-check"] = { 16898613353, 563, 820 },
+    ["file-clock"] = { 16898613353, 514, 869 },
+    ["file-code-2"] = { 16898613353, 918, 0 },
+    ["file-code"] = { 16898613353, 869, 49 },
+    ["file-cog"] = { 16898613353, 820, 98 },
+    ["file-diff"] = { 16898613353, 771, 147 },
+    ["file-digit"] = { 16898613353, 147, 771 },
+    ["file-down"] = { 16898613353, 98, 820 },
+    ["file-edit"] = { 16898613353, 49, 869 },
+    ["file-heart"] = { 16898613353, 0, 918 },
+    ["file-image"] = { 16898613353, 918, 257 },
+    ["file-input"] = { 16898613353, 869, 306 },
+    ["file-json-2"] = { 16898613353, 820, 355 },
+    ["file-json"] = { 16898613353, 771, 404 },
+    ["file-key-2"] = { 16898613353, 404, 771 },
+    ["file-key"] = { 16898613353, 355, 820 },
+    ["file-line-chart"] = { 16898613353, 306, 869 },
+    ["file-lock-2"] = { 16898613353, 257, 918 },
+    ["file-lock"] = { 16898613353, 918, 514 },
+    ["file-minus-2"] = { 16898613353, 869, 563 },
+    ["file-minus"] = { 16898613353, 820, 612 },
+    ["file-music"] = { 16898613353, 771, 661 },
+    ["file-output"] = { 16898613353, 661, 771 },
+    ["file-pen-line"] = { 16898613353, 612, 820 },
+    ["file-pen"] = { 16898613353, 563, 869 },
+    ["file-pie-chart"] = { 16898613353, 514, 918 },
+    ["file-plus-2"] = { 16898613353, 967, 0 },
+    ["file-plus"] = { 16898613353, 918, 49 },
+    ["file-question"] = { 16898613353, 869, 98 },
+    ["file-scan"] = { 16898613353, 820, 147 },
+    ["file-search-2"] = { 16898613353, 771, 196 },
+    ["file-search"] = { 16898613353, 196, 771 },
+    ["file-signature"] = { 16898613353, 147, 820 },
+    ["file-sliders"] = { 16898613353, 98, 869 },
+    ["file-spreadsheet"] = { 16898613353, 49, 918 },
+    ["file-stack"] = { 16898613353, 0, 967 },
+    ["file-symlink"] = { 16898613353, 967, 257 },
+    ["file-terminal"] = { 16898613353, 918, 306 },
+    ["file-text"] = { 16898613353, 869, 355 },
+    ["file-type-2"] = { 16898613353, 820, 404 },
+    ["file-type"] = { 16898613353, 771, 453 },
+    ["file-up"] = { 16898613353, 453, 771 },
+    ["file-video-2"] = { 16898613353, 404, 820 },
+    ["file-video"] = { 16898613353, 355, 869 },
+    ["file-volume-2"] = { 16898613353, 306, 918 },
+    ["file-volume"] = { 16898613353, 257, 967 },
+    ["file-warning"] = { 16898613353, 967, 514 },
+    ["file-x-2"] = { 16898613353, 918, 563 },
+    ["file-x"] = { 16898613353, 869, 612 },
+    ["file"] = { 16898613353, 820, 661 },
+    ["files"] = { 16898613353, 771, 710 },
+    ["film"] = { 16898613353, 710, 771 },
+    ["filter-x"] = { 16898613353, 661, 820 },
+    ["filter"] = { 16898613353, 612, 869 },
+    ["fingerprint"] = { 16898613353, 563, 918 },
+    ["fire-extinguisher"] = { 16898613353, 514, 967 },
+    ["fish-off"] = { 16898613353, 967, 49 },
+    ["fish-symbol"] = { 16898613353, 918, 98 },
+    ["fish"] = { 16898613353, 869, 147 },
+    ["flag-off"] = { 16898613353, 820, 196 },
+    ["flag-triangle-left"] = { 16898613353, 196, 820 },
+    ["flag-triangle-right"] = { 16898613353, 147, 869 },
+    ["flag"] = { 16898613353, 98, 918 },
+    ["flame-kindling"] = { 16898613353, 49, 967 },
+    ["flame"] = { 16898613353, 967, 306 },
+    ["flashlight-off"] = { 16898613353, 918, 355 },
+    ["flashlight"] = { 16898613353, 869, 404 },
+    ["flask-conical-off"] = { 16898613353, 820, 453 },
+    ["flask-conical"] = { 16898613353, 453, 820 },
+    ["flask-round"] = { 16898613353, 404, 869 },
+    ["flip-horizontal-2"] = { 16898613353, 355, 918 },
+    ["flip-horizontal"] = { 16898613353, 306, 967 },
+    ["flip-vertical-2"] = { 16898613353, 967, 563 },
+    ["flip-vertical"] = { 16898613353, 918, 612 },
+    ["flower-2"] = { 16898613353, 869, 661 },
+    ["flower"] = { 16898613353, 820, 710 },
+    ["focus"] = { 16898613353, 771, 759 },
+    ["fold-horizontal"] = { 16898613353, 710, 820 },
+    ["fold-vertical"] = { 16898613353, 661, 869 },
+    ["folder-archive"] = { 16898613353, 612, 918 },
+    ["folder-check"] = { 16898613353, 563, 967 },
+    ["folder-clock"] = { 16898613353, 967, 98 },
+    ["folder-closed"] = { 16898613353, 918, 147 },
+    ["folder-cog"] = { 16898613353, 869, 196 },
+    ["folder-dot"] = { 16898613353, 196, 869 },
+    ["folder-down"] = { 16898613353, 147, 918 },
+    ["folder-edit"] = { 16898613353, 98, 967 },
+    ["folder-git-2"] = { 16898613353, 967, 355 },
+    ["folder-git"] = { 16898613353, 918, 404 },
+    ["folder-heart"] = { 16898613353, 869, 453 },
+    ["folder-input"] = { 16898613353, 453, 869 },
+    ["folder-kanban"] = { 16898613353, 404, 918 },
+    ["folder-key"] = { 16898613353, 355, 967 },
+    ["folder-lock"] = { 16898613353, 967, 612 },
+    ["folder-minus"] = { 16898613353, 918, 661 },
+    ["folder-open-dot"] = { 16898613353, 869, 710 },
+    ["folder-open"] = { 16898613353, 820, 759 },
+    ["folder-output"] = { 16898613353, 771, 808 },
+    ["folder-pen"] = { 16898613353, 710, 869 },
+    ["folder-plus"] = { 16898613353, 661, 918 },
+    ["folder-root"] = { 16898613353, 612, 967 },
+    ["folder-search-2"] = { 16898613353, 967, 147 },
+    ["folder-search"] = { 16898613353, 918, 196 },
+    ["folder-symlink"] = { 16898613353, 196, 918 },
+    ["folder-sync"] = { 16898613353, 147, 967 },
+    ["folder-tree"] = { 16898613353, 967, 404 },
+    ["folder-up"] = { 16898613353, 918, 453 },
+    ["folder-x"] = { 16898613353, 453, 918 },
+    ["folder"] = { 16898613353, 404, 967 },
+    ["folders"] = { 16898613353, 967, 661 },
+    ["footprints"] = { 16898613353, 918, 710 },
+    ["forklift"] = { 16898613353, 869, 759 },
+    ["form-input"] = { 16898613353, 820, 808 },
+    ["forward"] = { 16898613353, 771, 857 },
+    ["frame"] = { 16898613353, 710, 918 },
+    ["framer"] = { 16898613353, 661, 967 },
+    ["frown"] = { 16898613353, 967, 196 },
+    ["fuel"] = { 16898613353, 196, 967 },
+    ["fullscreen"] = { 16898613353, 967, 453 },
+    ["function-square"] = { 16898613353, 453, 967 },
+    ["gallery-horizontal-end"] = { 16898613353, 967, 710 },
+    ["gallery-horizontal"] = { 16898613353, 918, 759 },
+    ["gallery-thumbnails"] = { 16898613353, 869, 808 },
+    ["gallery-vertical-end"] = { 16898613353, 820, 857 },
+    ["gallery-vertical"] = { 16898613353, 771, 906 },
+    ["gamepad-2"] = { 16898613353, 710, 967 },
+    ["gamepad"] = { 16898613353, 967, 759 },
+    ["gantt-chart-square"] = { 16898613353, 918, 808 },
+    ["gantt-chart"] = { 16898613353, 869, 857 },
+    ["gauge-circle"] = { 16898613353, 820, 906 },
+    ["gauge"] = { 16898613353, 771, 955 },
+    ["gavel"] = { 16898613353, 967, 808 },
+    ["gem"] = { 16898613353, 918, 857 },
+    ["ghost"] = { 16898613353, 869, 906 },
+    ["gift"] = { 16898613353, 820, 955 },
+    ["git-branch-plus"] = { 16898613353, 967, 857 },
+    ["git-branch"] = { 16898613353, 918, 906 },
+    ["git-commit-horizontal"] = { 16898613353, 869, 955 },
+    ["git-commit-vertical"] = { 16898613353, 967, 906 },
+    ["git-compare-arrows"] = { 16898613353, 918, 955 },
+    ["git-compare"] = { 16898613353, 967, 955 },
+    ["git-fork"] = { 16898613509, 771, 0 },
+    ["git-graph"] = { 16898613509, 0, 771 },
+    ["git-merge"] = { 16898613509, 771, 257 },
+    ["git-pull-request-arrow"] = { 16898613509, 257, 771 },
+    ["git-pull-request-closed"] = { 16898613509, 771, 514 },
+    ["git-pull-request-create-arrow"] = { 16898613509, 514, 771 },
+    ["git-pull-request-create"] = { 16898613509, 820, 0 },
+    ["git-pull-request-draft"] = { 16898613509, 771, 49 },
+    ["git-pull-request"] = { 16898613509, 49, 771 },
+    ["github"] = { 16898613509, 0, 820 },
+    ["gitlab"] = { 16898613509, 820, 257 },
+    ["glass-water"] = { 16898613509, 771, 306 },
+    ["glasses"] = { 16898613509, 306, 771 },
+    ["globe-2"] = { 16898613509, 257, 820 },
+    ["globe-lock"] = { 16898613509, 820, 514 },
+    ["globe"] = { 16898613509, 771, 563 },
+    ["goal"] = { 16898613509, 563, 771 },
+    ["grab"] = { 16898613509, 514, 820 },
+    ["graduation-cap"] = { 16898613509, 869, 0 },
+    ["grape"] = { 16898613509, 820, 49 },
+    ["grid-2x2"] = { 16898613509, 771, 98 },
+    ["grid-3x3"] = { 16898613509, 98, 771 },
+    ["grip-horizontal"] = { 16898613509, 49, 820 },
+    ["grip-vertical"] = { 16898613509, 0, 869 },
+    ["grip"] = { 16898613509, 869, 257 },
+    ["group"] = { 16898613509, 820, 306 },
+    ["guitar"] = { 16898613509, 771, 355 },
+    ["ham"] = { 16898613509, 355, 771 },
+    ["hammer"] = { 16898613509, 306, 820 },
+    ["hand-coins"] = { 16898613509, 257, 869 },
+    ["hand-heart"] = { 16898613509, 869, 514 },
+    ["hand-helping"] = { 16898613509, 820, 563 },
+    ["hand-metal"] = { 16898613509, 771, 612 },
+    ["hand-platter"] = { 16898613509, 612, 771 },
+    ["hand"] = { 16898613509, 563, 820 },
+    ["handshake"] = { 16898613509, 514, 869 },
+    ["hard-drive-download"] = { 16898613509, 918, 0 },
+    ["hard-drive-upload"] = { 16898613509, 869, 49 },
+    ["hard-drive"] = { 16898613509, 820, 98 },
+    ["hard-hat"] = { 16898613509, 771, 147 },
+    ["hash"] = { 16898613509, 147, 771 },
+    ["haze"] = { 16898613509, 98, 820 },
+    ["hdmi-port"] = { 16898613509, 49, 869 },
+    ["heading-1"] = { 16898613509, 0, 918 },
+    ["heading-2"] = { 16898613509, 918, 257 },
+    ["heading-3"] = { 16898613509, 869, 306 },
+    ["heading-4"] = { 16898613509, 820, 355 },
+    ["heading-5"] = { 16898613509, 771, 404 },
+    ["heading-6"] = { 16898613509, 404, 771 },
+    ["heading"] = { 16898613509, 355, 820 },
+    ["headphones"] = { 16898613509, 306, 869 },
+    ["headset"] = { 16898613509, 257, 918 },
+    ["heart-crack"] = { 16898613509, 918, 514 },
+    ["heart-handshake"] = { 16898613509, 869, 563 },
+    ["heart-off"] = { 16898613509, 820, 612 },
+    ["heart-pulse"] = { 16898613509, 771, 661 },
+    ["heart"] = { 16898613509, 661, 771 },
+    ["heater"] = { 16898613509, 612, 820 },
+    ["help-circle"] = { 16898613509, 563, 869 },
+    ["helping-hand"] = { 16898613509, 514, 918 },
+    ["hexagon"] = { 16898613509, 967, 0 },
+    ["highlighter"] = { 16898613509, 918, 49 },
+    ["history"] = { 16898613509, 869, 98 },
+    ["home"] = { 16898613509, 820, 147 },
+    ["hop-off"] = { 16898613509, 771, 196 },
+    ["hop"] = { 16898613509, 196, 771 },
+    ["hospital"] = { 16898613509, 147, 820 },
+    ["hotel"] = { 16898613509, 98, 869 },
+    ["hourglass"] = { 16898613509, 49, 918 },
+    ["ice-cream-2"] = { 16898613509, 0, 967 },
+    ["ice-cream-bowl"] = { 16898613509, 967, 257 },
+    ["ice-cream-cone"] = { 16898613509, 918, 306 },
+    ["ice-cream"] = { 16898613509, 869, 355 },
+    ["image-down"] = { 16898613509, 820, 404 },
+    ["image-minus"] = { 16898613509, 771, 453 },
+    ["image-off"] = { 16898613509, 453, 771 },
+    ["image-plus"] = { 16898613509, 404, 820 },
+    ["image-up"] = { 16898613509, 355, 869 },
+    ["image"] = { 16898613509, 306, 918 },
+    ["images"] = { 16898613509, 257, 967 },
+    ["import"] = { 16898613509, 967, 514 },
+    ["inbox"] = { 16898613509, 918, 563 },
+    ["indent-decrease"] = { 16898613509, 869, 612 },
+    ["indent-increase"] = { 16898613509, 820, 661 },
+    ["indent"] = { 16898613509, 771, 710 },
+    ["indian-rupee"] = { 16898613509, 710, 771 },
+    ["infinity"] = { 16898613509, 661, 820 },
+    ["info"] = { 16898613509, 612, 869 },
+    ["inspection-panel"] = { 16898613509, 563, 918 },
+    ["instagram"] = { 16898613509, 514, 967 },
+    ["italic"] = { 16898613509, 967, 49 },
+    ["iteration-ccw"] = { 16898613509, 918, 98 },
+    ["iteration-cw"] = { 16898613509, 869, 147 },
+    ["japanese-yen"] = { 16898613509, 820, 196 },
+    ["joystick"] = { 16898613509, 196, 820 },
+    ["kanban-square-dashed"] = { 16898613509, 147, 869 },
+    ["kanban-square"] = { 16898613509, 98, 918 },
+    ["kanban"] = { 16898613509, 49, 967 },
+    ["key-round"] = { 16898613509, 967, 306 },
+    ["key-square"] = { 16898613509, 918, 355 },
+    ["key"] = { 16898613509, 869, 404 },
+    ["keyboard-music"] = { 16898613509, 820, 453 },
+    ["keyboard"] = { 16898613509, 453, 820 },
+    ["lamp-ceiling"] = { 16898613509, 404, 869 },
+    ["lamp-desk"] = { 16898613509, 355, 918 },
+    ["lamp-floor"] = { 16898613509, 306, 967 },
+    ["lamp-wall-down"] = { 16898613509, 967, 563 },
+    ["lamp-wall-up"] = { 16898613509, 918, 612 },
+    ["lamp"] = { 16898613509, 869, 661 },
+    ["land-plot"] = { 16898613509, 820, 710 },
+    ["landmark"] = { 16898613509, 771, 759 },
+    ["languages"] = { 16898613509, 710, 820 },
+    ["laptop-2"] = { 16898613509, 661, 869 },
+    ["laptop-minimal"] = { 16898613509, 612, 918 },
+    ["laptop"] = { 16898613509, 563, 967 },
+    ["lasso-select"] = { 16898613509, 967, 98 },
+    ["lasso"] = { 16898613509, 918, 147 },
+    ["laugh"] = { 16898613509, 869, 196 },
+    ["layers-2"] = { 16898613509, 196, 869 },
+    ["layers-3"] = { 16898613509, 147, 918 },
+    ["layers"] = { 16898613509, 98, 967 },
+    ["layout-dashboard"] = { 16898613509, 967, 355 },
+    ["layout-grid"] = { 16898613509, 918, 404 },
+    ["layout-list"] = { 16898613509, 869, 453 },
+    ["layout-panel-left"] = { 16898613509, 453, 869 },
+    ["layout-panel-top"] = { 16898613509, 404, 918 },
+    ["layout-template"] = { 16898613509, 355, 967 },
+    ["layout"] = { 16898613509, 967, 612 },
+    ["leaf"] = { 16898613509, 918, 661 },
+    ["leafy-green"] = { 16898613509, 869, 710 },
+    ["library-big"] = { 16898613509, 820, 759 },
+    ["library-square"] = { 16898613509, 771, 808 },
+    ["library"] = { 16898613509, 710, 869 },
+    ["life-buoy"] = { 16898613509, 661, 918 },
+    ["ligature"] = { 16898613509, 612, 967 },
+    ["lightbulb-off"] = { 16898613509, 967, 147 },
+    ["lightbulb"] = { 16898613509, 918, 196 },
+    ["line-chart"] = { 16898613509, 196, 918 },
+    ["link-2-off"] = { 16898613509, 147, 967 },
+    ["link-2"] = { 16898613509, 967, 404 },
+    ["link"] = { 16898613509, 918, 453 },
+    ["linkedin"] = { 16898613509, 453, 918 },
+    ["list-checks"] = { 16898613509, 404, 967 },
+    ["list-collapse"] = { 16898613509, 967, 661 },
+    ["list-end"] = { 16898613509, 918, 710 },
+    ["list-filter"] = { 16898613509, 869, 759 },
+    ["list-minus"] = { 16898613509, 820, 808 },
+    ["list-music"] = { 16898613509, 771, 857 },
+    ["list-ordered"] = { 16898613509, 710, 918 },
+    ["list-plus"] = { 16898613509, 661, 967 },
+    ["list-restart"] = { 16898613509, 967, 196 },
+    ["list-start"] = { 16898613509, 196, 967 },
+    ["list-todo"] = { 16898613509, 967, 453 },
+    ["list-tree"] = { 16898613509, 453, 967 },
+    ["list-video"] = { 16898613509, 967, 710 },
+    ["list-x"] = { 16898613509, 918, 759 },
+    ["list"] = { 16898613509, 869, 808 },
+    ["loader-2"] = { 16898613509, 820, 857 },
+    ["loader-circle"] = { 16898613509, 771, 906 },
+    ["loader"] = { 16898613509, 710, 967 },
+    ["locate-fixed"] = { 16898613509, 967, 759 },
+    ["locate-off"] = { 16898613509, 918, 808 },
+    ["locate"] = { 16898613509, 869, 857 },
+    ["lock-keyhole-open"] = { 16898613509, 820, 906 },
+    ["lock-keyhole"] = { 16898613509, 771, 955 },
+    ["lock-open"] = { 16898613509, 967, 808 },
+    ["lock"] = { 16898613509, 918, 857 },
+    ["log-in"] = { 16898613509, 869, 906 },
+    ["log-out"] = { 16898613509, 820, 955 },
+    ["lollipop"] = { 16898613509, 967, 857 },
+    ["luggage"] = { 16898613509, 918, 906 },
+    ["m-square"] = { 16898613509, 869, 955 },
+    ["magnet"] = { 16898613509, 967, 906 },
+    ["mail-check"] = { 16898613509, 918, 955 },
+    ["mail-minus"] = { 16898613509, 967, 955 },
+    ["mail-open"] = { 16898613613, 771, 0 },
+    ["mail-plus"] = { 16898613613, 0, 771 },
+    ["mail-question"] = { 16898613613, 771, 257 },
+    ["mail-search"] = { 16898613613, 257, 771 },
+    ["mail-warning"] = { 16898613613, 771, 514 },
+    ["mail-x"] = { 16898613613, 514, 771 },
+    ["mail"] = { 16898613613, 820, 0 },
+    ["mailbox"] = { 16898613613, 771, 49 },
+    ["mails"] = { 16898613613, 49, 771 },
+    ["map-pin-off"] = { 16898613613, 0, 820 },
+    ["map-pin"] = { 16898613613, 820, 257 },
+    ["map-pinned"] = { 16898613613, 771, 306 },
+    ["map"] = { 16898613613, 306, 771 },
+    ["martini"] = { 16898613613, 257, 820 },
+    ["maximize-2"] = { 16898613613, 820, 514 },
+    ["maximize"] = { 16898613613, 771, 563 },
+    ["medal"] = { 16898613613, 563, 771 },
+    ["megaphone-off"] = { 16898613613, 514, 820 },
+    ["megaphone"] = { 16898613613, 869, 0 },
+    ["meh"] = { 16898613613, 820, 49 },
+    ["memory-stick"] = { 16898613613, 771, 98 },
+    ["menu-square"] = { 16898613613, 98, 771 },
+    ["menu"] = { 16898613613, 49, 820 },
+    ["merge"] = { 16898613613, 0, 869 },
+    ["message-circle-code"] = { 16898613613, 869, 257 },
+    ["message-circle-dashed"] = { 16898613613, 820, 306 },
+    ["message-circle-heart"] = { 16898613613, 771, 355 },
+    ["message-circle-more"] = { 16898613613, 355, 771 },
+    ["message-circle-off"] = { 16898613613, 306, 820 },
+    ["message-circle-plus"] = { 16898613613, 257, 869 },
+    ["message-circle-question"] = { 16898613613, 869, 514 },
+    ["message-circle-reply"] = { 16898613613, 820, 563 },
+    ["message-circle-warning"] = { 16898613613, 771, 612 },
+    ["message-circle-x"] = { 16898613613, 612, 771 },
+    ["message-circle"] = { 16898613613, 563, 820 },
+    ["message-square-code"] = { 16898613613, 514, 869 },
+    ["message-square-dashed"] = { 16898613613, 918, 0 },
+    ["message-square-diff"] = { 16898613613, 869, 49 },
+    ["message-square-dot"] = { 16898613613, 820, 98 },
+    ["message-square-heart"] = { 16898613613, 771, 147 },
+    ["message-square-more"] = { 16898613613, 147, 771 },
+    ["message-square-off"] = { 16898613613, 98, 820 },
+    ["message-square-plus"] = { 16898613613, 49, 869 },
+    ["message-square-quote"] = { 16898613613, 0, 918 },
+    ["message-square-reply"] = { 16898613613, 918, 257 },
+    ["message-square-share"] = { 16898613613, 869, 306 },
+    ["message-square-text"] = { 16898613613, 820, 355 },
+    ["message-square-warning"] = { 16898613613, 771, 404 },
+    ["message-square-x"] = { 16898613613, 404, 771 },
+    ["message-square"] = { 16898613613, 355, 820 },
+    ["messages-square"] = { 16898613613, 306, 869 },
+    ["mic-2"] = { 16898613613, 257, 918 },
+    ["mic-off"] = { 16898613613, 918, 514 },
+    ["mic-vocal"] = { 16898613613, 869, 563 },
+    ["mic"] = { 16898613613, 820, 612 },
+    ["microscope"] = { 16898613613, 771, 661 },
+    ["microwave"] = { 16898613613, 661, 771 },
+    ["milestone"] = { 16898613613, 612, 820 },
+    ["milk-off"] = { 16898613613, 563, 869 },
+    ["milk"] = { 16898613613, 514, 918 },
+    ["minimize-2"] = { 16898613613, 967, 0 },
+    ["minimize"] = { 16898613613, 918, 49 },
+    ["minus-circle"] = { 16898613613, 869, 98 },
+    ["minus-square"] = { 16898613613, 820, 147 },
+    ["minus"] = { 16898613613, 771, 196 },
+    ["monitor-check"] = { 16898613613, 196, 771 },
+    ["monitor-dot"] = { 16898613613, 147, 820 },
+    ["monitor-down"] = { 16898613613, 98, 869 },
+    ["monitor-off"] = { 16898613613, 49, 918 },
+    ["monitor-pause"] = { 16898613613, 0, 967 },
+    ["monitor-play"] = { 16898613613, 967, 257 },
+    ["monitor-smartphone"] = { 16898613613, 918, 306 },
+    ["monitor-speaker"] = { 16898613613, 869, 355 },
+    ["monitor-stop"] = { 16898613613, 820, 404 },
+    ["monitor-up"] = { 16898613613, 771, 453 },
+    ["monitor-x"] = { 16898613613, 453, 771 },
+    ["monitor"] = { 16898613613, 404, 820 },
+    ["moon-star"] = { 16898613613, 355, 869 },
+    ["moon"] = { 16898613613, 306, 918 },
+    ["more-horizontal"] = { 16898613613, 257, 967 },
+    ["more-vertical"] = { 16898613613, 967, 514 },
+    ["mountain-snow"] = { 16898613613, 918, 563 },
+    ["mountain"] = { 16898613613, 869, 612 },
+    ["mouse-pointer-2"] = { 16898613613, 820, 661 },
+    ["mouse-pointer-click"] = { 16898613613, 771, 710 },
+    ["mouse-pointer-square-dashed"] = { 16898613613, 710, 771 },
+    ["mouse-pointer-square"] = { 16898613613, 661, 820 },
+    ["mouse-pointer"] = { 16898613613, 612, 869 },
+    ["mouse"] = { 16898613613, 563, 918 },
+    ["move-3d"] = { 16898613613, 514, 967 },
+    ["move-diagonal-2"] = { 16898613613, 967, 49 },
+    ["move-diagonal"] = { 16898613613, 918, 98 },
+    ["move-down-left"] = { 16898613613, 869, 147 },
+    ["move-down-right"] = { 16898613613, 820, 196 },
+    ["move-down"] = { 16898613613, 196, 820 },
+    ["move-horizontal"] = { 16898613613, 147, 869 },
+    ["move-left"] = { 16898613613, 98, 918 },
+    ["move-right"] = { 16898613613, 49, 967 },
+    ["move-up-left"] = { 16898613613, 967, 306 },
+    ["move-up-right"] = { 16898613613, 918, 355 },
+    ["move-up"] = { 16898613613, 869, 404 },
+    ["move-vertical"] = { 16898613613, 820, 453 },
+    ["move"] = { 16898613613, 453, 820 },
+    ["music-2"] = { 16898613613, 404, 869 },
+    ["music-3"] = { 16898613613, 355, 918 },
+    ["music-4"] = { 16898613613, 306, 967 },
+    ["music"] = { 16898613613, 967, 563 },
+    ["navigation-2-off"] = { 16898613613, 918, 612 },
+    ["navigation-2"] = { 16898613613, 869, 661 },
+    ["navigation-off"] = { 16898613613, 820, 710 },
+    ["navigation"] = { 16898613613, 771, 759 },
+    ["network"] = { 16898613613, 710, 820 },
+    ["newspaper"] = { 16898613613, 661, 869 },
+    ["nfc"] = { 16898613613, 612, 918 },
+    ["notebook-pen"] = { 16898613613, 563, 967 },
+    ["notebook-tabs"] = { 16898613613, 967, 98 },
+    ["notebook-text"] = { 16898613613, 918, 147 },
+    ["notebook"] = { 16898613613, 869, 196 },
+    ["notepad-text-dashed"] = { 16898613613, 196, 869 },
+    ["notepad-text"] = { 16898613613, 147, 918 },
+    ["nut-off"] = { 16898613613, 98, 967 },
+    ["nut"] = { 16898613613, 967, 355 },
+    ["octagon-alert"] = { 16898613613, 918, 404 },
+    ["octagon-pause"] = { 16898613613, 869, 453 },
+    ["octagon-x"] = { 16898613613, 453, 869 },
+    ["octagon"] = { 16898613613, 404, 918 },
+    ["option"] = { 16898613613, 355, 967 },
+    ["orbit"] = { 16898613613, 967, 612 },
+    ["outdent"] = { 16898613613, 918, 661 },
+    ["package-2"] = { 16898613613, 869, 710 },
+    ["package-check"] = { 16898613613, 820, 759 },
+    ["package-minus"] = { 16898613613, 771, 808 },
+    ["package-open"] = { 16898613613, 710, 869 },
+    ["package-plus"] = { 16898613613, 661, 918 },
+    ["package-search"] = { 16898613613, 612, 967 },
+    ["package-x"] = { 16898613613, 967, 147 },
+    ["package"] = { 16898613613, 918, 196 },
+    ["paint-bucket"] = { 16898613613, 196, 918 },
+    ["paint-roller"] = { 16898613613, 147, 967 },
+    ["paintbrush-2"] = { 16898613613, 967, 404 },
+    ["paintbrush"] = { 16898613613, 918, 453 },
+    ["palette"] = { 16898613613, 453, 918 },
+    ["palmtree"] = { 16898613613, 404, 967 },
+    ["panel-bottom-close"] = { 16898613613, 967, 661 },
+    ["panel-bottom-dashed"] = { 16898613613, 918, 710 },
+    ["panel-bottom-inactive"] = { 16898613613, 869, 759 },
+    ["panel-bottom-open"] = { 16898613613, 820, 808 },
+    ["panel-bottom"] = { 16898613613, 771, 857 },
+    ["panel-left-close"] = { 16898613613, 710, 918 },
+    ["panel-left-dashed"] = { 16898613613, 661, 967 },
+    ["panel-left-inactive"] = { 16898613613, 967, 196 },
+    ["panel-left-open"] = { 16898613613, 196, 967 },
+    ["panel-left"] = { 16898613613, 967, 453 },
+    ["panel-right-close"] = { 16898613613, 453, 967 },
+    ["panel-right-dashed"] = { 16898613613, 967, 710 },
+    ["panel-right-inactive"] = { 16898613613, 918, 759 },
+    ["panel-right-open"] = { 16898613613, 869, 808 },
+    ["panel-right"] = { 16898613613, 820, 857 },
+    ["panel-top-close"] = { 16898613613, 771, 906 },
+    ["panel-top-dashed"] = { 16898613613, 710, 967 },
+    ["panel-top-inactive"] = { 16898613613, 967, 759 },
+    ["panel-top-open"] = { 16898613613, 918, 808 },
+    ["panel-top"] = { 16898613613, 869, 857 },
+    ["panels-left-bottom"] = { 16898613613, 820, 906 },
+    ["panels-right-bottom"] = { 16898613613, 771, 955 },
+    ["panels-top-left"] = { 16898613613, 967, 808 },
+    ["paperclip"] = { 16898613613, 918, 857 },
+    ["parentheses"] = { 16898613613, 869, 906 },
+    ["parking-circle-off"] = { 16898613613, 820, 955 },
+    ["parking-circle"] = { 16898613613, 967, 857 },
+    ["parking-meter"] = { 16898613613, 918, 906 },
+    ["parking-square-off"] = { 16898613613, 869, 955 },
+    ["parking-square"] = { 16898613613, 967, 906 },
+    ["party-popper"] = { 16898613613, 918, 955 },
+    ["pause-circle"] = { 16898613613, 967, 955 },
+    ["pause-octagon"] = { 16898613699, 771, 0 },
+    ["pause"] = { 16898613699, 0, 771 },
+    ["paw-print"] = { 16898613699, 771, 257 },
+    ["pc-case"] = { 16898613699, 257, 771 },
+    ["pen-line"] = { 16898613699, 771, 514 },
+    ["pen-square"] = { 16898613699, 514, 771 },
+    ["pen-tool"] = { 16898613699, 820, 0 },
+    ["pen"] = { 16898613699, 771, 49 },
+    ["pencil-line"] = { 16898613699, 49, 771 },
+    ["pencil-ruler"] = { 16898613699, 0, 820 },
+    ["pencil"] = { 16898613699, 820, 257 },
+    ["pentagon"] = { 16898613699, 771, 306 },
+    ["percent-circle"] = { 16898613699, 306, 771 },
+    ["percent-diamond"] = { 16898613699, 257, 820 },
+    ["percent-square"] = { 16898613699, 820, 514 },
+    ["percent"] = { 16898613699, 771, 563 },
+    ["person-standing"] = { 16898613699, 563, 771 },
+    ["phone-call"] = { 16898613699, 514, 820 },
+    ["phone-forwarded"] = { 16898613699, 869, 0 },
+    ["phone-incoming"] = { 16898613699, 820, 49 },
+    ["phone-missed"] = { 16898613699, 771, 98 },
+    ["phone-off"] = { 16898613699, 98, 771 },
+    ["phone-outgoing"] = { 16898613699, 49, 820 },
+    ["phone"] = { 16898613699, 0, 869 },
+    ["pi-square"] = { 16898613699, 869, 257 },
+    ["pi"] = { 16898613699, 820, 306 },
+    ["piano"] = { 16898613699, 771, 355 },
+    ["pickaxe"] = { 16898613699, 355, 771 },
+    ["picture-in-picture-2"] = { 16898613699, 306, 820 },
+    ["picture-in-picture"] = { 16898613699, 257, 869 },
+    ["pie-chart"] = { 16898613699, 869, 514 },
+    ["piggy-bank"] = { 16898613699, 820, 563 },
+    ["pilcrow-square"] = { 16898613699, 771, 612 },
+    ["pilcrow"] = { 16898613699, 612, 771 },
+    ["pill"] = { 16898613699, 563, 820 },
+    ["pin-off"] = { 16898613699, 514, 869 },
+    ["pin"] = { 16898613699, 918, 0 },
+    ["pipette"] = { 16898613699, 869, 49 },
+    ["pizza"] = { 16898613699, 820, 98 },
+    ["plane-landing"] = { 16898613699, 771, 147 },
+    ["plane-takeoff"] = { 16898613699, 147, 771 },
+    ["plane"] = { 16898613699, 98, 820 },
+    ["play-circle"] = { 16898613699, 49, 869 },
+    ["play-square"] = { 16898613699, 0, 918 },
+    ["play"] = { 16898613699, 918, 257 },
+    ["plug-2"] = { 16898613699, 869, 306 },
+    ["plug-zap-2"] = { 16898613699, 820, 355 },
+    ["plug-zap"] = { 16898613699, 771, 404 },
+    ["plug"] = { 16898613699, 404, 771 },
+    ["plus-circle"] = { 16898613699, 355, 820 },
+    ["plus-square"] = { 16898613699, 306, 869 },
+    ["plus"] = { 16898613699, 257, 918 },
+    ["pocket-knife"] = { 16898613699, 918, 514 },
+    ["pocket"] = { 16898613699, 869, 563 },
+    ["podcast"] = { 16898613699, 820, 612 },
+    ["pointer-off"] = { 16898613699, 771, 661 },
+    ["pointer"] = { 16898613699, 661, 771 },
+    ["popcorn"] = { 16898613699, 612, 820 },
+    ["popsicle"] = { 16898613699, 563, 869 },
+    ["pound-sterling"] = { 16898613699, 514, 918 },
+    ["power-circle"] = { 16898613699, 967, 0 },
+    ["power-off"] = { 16898613699, 918, 49 },
+    ["power-square"] = { 16898613699, 869, 98 },
+    ["power"] = { 16898613699, 820, 147 },
+    ["presentation"] = { 16898613699, 771, 196 },
+    ["printer"] = { 16898613699, 196, 771 },
+    ["projector"] = { 16898613699, 147, 820 },
+    ["proportions"] = { 16898613699, 98, 869 },
+    ["puzzle"] = { 16898613699, 49, 918 },
+    ["pyramid"] = { 16898613699, 0, 967 },
+    ["qr-code"] = { 16898613699, 967, 257 },
+    ["quote"] = { 16898613699, 918, 306 },
+    ["rabbit"] = { 16898613699, 869, 355 },
+    ["radar"] = { 16898613699, 820, 404 },
+    ["radiation"] = { 16898613699, 771, 453 },
+    ["radical"] = { 16898613699, 453, 771 },
+    ["radio-receiver"] = { 16898613699, 404, 820 },
+    ["radio-tower"] = { 16898613699, 355, 869 },
+    ["radio"] = { 16898613699, 306, 918 },
+    ["radius"] = { 16898613699, 257, 967 },
+    ["rail-symbol"] = { 16898613699, 967, 514 },
+    ["rainbow"] = { 16898613699, 918, 563 },
+    ["rat"] = { 16898613699, 869, 612 },
+    ["ratio"] = { 16898613699, 820, 661 },
+    ["receipt-cent"] = { 16898613699, 771, 710 },
+    ["receipt-euro"] = { 16898613699, 710, 771 },
+    ["receipt-indian-rupee"] = { 16898613699, 661, 820 },
+    ["receipt-japanese-yen"] = { 16898613699, 612, 869 },
+    ["receipt-pound-sterling"] = { 16898613699, 563, 918 },
+    ["receipt-russian-ruble"] = { 16898613699, 514, 967 },
+    ["receipt-swiss-franc"] = { 16898613699, 967, 49 },
+    ["receipt-text"] = { 16898613699, 918, 98 },
+    ["receipt"] = { 16898613699, 869, 147 },
+    ["rectangle-ellipsis"] = { 16898613699, 820, 196 },
+    ["rectangle-horizontal"] = { 16898613699, 196, 820 },
+    ["rectangle-vertical"] = { 16898613699, 147, 869 },
+    ["recycle"] = { 16898613699, 98, 918 },
+    ["redo-2"] = { 16898613699, 49, 967 },
+    ["redo-dot"] = { 16898613699, 967, 306 },
+    ["redo"] = { 16898613699, 918, 355 },
+    ["refresh-ccw-dot"] = { 16898613699, 869, 404 },
+    ["refresh-ccw"] = { 16898613699, 820, 453 },
+    ["refresh-cw-off"] = { 16898613699, 453, 820 },
+    ["refresh-cw"] = { 16898613699, 404, 869 },
+    ["refrigerator"] = { 16898613699, 355, 918 },
+    ["regex"] = { 16898613699, 306, 967 },
+    ["remove-formatting"] = { 16898613699, 967, 563 },
+    ["repeat-1"] = { 16898613699, 918, 612 },
+    ["repeat-2"] = { 16898613699, 869, 661 },
+    ["repeat"] = { 16898613699, 820, 710 },
+    ["replace-all"] = { 16898613699, 771, 759 },
+    ["replace"] = { 16898613699, 710, 820 },
+    ["reply-all"] = { 16898613699, 661, 869 },
+    ["reply"] = { 16898613699, 612, 918 },
+    ["rewind"] = { 16898613699, 563, 967 },
+    ["ribbon"] = { 16898613699, 967, 98 },
+    ["rocket"] = { 16898613699, 918, 147 },
+    ["rocking-chair"] = { 16898613699, 869, 196 },
+    ["roller-coaster"] = { 16898613699, 196, 869 },
+    ["rotate-3d"] = { 16898613699, 147, 918 },
+    ["rotate-ccw-square"] = { 16898613699, 98, 967 },
+    ["rotate-ccw"] = { 16898613699, 967, 355 },
+    ["rotate-cw-square"] = { 16898613699, 918, 404 },
+    ["rotate-cw"] = { 16898613699, 869, 453 },
+    ["route-off"] = { 16898613699, 453, 869 },
+    ["route"] = { 16898613699, 404, 918 },
+    ["router"] = { 16898613699, 355, 967 },
+    ["rows-2"] = { 16898613699, 967, 612 },
+    ["rows-3"] = { 16898613699, 918, 661 },
+    ["rows-4"] = { 16898613699, 869, 710 },
+    ["rows"] = { 16898613699, 820, 759 },
+    ["rss"] = { 16898613699, 771, 808 },
+    ["ruler"] = { 16898613699, 710, 869 },
+    ["russian-ruble"] = { 16898613699, 661, 918 },
+    ["sailboat"] = { 16898613699, 612, 967 },
+    ["salad"] = { 16898613699, 967, 147 },
+    ["sandwich"] = { 16898613699, 918, 196 },
+    ["satellite-dish"] = { 16898613699, 196, 918 },
+    ["satellite"] = { 16898613699, 147, 967 },
+    ["save-all"] = { 16898613699, 967, 404 },
+    ["save"] = { 16898613699, 918, 453 },
+    ["scale-3d"] = { 16898613699, 453, 918 },
+    ["scale"] = { 16898613699, 404, 967 },
+    ["scaling"] = { 16898613699, 967, 661 },
+    ["scan-barcode"] = { 16898613699, 918, 710 },
+    ["scan-eye"] = { 16898613699, 869, 759 },
+    ["scan-face"] = { 16898613699, 820, 808 },
+    ["scan-line"] = { 16898613699, 771, 857 },
+    ["scan-search"] = { 16898613699, 710, 918 },
+    ["scan-text"] = { 16898613699, 661, 967 },
+    ["scan"] = { 16898613699, 967, 196 },
+    ["scatter-chart"] = { 16898613699, 196, 967 },
+    ["school-2"] = { 16898613699, 967, 453 },
+    ["school"] = { 16898613699, 453, 967 },
+    ["scissors-line-dashed"] = { 16898613699, 967, 710 },
+    ["scissors-square-dashed-bottom"] = { 16898613699, 918, 759 },
+    ["scissors-square"] = { 16898613699, 869, 808 },
+    ["scissors"] = { 16898613699, 820, 857 },
+    ["screen-share-off"] = { 16898613699, 771, 906 },
+    ["screen-share"] = { 16898613699, 710, 967 },
+    ["scroll-text"] = { 16898613699, 967, 759 },
+    ["scroll"] = { 16898613699, 918, 808 },
+    ["search-check"] = { 16898613699, 869, 857 },
+    ["search-code"] = { 16898613699, 820, 906 },
+    ["search-slash"] = { 16898613699, 771, 955 },
+    ["search-x"] = { 16898613699, 967, 808 },
+    ["search"] = { 16898613699, 918, 857 },
+    ["send-horizontal"] = { 16898613699, 869, 906 },
+    ["send-to-back"] = { 16898613699, 820, 955 },
+    ["send"] = { 16898613699, 967, 857 },
+    ["separator-horizontal"] = { 16898613699, 918, 906 },
+    ["separator-vertical"] = { 16898613699, 869, 955 },
+    ["server-cog"] = { 16898613699, 967, 906 },
+    ["server-crash"] = { 16898613699, 918, 955 },
+    ["server-off"] = { 16898613699, 967, 955 },
+    ["server"] = { 16898613777, 771, 0 },
+    ["settings-2"] = { 16898613777, 0, 771 },
+    ["settings"] = { 16898613777, 771, 257 },
+    ["shapes"] = { 16898613777, 257, 771 },
+    ["share-2"] = { 16898613777, 771, 514 },
+    ["share"] = { 16898613777, 514, 771 },
+    ["sheet"] = { 16898613777, 820, 0 },
+    ["shell"] = { 16898613777, 771, 49 },
+    ["shield-alert"] = { 16898613777, 49, 771 },
+    ["shield-ban"] = { 16898613777, 0, 820 },
+    ["shield-check"] = { 16898613777, 820, 257 },
+    ["shield-ellipsis"] = { 16898613777, 771, 306 },
+    ["shield-half"] = { 16898613777, 306, 771 },
+    ["shield-minus"] = { 16898613777, 257, 820 },
+    ["shield-off"] = { 16898613777, 820, 514 },
+    ["shield-plus"] = { 16898613777, 771, 563 },
+    ["shield-question"] = { 16898613777, 563, 771 },
+    ["shield-x"] = { 16898613777, 514, 820 },
+    ["shield"] = { 16898613777, 869, 0 },
+    ["ship-wheel"] = { 16898613777, 820, 49 },
+    ["ship"] = { 16898613777, 771, 98 },
+    ["shirt"] = { 16898613777, 98, 771 },
+    ["shopping-bag"] = { 16898613777, 49, 820 },
+    ["shopping-basket"] = { 16898613777, 0, 869 },
+    ["shopping-cart"] = { 16898613777, 869, 257 },
+    ["shovel"] = { 16898613777, 820, 306 },
+    ["shower-head"] = { 16898613777, 771, 355 },
+    ["shrink"] = { 16898613777, 355, 771 },
+    ["shrub"] = { 16898613777, 306, 820 },
+    ["shuffle"] = { 16898613777, 257, 869 },
+    ["sigma-square"] = { 16898613777, 869, 514 },
+    ["sigma"] = { 16898613777, 820, 563 },
+    ["signal-high"] = { 16898613777, 771, 612 },
+    ["signal-low"] = { 16898613777, 612, 771 },
+    ["signal-medium"] = { 16898613777, 563, 820 },
+    ["signal-zero"] = { 16898613777, 514, 869 },
+    ["signal"] = { 16898613777, 918, 0 },
+    ["signpost-big"] = { 16898613777, 869, 49 },
+    ["signpost"] = { 16898613777, 820, 98 },
+    ["siren"] = { 16898613777, 771, 147 },
+    ["skip-back"] = { 16898613777, 147, 771 },
+    ["skip-forward"] = { 16898613777, 98, 820 },
+    ["skull"] = { 16898613777, 49, 869 },
+    ["slack"] = { 16898613777, 0, 918 },
+    ["slash"] = { 16898613777, 918, 257 },
+    ["slice"] = { 16898613777, 869, 306 },
+    ["sliders-horizontal"] = { 16898613777, 820, 355 },
+    ["sliders-vertical"] = { 16898613777, 771, 404 },
+    ["sliders"] = { 16898613777, 404, 771 },
+    ["smartphone-charging"] = { 16898613777, 355, 820 },
+    ["smartphone-nfc"] = { 16898613777, 306, 869 },
+    ["smartphone"] = { 16898613777, 257, 918 },
+    ["smile-plus"] = { 16898613777, 918, 514 },
+    ["smile"] = { 16898613777, 869, 563 },
+    ["snail"] = { 16898613777, 820, 612 },
+    ["snowflake"] = { 16898613777, 771, 661 },
+    ["sofa"] = { 16898613777, 661, 771 },
+    ["soup"] = { 16898613777, 612, 820 },
+    ["space"] = { 16898613777, 563, 869 },
+    ["spade"] = { 16898613777, 514, 918 },
+    ["sparkle"] = { 16898613777, 967, 0 },
+    ["sparkles"] = { 16898613777, 918, 49 },
+    ["speaker"] = { 16898613777, 869, 98 },
+    ["speech"] = { 16898613777, 820, 147 },
+    ["spell-check-2"] = { 16898613777, 771, 196 },
+    ["spell-check"] = { 16898613777, 196, 771 },
+    ["spline"] = { 16898613777, 147, 820 },
+    ["split-square-horizontal"] = { 16898613777, 98, 869 },
+    ["split-square-vertical"] = { 16898613777, 49, 918 },
+    ["split"] = { 16898613777, 0, 967 },
+    ["spray-can"] = { 16898613777, 967, 257 },
+    ["sprout"] = { 16898613777, 918, 306 },
+    ["square-activity"] = { 16898613777, 869, 355 },
+    ["square-arrow-down-left"] = { 16898613777, 820, 404 },
+    ["square-arrow-down-right"] = { 16898613777, 771, 453 },
+    ["square-arrow-down"] = { 16898613777, 453, 771 },
+    ["square-arrow-left"] = { 16898613777, 404, 820 },
+    ["square-arrow-out-down-left"] = { 16898613777, 355, 869 },
+    ["square-arrow-out-down-right"] = { 16898613777, 306, 918 },
+    ["square-arrow-out-up-left"] = { 16898613777, 257, 967 },
+    ["square-arrow-out-up-right"] = { 16898613777, 967, 514 },
+    ["square-arrow-right"] = { 16898613777, 918, 563 },
+    ["square-arrow-up-left"] = { 16898613777, 869, 612 },
+    ["square-arrow-up-right"] = { 16898613777, 820, 661 },
+    ["square-arrow-up"] = { 16898613777, 771, 710 },
+    ["square-asterisk"] = { 16898613777, 710, 771 },
+    ["square-bottom-dashed-scissors"] = { 16898613777, 661, 820 },
+    ["square-check-big"] = { 16898613777, 612, 869 },
+    ["square-check"] = { 16898613777, 563, 918 },
+    ["square-chevron-down"] = { 16898613777, 514, 967 },
+    ["square-chevron-left"] = { 16898613777, 967, 49 },
+    ["square-chevron-right"] = { 16898613777, 918, 98 },
+    ["square-chevron-up"] = { 16898613777, 869, 147 },
+    ["square-code"] = { 16898613777, 820, 196 },
+    ["square-dashed-bottom-code"] = { 16898613777, 196, 820 },
+    ["square-dashed-bottom"] = { 16898613777, 147, 869 },
+    ["square-dashed-kanban"] = { 16898613777, 98, 918 },
+    ["square-dashed-mouse-pointer"] = { 16898613777, 49, 967 },
+    ["square-divide"] = { 16898613777, 967, 306 },
+    ["square-dot"] = { 16898613777, 918, 355 },
+    ["square-equal"] = { 16898613777, 869, 404 },
+    ["square-function"] = { 16898613777, 820, 453 },
+    ["square-gantt-chart"] = { 16898613777, 453, 820 },
+    ["square-kanban"] = { 16898613777, 404, 869 },
+    ["square-library"] = { 16898613777, 355, 918 },
+    ["square-m"] = { 16898613777, 306, 967 },
+    ["square-menu"] = { 16898613777, 967, 563 },
+    ["square-minus"] = { 16898613777, 918, 612 },
+    ["square-mouse-pointer"] = { 16898613777, 869, 661 },
+    ["square-parking-off"] = { 16898613777, 820, 710 },
+    ["square-parking"] = { 16898613777, 771, 759 },
+    ["square-pen"] = { 16898613777, 710, 820 },
+    ["square-percent"] = { 16898613777, 661, 869 },
+    ["square-pi"] = { 16898613777, 612, 918 },
+    ["square-pilcrow"] = { 16898613777, 563, 967 },
+    ["square-play"] = { 16898613777, 967, 98 },
+    ["square-plus"] = { 16898613777, 918, 147 },
+    ["square-power"] = { 16898613777, 869, 196 },
+    ["square-radical"] = { 16898613777, 196, 869 },
+    ["square-scissors"] = { 16898613777, 147, 918 },
+    ["square-sigma"] = { 16898613777, 98, 967 },
+    ["square-slash"] = { 16898613777, 967, 355 },
+    ["square-split-horizontal"] = { 16898613777, 918, 404 },
+    ["square-split-vertical"] = { 16898613777, 869, 453 },
+    ["square-stack"] = { 16898613777, 453, 869 },
+    ["square-terminal"] = { 16898613777, 404, 918 },
+    ["square-user-round"] = { 16898613777, 355, 967 },
+    ["square-user"] = { 16898613777, 967, 612 },
+    ["square-x"] = { 16898613777, 918, 661 },
+    ["square"] = { 16898613777, 869, 710 },
+    ["squircle"] = { 16898613777, 820, 759 },
+    ["squirrel"] = { 16898613777, 771, 808 },
+    ["stamp"] = { 16898613777, 710, 869 },
+    ["star-half"] = { 16898613777, 661, 918 },
+    ["star-off"] = { 16898613777, 612, 967 },
+    ["star"] = { 16898613777, 967, 147 },
+    ["step-back"] = { 16898613777, 918, 196 },
+    ["step-forward"] = { 16898613777, 196, 918 },
+    ["stethoscope"] = { 16898613777, 147, 967 },
+    ["sticker"] = { 16898613777, 967, 404 },
+    ["sticky-note"] = { 16898613777, 918, 453 },
+    ["stop-circle"] = { 16898613777, 453, 918 },
+    ["store"] = { 16898613777, 404, 967 },
+    ["stretch-horizontal"] = { 16898613777, 967, 661 },
+    ["stretch-vertical"] = { 16898613777, 918, 710 },
+    ["strikethrough"] = { 16898613777, 869, 759 },
+    ["subscript"] = { 16898613777, 820, 808 },
+    ["subtitles"] = { 16898613777, 771, 857 },
+    ["sun-dim"] = { 16898613777, 710, 918 },
+    ["sun-medium"] = { 16898613777, 661, 967 },
+    ["sun-moon"] = { 16898613777, 967, 196 },
+    ["sun-snow"] = { 16898613777, 196, 967 },
+    ["sun"] = { 16898613777, 967, 453 },
+    ["sunrise"] = { 16898613777, 453, 967 },
+    ["sunset"] = { 16898613777, 967, 710 },
+    ["superscript"] = { 16898613777, 918, 759 },
+    ["swatch-book"] = { 16898613777, 869, 808 },
+    ["swiss-franc"] = { 16898613777, 820, 857 },
+    ["switch-camera"] = { 16898613777, 771, 906 },
+    ["sword"] = { 16898613777, 710, 967 },
+    ["swords"] = { 16898613777, 967, 759 },
+    ["syringe"] = { 16898613777, 918, 808 },
+    ["table-2"] = { 16898613777, 869, 857 },
+    ["table-cells-merge"] = { 16898613777, 820, 906 },
+    ["table-cells-split"] = { 16898613777, 771, 955 },
+    ["table-columns-split"] = { 16898613777, 967, 808 },
+    ["table-properties"] = { 16898613777, 918, 857 },
+    ["table-rows-split"] = { 16898613777, 869, 906 },
+    ["table"] = { 16898613777, 820, 955 },
+    ["tablet-smartphone"] = { 16898613777, 967, 857 },
+    ["tablet"] = { 16898613777, 918, 906 },
+    ["tablets"] = { 16898613777, 869, 955 },
+    ["tag"] = { 16898613777, 967, 906 },
+    ["tags"] = { 16898613777, 918, 955 },
+    ["tally-1"] = { 16898613777, 967, 955 },
+    ["tally-2"] = { 16898613869, 771, 0 },
+    ["tally-3"] = { 16898613869, 0, 771 },
+    ["tally-4"] = { 16898613869, 771, 257 },
+    ["tally-5"] = { 16898613869, 257, 771 },
+    ["tangent"] = { 16898613869, 771, 514 },
+    ["target"] = { 16898613869, 514, 771 },
+    ["telescope"] = { 16898613869, 820, 0 },
+    ["tent-tree"] = { 16898613869, 771, 49 },
+    ["tent"] = { 16898613869, 49, 771 },
+    ["terminal-square"] = { 16898613869, 0, 820 },
+    ["terminal"] = { 16898613869, 820, 257 },
+    ["test-tube-2"] = { 16898613869, 771, 306 },
+    ["test-tube-diagonal"] = { 16898613869, 306, 771 },
+    ["test-tube"] = { 16898613869, 257, 820 },
+    ["test-tubes"] = { 16898613869, 820, 514 },
+    ["text-cursor-input"] = { 16898613869, 771, 563 },
+    ["text-cursor"] = { 16898613869, 563, 771 },
+    ["text-quote"] = { 16898613869, 514, 820 },
+    ["text-search"] = { 16898613869, 869, 0 },
+    ["text-select"] = { 16898613869, 820, 49 },
+    ["text"] = { 16898613869, 771, 98 },
+    ["theater"] = { 16898613869, 98, 771 },
+    ["thermometer-snowflake"] = { 16898613869, 49, 820 },
+    ["thermometer-sun"] = { 16898613869, 0, 869 },
+    ["thermometer"] = { 16898613869, 869, 257 },
+    ["thumbs-down"] = { 16898613869, 820, 306 },
+    ["thumbs-up"] = { 16898613869, 771, 355 },
+    ["ticket-check"] = { 16898613869, 355, 771 },
+    ["ticket-minus"] = { 16898613869, 306, 820 },
+    ["ticket-percent"] = { 16898613869, 257, 869 },
+    ["ticket-plus"] = { 16898613869, 869, 514 },
+    ["ticket-slash"] = { 16898613869, 820, 563 },
+    ["ticket-x"] = { 16898613869, 771, 612 },
+    ["ticket"] = { 16898613869, 612, 771 },
+    ["timer-off"] = { 16898613869, 563, 820 },
+    ["timer-reset"] = { 16898613869, 514, 869 },
+    ["timer"] = { 16898613869, 918, 0 },
+    ["toggle-left"] = { 16898613869, 869, 49 },
+    ["toggle-right"] = { 16898613869, 820, 98 },
+    ["tornado"] = { 16898613869, 771, 147 },
+    ["torus"] = { 16898613869, 147, 771 },
+    ["touchpad-off"] = { 16898613869, 98, 820 },
+    ["touchpad"] = { 16898613869, 49, 869 },
+    ["tower-control"] = { 16898613869, 0, 918 },
+    ["toy-brick"] = { 16898613869, 918, 257 },
+    ["tractor"] = { 16898613869, 869, 306 },
+    ["traffic-cone"] = { 16898613869, 820, 355 },
+    ["train-front-tunnel"] = { 16898613869, 771, 404 },
+    ["train-front"] = { 16898613869, 404, 771 },
+    ["train-track"] = { 16898613869, 355, 820 },
+    ["tram-front"] = { 16898613869, 306, 869 },
+    ["trash-2"] = { 16898613869, 257, 918 },
+    ["trash"] = { 16898613869, 918, 514 },
+    ["tree-deciduous"] = { 16898613869, 869, 563 },
+    ["tree-palm"] = { 16898613869, 820, 612 },
+    ["tree-pine"] = { 16898613869, 771, 661 },
+    ["trees"] = { 16898613869, 661, 771 },
+    ["trello"] = { 16898613869, 612, 820 },
+    ["trending-down"] = { 16898613869, 563, 869 },
+    ["trending-up"] = { 16898613869, 514, 918 },
+    ["triangle-alert"] = { 16898613869, 967, 0 },
+    ["triangle-right"] = { 16898613869, 918, 49 },
+    ["triangle"] = { 16898613869, 869, 98 },
+    ["trophy"] = { 16898613869, 820, 147 },
+    ["truck"] = { 16898613869, 771, 196 },
+    ["turtle"] = { 16898613869, 196, 771 },
+    ["tv-2"] = { 16898613869, 147, 820 },
+    ["tv"] = { 16898613869, 98, 869 },
+    ["twitch"] = { 16898613869, 49, 918 },
+    ["twitter"] = { 16898613869, 0, 967 },
+    ["type"] = { 16898613869, 967, 257 },
+    ["umbrella-off"] = { 16898613869, 918, 306 },
+    ["umbrella"] = { 16898613869, 869, 355 },
+    ["underline"] = { 16898613869, 820, 404 },
+    ["undo-2"] = { 16898613869, 771, 453 },
+    ["undo-dot"] = { 16898613869, 453, 771 },
+    ["undo"] = { 16898613869, 404, 820 },
+    ["unfold-horizontal"] = { 16898613869, 355, 869 },
+    ["unfold-vertical"] = { 16898613869, 306, 918 },
+    ["ungroup"] = { 16898613869, 257, 967 },
+    ["university"] = { 16898613869, 967, 514 },
+    ["unlink-2"] = { 16898613869, 918, 563 },
+    ["unlink"] = { 16898613869, 869, 612 },
+    ["unlock-keyhole"] = { 16898613869, 820, 661 },
+    ["unlock"] = { 16898613869, 771, 710 },
+    ["unplug"] = { 16898613869, 710, 771 },
+    ["upload-cloud"] = { 16898613869, 661, 820 },
+    ["upload"] = { 16898613869, 612, 869 },
+    ["usb"] = { 16898613869, 563, 918 },
+    ["user-2"] = { 16898613869, 514, 967 },
+    ["user-check-2"] = { 16898613869, 967, 49 },
+    ["user-check"] = { 16898613869, 918, 98 },
+    ["user-circle-2"] = { 16898613869, 869, 147 },
+    ["user-circle"] = { 16898613869, 820, 196 },
+    ["user-cog-2"] = { 16898613869, 196, 820 },
+    ["user-cog"] = { 16898613869, 147, 869 },
+    ["user-minus-2"] = { 16898613869, 98, 918 },
+    ["user-minus"] = { 16898613869, 49, 967 },
+    ["user-plus-2"] = { 16898613869, 967, 306 },
+    ["user-plus"] = { 16898613869, 918, 355 },
+    ["user-round-check"] = { 16898613869, 869, 404 },
+    ["user-round-cog"] = { 16898613869, 820, 453 },
+    ["user-round-minus"] = { 16898613869, 453, 820 },
+    ["user-round-plus"] = { 16898613869, 404, 869 },
+    ["user-round-search"] = { 16898613869, 355, 918 },
+    ["user-round-x"] = { 16898613869, 306, 967 },
+    ["user-round"] = { 16898613869, 967, 563 },
+    ["user-search"] = { 16898613869, 918, 612 },
+    ["user-square-2"] = { 16898613869, 869, 661 },
+    ["user-square"] = { 16898613869, 820, 710 },
+    ["user-x-2"] = { 16898613869, 771, 759 },
+    ["user-x"] = { 16898613869, 710, 820 },
+    ["user"] = { 16898613869, 661, 869 },
+    ["users-2"] = { 16898613869, 612, 918 },
+    ["users-round"] = { 16898613869, 563, 967 },
+    ["users"] = { 16898613869, 967, 98 },
+    ["utensils-crossed"] = { 16898613869, 918, 147 },
+    ["utensils"] = { 16898613869, 869, 196 },
+    ["utility-pole"] = { 16898613869, 196, 869 },
+    ["variable"] = { 16898613869, 147, 918 },
+    ["vault"] = { 16898613869, 98, 967 },
+    ["vegan"] = { 16898613869, 967, 355 },
+    ["venetian-mask"] = { 16898613869, 918, 404 },
+    ["vibrate-off"] = { 16898613869, 869, 453 },
+    ["vibrate"] = { 16898613869, 453, 869 },
+    ["video-off"] = { 16898613869, 404, 918 },
+    ["video"] = { 16898613869, 355, 967 },
+    ["videotape"] = { 16898613869, 967, 612 },
+    ["view"] = { 16898613869, 918, 661 },
+    ["voicemail"] = { 16898613869, 869, 710 },
+    ["volume-1"] = { 16898613869, 820, 759 },
+    ["volume-2"] = { 16898613869, 771, 808 },
+    ["volume-x"] = { 16898613869, 710, 869 },
+    ["volume"] = { 16898613869, 661, 918 },
+    ["vote"] = { 16898613869, 612, 967 },
+    ["wallet-2"] = { 16898613869, 967, 147 },
+    ["wallet-cards"] = { 16898613869, 918, 196 },
+    ["wallet-minimal"] = { 16898613869, 196, 918 },
+    ["wallet"] = { 16898613869, 147, 967 },
+    ["wallpaper"] = { 16898613869, 967, 404 },
+    ["wand-2"] = { 16898613869, 918, 453 },
+    ["wand-sparkles"] = { 16898613869, 453, 918 },
+    ["wand"] = { 16898613869, 404, 967 },
+    ["warehouse"] = { 16898613869, 967, 661 },
+    ["washing-machine"] = { 16898613869, 918, 710 },
+    ["watch"] = { 16898613869, 869, 759 },
+    ["waves"] = { 16898613869, 820, 808 },
+    ["waypoints"] = { 16898613869, 771, 857 },
+    ["webcam"] = { 16898613869, 710, 918 },
+    ["webhook-off"] = { 16898613869, 661, 967 },
+    ["webhook"] = { 16898613869, 967, 196 },
+    ["weight"] = { 16898613869, 196, 967 },
+    ["wheat-off"] = { 16898613869, 967, 453 },
+    ["wheat"] = { 16898613869, 453, 967 },
+    ["whole-word"] = { 16898613869, 967, 710 },
+    ["wifi-off"] = { 16898613869, 918, 759 },
+    ["wifi"] = { 16898613869, 869, 808 },
+    ["wind"] = { 16898613869, 820, 857 },
+    ["wine-off"] = { 16898613869, 771, 906 },
+    ["wine"] = { 16898613869, 710, 967 },
+    ["workflow"] = { 16898613869, 967, 759 },
+    ["worm"] = { 16898613869, 918, 808 },
+    ["wrap-text"] = { 16898613869, 869, 857 },
+    ["wrench"] = { 16898613869, 820, 906 },
+    ["x-circle"] = { 16898613869, 771, 955 },
+    ["x-octagon"] = { 16898613869, 967, 808 },
+    ["x-square"] = { 16898613869, 918, 857 },
+    ["x"] = { 16898613869, 869, 906 },
+    ["youtube"] = { 16898613869, 820, 955 },
+    ["zap-off"] = { 16898613869, 967, 857 },
+    ["zap"] = { 16898613869, 918, 906 },
+    ["zoom-in"] = { 16898613869, 869, 955 },
+    ["zoom-out"] = { 16898613869, 967, 906 },
 }
 
-local function icon(scope, parent, name, position, size, token)
-    local aliases = { ["☾"] = "Moon", ["⚙"] = "Settings" }
-    name = aliases[name] or name or "Grid"
-    local root = frame(scope, parent, {
-        Name = "Icon",
-        BackgroundTransparency = 1,
-        Position = position or UDim2.new(),
-        Size = UDim2.fromOffset(size or 18, size or 18),
-    })
-    local segments = {}
-    local scale = (size or 18) / 20
-    for _, path in ipairs(IconPaths[name] or IconPaths.Grid) do
-        for index = 1, #path - 2, 2 do
-            local x1, y1 = path[index], path[index + 1]
-            local x2, y2 = path[index + 2], path[index + 3]
-            local dx, dy = x2 - x1, y2 - y1
-            local line = frame(scope, root, {
-                AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.fromOffset((x1 + x2) * scale / 2, (y1 + y2) * scale / 2),
-                Size = UDim2.fromOffset(math.max(1.6, math.sqrt(dx * dx + dy * dy) * scale), 1.6),
-                Rotation = math.deg(math.atan2(dy, dx)),
-            })
-            corner(line, 1)
-            table.insert(segments, line)
+local IconAliases = {
+    house = "home",
+    grid = "layout-grid",
+    sliders = "sliders-horizontal",
+    chevron = "chevron-down",
+    arrow = "arrow-right",
+    close = "x",
+    minimize = "minus",
+    resize = "move-diagonal-2",
+    ["☾"] = "moon",
+    ["⚙"] = "settings",
+}
+local CustomIcons = {}
+local MissingIcons = {}
+
+local function iconName(name)
+    name = tostring(name or "layout-grid")
+    name = name:gsub("^lucide:", ""):gsub("^lucide%-", "")
+    name = name:gsub("(%l)(%u)", "%1-%2"):lower():gsub("_", "-")
+    return IconAliases[name] or name
+end
+
+-- GetIcon returns a copy; callers cannot accidentally mutate the built-in atlas.
+function Midnight:GetIcon(name)
+    local key = iconName(name)
+    local custom = CustomIcons[key]
+    if custom then
+        return table.clone(custom)
+    end
+    local data = LucideAtlas[key]
+    if not data then
+        return nil
+    end
+    return {
+        Name = key,
+        Image = "rbxassetid://" .. tostring(data[1]),
+        ImageRectOffset = Vector2.new(data[2], data[3]),
+        ImageRectSize = Vector2.new(48, 48),
+    }
+end
+
+function Midnight:HasIcon(name)
+    return self:GetIcon(name) ~= nil
+end
+
+function Midnight:ListIcons(query)
+    local result, seen = {}, {}
+    query = tostring(query or ""):lower()
+    for _, source in ipairs({ LucideAtlas, CustomIcons }) do
+        for name in pairs(source) do
+            if not seen[name] and string.find(name, query, 1, true) then
+                seen[name] = true
+                table.insert(result, name)
+            end
         end
     end
+    table.sort(result)
+    return result
+end
+
+-- Register a Roblox image or an atlas descriptor for additional/custom icons.
+function Midnight:RegisterIcon(name, asset)
+    local descriptor
+    if type(asset) == "number" or type(asset) == "string" then
+        local id = tostring(asset):match("^rbxassetid://(%d+)$") or tostring(asset):match("^%d+$")
+        assert(id, "RegisterIcon expects a Roblox asset ID")
+        descriptor = { Image = "rbxassetid://" .. id }
+    else
+        assert(type(asset) == "table" and type(asset.Image) == "string", "Invalid icon descriptor")
+        descriptor = table.clone(asset)
+        assert(descriptor.Image:match("^rbxassetid://%d+$"), "Icon images must use Roblox asset IDs")
+    end
+    descriptor.Name = iconName(name)
+    descriptor.ImageRectOffset = descriptor.ImageRectOffset or Vector2.zero
+    descriptor.ImageRectSize = descriptor.ImageRectSize or Vector2.zero
+    assert(typeof(descriptor.ImageRectOffset) == "Vector2", "Invalid icon crop offset")
+    assert(typeof(descriptor.ImageRectSize) == "Vector2", "Invalid icon crop size")
+    CustomIcons[descriptor.Name] = descriptor
+    return self
+end
+
+local function icon(scope, parent, name, position, size, token)
+    local asset = Midnight:GetIcon(name)
+    if not asset and (type(name) == "number" or tostring(name):match("^rbxassetid://%d+$")) then
+        asset = {
+            Image = tostring(name):match("^rbxassetid://") and tostring(name) or "rbxassetid://" .. tostring(name),
+            ImageRectOffset = Vector2.zero,
+            ImageRectSize = Vector2.zero,
+        }
+    end
+    if not asset then
+        local key = tostring(name)
+        if not MissingIcons[key] then
+            MissingIcons[key] = true
+            warn("[Midnight UI] Unknown Lucide icon: " .. key .. ". Use ListIcons() or RegisterIcon().")
+        end
+        asset = Midnight:GetIcon("circle-help")
+    end
+    local root = new("ImageLabel", {
+        Name = "Icon",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = position or UDim2.new(),
+        Size = UDim2.fromOffset(size or 18, size or 18),
+        Image = asset.Image,
+        ImageRectOffset = asset.ImageRectOffset,
+        ImageRectSize = asset.ImageRectSize,
+        ScaleType = Enum.ScaleType.Fit,
+        ResampleMode = Enum.ResamplerMode.Default,
+    }, parent)
     local result = { Root = root, Token = token or "Muted" }
     function result:SetToken(nextToken, immediate)
         self.Token = nextToken
-        for _, line in ipairs(segments) do
-            if immediate then
-                line.BackgroundColor3 = Midnight.Theme[self.Token]
-            else
-                animate(scope, line, { BackgroundColor3 = Midnight.Theme[self.Token] })
-            end
+        if immediate then
+            root.ImageColor3 = Midnight.Theme[self.Token] or Midnight.Theme.Text
+        else
+            animate(scope, root, { ImageColor3 = Midnight.Theme[self.Token] or Midnight.Theme.Text })
         end
+    end
+    function result:SetIcon(nextName)
+        local nextAsset = Midnight:GetIcon(nextName)
+        if not nextAsset then
+            return false
+        end
+        root.Image = nextAsset.Image
+        root.ImageRectOffset = nextAsset.ImageRectOffset
+        root.ImageRectSize = nextAsset.ImageRectSize
+        return true
     end
     themed(scope, function()
         result:SetToken(result.Token, true)
@@ -528,10 +2207,56 @@ local function icon(scope, parent, name, position, size, token)
     return result
 end
 
--- Broad strokes share one contour: no concentric hard-edged rings.
+-- A diffuse light inside the surface, built without an image or a hard outline.
+local function aura(scope, parent, token)
+    local layers = {}
+    for index = 1, 9 do
+        local layer = frame(scope, parent, {
+            Name = "DiffuseLight",
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.43, 0.5),
+            Size = UDim2.fromScale(0.98 - index * 0.035, 1 - index * 0.07),
+            BackgroundTransparency = 1,
+        }, token or "Accent")
+        corner(layer, 12)
+        new("UIGradient", {
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1),
+                NumberSequenceKeypoint.new(0.35, 0.05),
+                NumberSequenceKeypoint.new(0.65, 0.3),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+        }, layer)
+        table.insert(layers, layer)
+    end
+    return function(visible, immediate, strength)
+        for _, layer in ipairs(layers) do
+            local transparency = visible and (1 - (strength or 0.035)) or 1
+            if immediate then
+                layer.BackgroundTransparency = transparency
+            else
+                animate(scope, layer, { BackgroundTransparency = transparency }, 0.25)
+            end
+        end
+    end
+end
+
+-- Fade text into place without disturbing layout, caret, selection or value.
+local function revealText(scope, object, text, enabled)
+    object.Text = tostring(text)
+    if not Midnight.ReducedMotion and enabled ~= false then
+        object.TextTransparency = 0.26
+        animate(scope, object, { TextTransparency = 0 }, 0.2)
+    else
+        object.TextTransparency = 0
+    end
+end
+
+-- Closely spaced, low-opacity contours approximate a smooth falloff.
 local function glow(scope, object)
     local lines = {}
-    for index, width in ipairs({ 16, 11, 7, 4 }) do
+    for index = 1, 14 do
+        local width = 30 - index * 2
         local halo = frame(scope, object, {
             Name = "SoftGlow",
             Position = UDim2.fromOffset(0, 0),
@@ -540,7 +2265,7 @@ local function glow(scope, object)
             ZIndex = 1,
         })
         corner(halo, 10)
-        local base = ({ 0.985, 0.978, 0.965, 0.94 })[index]
+        local base = 0.998 - (index / 14) ^ 2 * 0.014
         lines[index] = { Stroke = stroke(scope, halo, "Accent", base, width), Base = base }
     end
     return lines
@@ -562,10 +2287,12 @@ focusStyle = function(scope, input, outline)
     end
     scope:Connect(input.Focused, function()
         focused = true
+        input.TextTruncate = Enum.TextTruncate.None
         render()
     end)
     scope:Connect(input.FocusLost, function()
         focused = false
+        input.TextTruncate = Enum.TextTruncate.AtEnd
         render()
     end)
     themed(scope, function()
@@ -1084,7 +2811,7 @@ function Midnight:CreateWindow(options)
 
     window.Body = frame(scope, window.Shell, {
         Position = UDim2.fromOffset(14, 80),
-        Size = UDim2.new(1, -28, 1, -112),
+        Size = UDim2.new(1, -28, 1, -102),
         BackgroundTransparency = 1,
         ZIndex = 3,
     })
@@ -1111,20 +2838,7 @@ function Midnight:CreateWindow(options)
         BackgroundTransparency = 1,
         ClipsDescendants = true,
     })
-    window.StatusLabel = label(scope, window.Shell, options.Status or "READY", {
-        Position = UDim2.new(0, 24, 1, -24),
-        Size = UDim2.new(0.5, -24, 0, 16),
-        TextSize = 9,
-        ZIndex = 3,
-    }, "Muted")
-    window.Watermark = label(scope, window.Shell, "Midnight UI  /  2.0", {
-        AnchorPoint = Vector2.new(1, 1),
-        Position = UDim2.new(1, -30, 1, -8),
-        Size = UDim2.fromOffset(126, 16),
-        TextSize = 9,
-        TextXAlignment = Enum.TextXAlignment.Right,
-        ZIndex = 3,
-    }, "Muted")
+    -- The footer intentionally contains only the resize handle.
     window.ResizeHandle = button(scope, window.Shell, "", {
         AnchorPoint = Vector2.new(1, 1),
         Position = UDim2.fromScale(1, 1),
@@ -1193,7 +2907,7 @@ function Midnight:CreateWindow(options)
         if window.Visible and Midnight.Visible and not Midnight.ReducedMotion then
             for _, layer in ipairs(window.Glow) do
                 animate(scope, layer.Stroke, {
-                    Transparency = math.clamp(layer.Base - (bright and 0.006 or 0), 0, 1),
+                    Transparency = math.clamp(layer.Base - (bright and 0.001 or 0), 0, 1),
                 }, 0.35)
             end
         end
@@ -1260,7 +2974,7 @@ end
 
 function WindowMethods:SetStatus(text)
     if not self.Destroyed then
-        self.StatusLabel.Text = tostring(text)
+        self.Status = tostring(text)
     end
 end
 
@@ -1308,8 +3022,6 @@ function WindowMethods:SetMinimized(minimized)
     end
     self.Body.Visible = not self.Minimized
     self.ResizeHandle.Visible = not self.Minimized
-    self.Watermark.Visible = not self.Minimized
-    self.StatusLabel.Visible = not self.Minimized
     animate(self.Scope, self.Root, {
         Size = UDim2.fromOffset(self.FullSize.X + 32, (self.Minimized and 68 or self.FullSize.Y) + 32),
     }, 0.25)
@@ -1373,26 +3085,21 @@ function WindowMethods:CreateTab(options)
         LayoutOrder = #self.Tabs + 1,
     })
     corner(tab.NavButton, 8)
-    local outline = stroke(scope, tab.NavButton, "Border", 1)
-    local selectedWash = frame(scope, tab.NavButton, {
-        Size = UDim2.fromScale(1, 1),
-        BackgroundTransparency = 1,
-    }, "Accent")
-    corner(selectedWash, 8)
+    tab.NavButton.ClipsDescendants = true
+    local setLight = aura(scope, tab.NavButton, "Accent")
     local symbol = icon(scope, tab.NavButton, options.Icon or "Grid", UDim2.fromOffset(11, 11), 18, "Muted")
+    function tab:SetIcon(name)
+        if not scope.Alive then
+            return false
+        end
+        return symbol:SetIcon(name)
+    end
     local caption = label(scope, tab.NavButton, options.Title or "Tab", {
         Position = UDim2.fromOffset(39, 0),
         Size = UDim2.new(1, -48, 1, 0),
         TextSize = 12,
         Font = Enum.Font.GothamMedium,
     })
-    local indicator = frame(scope, tab.NavButton, {
-        AnchorPoint = Vector2.new(0, 0.5),
-        Position = UDim2.fromScale(0, 0.5),
-        Size = UDim2.fromOffset(2, 0),
-        BackgroundTransparency = 1,
-    }, "Accent")
-    corner(indicator, 2)
     tab.Page = new("CanvasGroup", {
         Name = "TabPage",
         Size = UDim2.fromScale(1, 1),
@@ -1428,15 +3135,10 @@ function WindowMethods:CreateTab(options)
         end
         set(self.NavButton, {
             BackgroundColor3 = Midnight.Theme.Raised,
-            BackgroundTransparency = selected and 0.25 or (over and 0.6 or 1),
+            BackgroundTransparency = selected and 0.38 or (over and 0.75 or 1),
         })
-        set(selectedWash, { BackgroundTransparency = selected and 0.94 or 1 })
-        set(outline, { Transparency = selected and 0.65 or 1 })
+        setLight(selected, immediate, 0.045)
         set(caption, { TextColor3 = selected and Midnight.Theme.Text or Midnight.Theme.Muted })
-        set(indicator, {
-            Size = UDim2.fromOffset(2, selected and 18 or 0),
-            BackgroundTransparency = selected and 0 or 1,
-        })
         symbol:SetToken(selected and "Accent" or "Muted", immediate)
     end
     function tab:Select()
@@ -1757,10 +3459,10 @@ function ContainerMethods:Label(options)
         Visible = options.Description ~= nil and options.Description ~= "",
     }, "Muted")
     function item:Set(text, details)
-        title.Text = tostring(text)
+        revealText(scope, title, text, options.Animate)
         self.Value = title.Text
         if details ~= nil then
-            description.Text = tostring(details)
+            revealText(scope, description, details, options.Animate)
             description.Visible = description.Text ~= ""
         end
         return self
@@ -1918,19 +3620,30 @@ end
 function ContainerMethods:Slider(options)
     options = option(options)
     local item, scope, root = control(self, options, options.Description and 96 or 78)
-    captions(scope, root, options, 92)
+    local title = captions(scope, root, options, 114)
+    title.TextSize = 14
+    title.Font = Enum.Font.GothamMedium
     local minimum = finite(options.Min, 0)
     local maximum = finite(options.Max, 100)
     if maximum < minimum then
         minimum, maximum = maximum, minimum
     end
     local step = math.max(0, finite(options.Increment, 1))
-    local valueLabel = label(scope, root, "", {
-        Position = UDim2.new(1, -90, 0, 8),
-        Size = UDim2.fromOffset(76, 28),
-        TextXAlignment = Enum.TextXAlignment.Right,
-        TextSize = 12,
-    }, "Accent")
+    local valueBadge = frame(scope, root, {
+        Name = "SliderValueBadge",
+        Position = UDim2.new(1, -96, 0, 9),
+        Size = UDim2.fromOffset(82, 28),
+        BackgroundTransparency = 0.15,
+    }, "Raised")
+    corner(valueBadge, 7)
+    local valueLabel = label(scope, valueBadge, "", {
+        Name = "SliderValue",
+        Position = UDim2.fromOffset(5, 0),
+        Size = UDim2.new(1, -10, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextSize = 14,
+        Font = Enum.Font.GothamBold,
+    }, "Text")
     local hit = button(scope, root, "", {
         Position = UDim2.new(0, 14, 1, -38),
         Size = UDim2.new(1, -28, 0, 32),
@@ -2359,6 +4072,16 @@ function ContainerMethods:Textbox(options)
         Size = UDim2.new(1, -24, 0, 32),
         MultiLine = options.MultiLine == true,
     })
+    item.Input = input
+    scope:Connect(input:GetPropertyChangedSignal("Text"), function()
+        if input:IsFocused() and not item.Disabled then
+            if options.Animate ~= false and not Midnight.ReducedMotion then
+                input.TextTransparency = 0.1
+                animate(scope, input, { TextTransparency = 0 }, 0.15)
+            end
+            safe(options.OnChanged, input.Text)
+        end
+    end)
     local maxLength = math.max(0, math.floor(finite(options.MaxLength, 4096)))
     local function trim(text)
         text = tostring(text)
@@ -2748,7 +4471,7 @@ function Midnight:Notify(options)
     local token = tokens[options.Type] or "Accent"
     NotificationId = NotificationId + 1
     host.Count = host.Count + 1
-    local width = math.min(328, math.max(180, host.Gui.AbsoluteSize.X - 32))
+    local width = math.min(340, math.max(160, host.Gui.AbsoluteSize.X - 32))
     local slot = frame(scope, host.Holder, {
         Name = "NotificationSlot",
         Size = UDim2.fromOffset(width, 100),
@@ -2766,35 +4489,43 @@ function Midnight:Notify(options)
         Size = UDim2.new(1, -8, 1, -8),
     }, "Panel")
     corner(card, 10)
-    stroke(scope, card, "Border", 0.45)
-    local accent = frame(scope, card, {
-        Position = UDim2.fromOffset(0, 12),
-        Size = UDim2.new(0, 2, 1, -24),
-        BackgroundTransparency = 0.05,
-    }, token)
-    corner(accent, 2)
+    stroke(scope, card, "Border", 0.82)
+    local setLight = aura(scope, card, token)
+    setLight(true, true, 0.018)
     local badge = frame(scope, card, {
         Position = UDim2.fromOffset(12, 13),
         Size = UDim2.fromOffset(28, 28),
         BackgroundTransparency = 0.9,
     }, token)
     corner(badge, 8)
-    icon(scope, badge, options.Type == "Success" and "Check" or "Bell", UDim2.fromOffset(5, 5), 18, token)
-    label(scope, card, options.Title or "Notification", {
+    local notificationIcons = {
+        Info = "info",
+        Success = "circle-check",
+        Error = "circle-x",
+        Warning = "triangle-alert",
+    }
+    icon(scope, badge, options.Icon or notificationIcons[options.Type] or "info", UDim2.fromOffset(4, 4), 20, token)
+    local heading = label(scope, card, options.Title or "Notification", {
+        Name = "NotificationTitle",
         Position = UDim2.fromOffset(50, 12),
-        Size = UDim2.new(1, -84, 0, 21),
+        Size = UDim2.new(1, -86, 0, 21),
         Font = Enum.Font.GothamBold,
-        TextSize = 12,
+        TextSize = 13,
     })
     local message = label(scope, card, options.Content or "", {
-        Position = UDim2.fromOffset(50, 36),
-        Size = UDim2.new(1, -64, 0, 0),
+        Name = "NotificationContent",
+        Position = UDim2.fromOffset(50, 37),
+        Size = UDim2.new(1, -66, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
         TextWrapped = true,
-        TextTruncate = Enum.TextTruncate.None,
+        TextTruncate = Enum.TextTruncate.AtEnd,
         TextYAlignment = Enum.TextYAlignment.Top,
-        TextSize = 11,
+        TextSize = 12,
+        LineHeight = 1.15,
     }, "Muted")
+    new("UISizeConstraint", { MaxSize = Vector2.new(10000, 84) }, message)
+    revealText(scope, heading, heading.Text)
+    revealText(scope, message, message.Text)
     local dismiss = button(scope, card, "", {
         Position = UDim2.new(1, -30, 0, 8),
         Size = UDim2.fromOffset(24, 24),
@@ -2811,12 +4542,16 @@ function Midnight:Notify(options)
         BackgroundTransparency = 0.1,
     }, token)
     corner(progress, 2)
+    local closing = false
     local function measure()
-        slot.Size = UDim2.fromOffset(width, math.max(88, 36 + message.AbsoluteSize.Y + 26))
+        if not closing then
+            slot.Size = UDim2.fromOffset(width, math.max(84, 37 + math.min(84, message.AbsoluteSize.Y) + 23))
+        end
     end
+    measure()
     scope:Connect(message:GetPropertyChangedSignal("AbsoluteSize"), measure)
     scope:Connect(host.Gui:GetPropertyChangedSignal("AbsoluteSize"), function()
-        width = math.min(328, math.max(180, host.Gui.AbsoluteSize.X - 32))
+        width = math.min(340, math.max(160, host.Gui.AbsoluteSize.X - 32))
         measure()
     end)
     local handle = { Closed = false }
@@ -2825,6 +4560,7 @@ function Midnight:Notify(options)
             return
         end
         self.Closed = true
+        closing = true
         animate(scope, group, {
             Position = UDim2.fromOffset(24, 0),
             GroupTransparency = 1,
@@ -2878,7 +4614,8 @@ function Midnight:Notify(options)
             live = live + 1
         end
     end
-    if live > 4 then
+    local capacity = math.clamp(math.floor((host.Gui.AbsoluteSize.Y - 40) / 154), 1, 4)
+    if live > capacity then
         for _, entry in ipairs(host.Handles) do
             if not entry.Closed then
                 entry:Close()
