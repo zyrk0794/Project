@@ -1,6 +1,6 @@
 --[[
     Midnight UI Library
-    Version: 2.2.0
+    Version: 2.2.1
     Credits: Original implementation by OpenAI for this project.
     Date: 2026-09-28
     License: MIT
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.2.0",
+    Version = "2.2.1",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -3532,14 +3532,10 @@ local function row(container, height)
         LayoutOrder = container.Order,
     }, "Panel")
     corner(object, 8)
-    local borderHost = frame(scope, object, {
-        Name = "InsetBorder",
-        Position = UDim2.fromOffset(1, 1),
-        Size = UDim2.new(1, -2, 1, -2),
-        BackgroundTransparency = 1,
-    })
-    corner(borderHost, 7)
-    local outline = stroke(scope, borderHost, "Border", 0.8)
+    -- UIStroke is a modifier, so it never becomes a UIListLayout item.
+    -- A full-height decoration Frame here creates an AutomaticSize feedback loop.
+    local outline = stroke(scope, object, "Border", 0.8)
+    outline.BorderStrokePosition = Enum.BorderStrokePosition.Inner
     return scope, object, outline
 end
 
@@ -3598,6 +3594,8 @@ function ControlMethods:SetDisabled(disabled)
         return self
     end
     self.Disabled = disabled == true
+    -- Read-only, automatically sized labels must not receive a layout child.
+    if self.Root.AutomaticSize == Enum.AutomaticSize.Y then return self end
     if not self.DisabledVeil then
         self.DisabledVeil = frame(self.Scope, self.Root, {
             Name = "DisabledVeil",
@@ -4066,24 +4064,87 @@ local function progressSurface(scope, parent, properties, backdrop)
         fill.BackgroundColor3 = Color3.new(1, 1, 1)
         sheen.Color = ColorSequence.new(a, b)
     end)
-    local state = { Indeterminate = false, Alpha = 0 }
+    local state = {
+        Indeterminate = false,
+        Alpha = 0,
+        Displayed = 0,
+        Velocity = 0,
+        Initialized = false,
+        Phase = 0,
+    }
+    local function render()
+        if state.Indeterminate then
+            -- Analytic motion avoids restarting a tween every few frames.
+            local phase = Midnight.ReducedMotion and 0 or state.Phase
+            local width = 0.24 + 0.1 * (0.5 + 0.5 * math.sin(phase * 2))
+            local left = (1 - width) * (0.5 - 0.5 * math.cos(phase))
+            fill.Position = UDim2.fromScale(left, 0)
+            fill.Size = UDim2.fromScale(width, 1)
+        else
+            fill.Position = UDim2.new()
+            fill.Size = UDim2.fromScale(state.Displayed, 1)
+        end
+        safe(state.OnChanged, state.Displayed, state.Indeterminate)
+    end
     function state:Set(alpha)
-        self.Alpha = math.clamp(alpha, 0, 1)
+        alpha = math.clamp(alpha, 0, 1)
+        local same = self.Initialized and not self.Indeterminate and self.Alpha == alpha
         self.Indeterminate = false
-        animate(scope, fill, { Position = UDim2.new(), Size = UDim2.fromScale(self.Alpha, 1) }, 0.25)
+        self.Alpha = alpha
+        if not same then self.SettledCallback = nil end
+        if not self.Initialized or Midnight.ReducedMotion then
+            self.Displayed, self.Velocity = alpha, 0
+        end
+        self.Initialized = true
+        render()
     end
     function state:SetIndeterminate(enabled)
-        self.Indeterminate = enabled == true
-        if not self.Indeterminate then self:Set(self.Alpha) end
+        local nextMode = enabled == true
+        if self.Indeterminate == nextMode then return end
+        self.Indeterminate = nextMode
+        self.Velocity = 0
+        self.SettledCallback = nil
+        if nextMode then self.Phase = math.pi / 2 end
+        render()
     end
-    local elapsed, update = 0, 0
-    scope:Connect(RunService.Heartbeat, function(delta)
-        if not state.Indeterminate or not Midnight.Visible or not isVisible(parent) then return end
-        elapsed, update = elapsed + delta, update + delta
-        if update < 0.12 then return end
-        update = 0
-        local x = Midnight.ReducedMotion and 0.32 or (0.32 + math.sin(elapsed * 2.2) * 0.32)
-        animate(scope, fill, { Position = UDim2.fromScale(x, 0), Size = UDim2.fromScale(0.36, 1) }, 0.15)
+    function state:WhenSettled(callback)
+        if not self.Indeterminate and self.Displayed == self.Alpha then
+            safe(callback)
+        else
+            self.SettledCallback = callback
+        end
+    end
+    scope:Connect(RunService.RenderStepped, function(delta)
+        if not Midnight.Visible or not isVisible(parent) then return end
+        if state.Indeterminate then
+            if Midnight.ReducedMotion then
+                render()
+                return
+            end
+            state.Phase = (state.Phase + math.min(delta, 0.1) * 2.4) % (math.pi * 2)
+            render()
+            return
+        end
+        if state.Displayed ~= state.Alpha then
+            if Midnight.ReducedMotion then
+                state.Displayed, state.Velocity = state.Alpha, 0
+            else
+                -- Carry velocity across target changes instead of canceling a tween.
+                state.Displayed, state.Velocity = TweenService:SmoothDamp(
+                    state.Displayed, state.Alpha, state.Velocity, 0.16, math.huge, math.min(delta, 0.1)
+                )
+                state.Displayed = math.clamp(state.Displayed, 0, 1)
+                if math.abs(state.Displayed - state.Alpha) < 0.0005 and math.abs(state.Velocity) < 0.005 then
+                    state.Displayed, state.Velocity = state.Alpha, 0
+                end
+            end
+            render()
+        end
+        if state.Displayed == state.Alpha and state.SettledCallback then
+            local callback = state.SettledCallback
+            state.SettledCallback = nil
+            safe(callback)
+        end
     end)
     return state, track, fill
 end
@@ -4105,6 +4166,9 @@ function ContainerMethods:ProgressBar(options)
         Position = UDim2.new(0, 14, 1, -23),
         Size = UDim2.new(1, -28, 0, 7),
     })
+    bar.OnChanged = function(displayed, indeterminate)
+        percentage.Text = indeterminate and "..." or (tostring(math.round(displayed * 100)) .. "%")
+    end
     local minimum, maximum = finite(options.Min, 0), finite(options.Max, 100)
     if maximum <= minimum then maximum = minimum + 1 end
     local completed = false
@@ -4117,7 +4181,6 @@ function ContainerMethods:ProgressBar(options)
         self.Value = value
         local alpha = (value - minimum) / (maximum - minimum)
         bar:Set(alpha)
-        percentage.Text = tostring(math.round(alpha * 100)) .. "%"
         self:_Commit(silent == true, changed)
         if alpha == 1 and not completed and not silent then safe(options.OnComplete, value) end
         completed = alpha == 1
@@ -4126,7 +4189,6 @@ function ContainerMethods:ProgressBar(options)
     function item:SetIndeterminate(enabled)
         if scope.Alive then
             bar:SetIndeterminate(enabled)
-            percentage.Text = enabled and "..." or (tostring(math.round(bar.Alpha * 100)) .. "%")
         end
         return self
     end
@@ -4206,29 +4268,65 @@ function WindowMethods:ShowLoading(options)
         ZIndex = 2,
     })
     new("UISizeConstraint", { MaxSize = Vector2.new(430, 206) }, panel)
-    local spinner = frame(scope, panel, {
-        Name = "LoadingSpinner",
+    local emblem = frame(scope, panel, {
+        Name = "LoadingEmblem",
         AnchorPoint = Vector2.new(0.5, 0),
         Position = UDim2.fromScale(0.5, 0),
         Size = UDim2.fromOffset(64, 64),
         BackgroundTransparency = 1,
     })
-    local dots = {}
-    for index = 1, 12 do
-        local angle = (index - 1) * math.pi / 6 - math.pi / 2
-        local dot = frame(scope, spinner, {
-            Name = "SpinnerDot" .. index,
-            AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = UDim2.fromOffset(32 + math.cos(angle) * 23, 32 + math.sin(angle) * 23),
-            Size = UDim2.fromOffset(4, 4),
-            BackgroundTransparency = 0.2 + (index - 1) / 16,
-        })
-        corner(dot, 3)
-        themed(scope, function(theme)
-            dot.BackgroundColor3 = readable(theme.Accent, { Color3.new(0, 0, 0) }, 4.5)
-        end)
-        table.insert(dots, dot)
-    end
+    local emblemScale = new("UIScale", { Name = "EmblemEntrance", Scale = 0.92 }, emblem)
+    local core = frame(scope, emblem, {
+        Name = "EmblemCore",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(42, 42),
+        BackgroundTransparency = 0.94,
+    }, "Accent")
+    corner(core, 21)
+    local symbol = icon(scope, emblem, "moon", UDim2.fromOffset(21, 21), 22, "Accent")
+    symbol.Root.Name = "EmblemSymbol"
+    local ring = frame(scope, emblem, {
+        Name = "OrbitRing",
+        Position = UDim2.fromOffset(3, 3),
+        Size = UDim2.fromOffset(58, 58),
+        BackgroundTransparency = 1,
+    })
+    corner(ring, 29)
+    local trackBorder = stroke(scope, ring, "Muted", 0.9, 1)
+    local orbit = frame(scope, emblem, {
+        Name = "OrbitLight",
+        Position = UDim2.fromOffset(3, 3),
+        Size = UDim2.fromOffset(58, 58),
+        BackgroundTransparency = 1,
+    })
+    corner(orbit, 29)
+    local arc = stroke(scope, orbit, "Accent", 0.08, 1.6)
+    local arcGradient = new("UIGradient", {
+        Name = "OrbitFalloff",
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.35, 0.98),
+            NumberSequenceKeypoint.new(0.7, 0.5),
+            NumberSequenceKeypoint.new(1, 0),
+        }),
+    }, arc)
+    local halo = stroke(scope, orbit, "Accent", 0.96, 5)
+    local haloGradient = new("UIGradient", {
+        Name = "OrbitBloomFalloff",
+        Transparency = arcGradient.Transparency,
+    }, halo)
+    themed(scope, function(theme)
+        local accent = readable(theme.Accent, { Color3.new(0, 0, 0) }, 4.5)
+        local secondary = readable(theme.Secondary, { Color3.new(0, 0, 0) }, 4.5)
+        symbol.Root.ImageColor3 = accent
+        core.BackgroundColor3 = accent
+        trackBorder.Color = Color3.fromRGB(115, 128, 157)
+        arc.Color = Color3.new(1, 1, 1)
+        halo.Color = Color3.new(1, 1, 1)
+        arcGradient.Color = ColorSequence.new(secondary, accent)
+        haloGradient.Color = arcGradient.Color
+    end)
     local heading = label(scope, panel, options.Title or "Preparing your workspace", {
         Name = "LoadingTitle",
         Position = UDim2.fromOffset(0, 77),
@@ -4268,27 +4366,28 @@ function WindowMethods:ShowLoading(options)
         Position = UDim2.fromOffset(0, 155),
         Size = UDim2.new(1, 0, 0, 5),
     }, Color3.new(0, 0, 0))
-    local elapsed, phase = 0, 0
-    scope:Connect(RunService.Heartbeat, function(delta)
-        if handle.Closed or Midnight.ReducedMotion or not Midnight.Visible or not window.Visible then return end
-        elapsed = elapsed + delta
-        if elapsed < 0.09 then return end
-        elapsed = 0
-        phase = (phase + 1) % 12
-        for index, dot in ipairs(dots) do
-            animate(scope, dot, { BackgroundTransparency = 0.12 + ((index - phase) % 12) / 14 }, 0.15)
-        end
+    bar.OnChanged = function(displayed, indeterminate)
+        local value = math.round(displayed * 100)
+        if value == 100 and displayed < 1 then value = 99 end
+        percent.Text = indeterminate and "..." or (tostring(value) .. "%")
+    end
+    local phase = 0
+    scope:Connect(RunService.RenderStepped, function(delta)
+        if handle.Closed or handle.Finished or Midnight.ReducedMotion
+            or not Midnight.Visible or not window.Visible then return end
+        phase = (phase + math.min(delta, 0.1)) % 120
+        arcGradient.Rotation = (phase * 125) % 360
+        haloGradient.Rotation = arcGradient.Rotation
+        core.BackgroundTransparency = 0.94 + math.sin(phase * 2.2) * 0.018
     end)
     function handle:Set(value, text, information)
-        if self.Closed or not scope.Alive then return self end
+        if self.Closed or self.Completing or not scope.Alive then return self end
         local number = finite(value, nil)
         if number then
             number = math.clamp(number, 0, 100)
             bar:Set(number / 100)
-            percent.Text = tostring(math.round(number)) .. "%"
         else
             bar:SetIndeterminate(true)
-            percent.Text = "..."
         end
         if text ~= nil then revealText(scope, detail, text) end
         if information ~= nil then revealText(scope, info, information) end
@@ -4310,19 +4409,30 @@ function WindowMethods:ShowLoading(options)
         if immediate or Midnight.ReducedMotion then
             dispose()
         else
+            animate(scope, emblemScale, { Scale = 0.94 }, 0.25)
             animate(scope, overlay, { GroupTransparency = 1 }, 0.25)
             scope:Delay(0.26, dispose)
         end
     end
     function handle:Complete(text)
-        if self.Closed then return self end
-        self:Set(100, text or "Ready")
-        scope:Delay(0.3, function() self:Close() end)
+        if self.Closed or self.Completing then return self end
+        self:Set(100)
+        self.Completing = true
+        bar:WhenSettled(function()
+            if self.Closed or not scope.Alive then return end
+            self.Finished = true
+            symbol:SetIcon("check")
+            revealText(scope, detail, text or "Ready")
+            animate(scope, arc, { Transparency = 0.5 }, 0.2)
+            animate(scope, core, { BackgroundTransparency = 0.9 }, 0.2)
+            scope:Delay(0.25, function() self:Close() end)
+        end)
         return self
     end
     handle.Root = overlay
     self.LoadingOverlay = handle
     handle:Set(options.Progress, options.Content, options.Info)
+    animate(scope, emblemScale, { Scale = 1 }, 0.3)
     animate(scope, overlay, { GroupTransparency = 0 }, 0.25)
     return handle
 end
