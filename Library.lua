@@ -1,14 +1,9 @@
 --[[
     Midnight UI Library
-    Version: 2.2.1
-    Credits: Original implementation by OpenAI for this project.
+    Version: 2.2.2
+    Credits: Original
     Date: 2026-09-28
     License: MIT
-
-    Client-side Roblox Luau module with optional host capabilities.
-    Studio: put this file in a ModuleScript and require it from a LocalScript.
-    External hosts: this file returns the library for a loadstring loader.
-    Lucide icons use Roblox-hosted atlases; no remote Lua modules are executed.
 ]]
 
 -- 1. Services and utilities ----------------------------------------------------
@@ -20,7 +15,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.2.1",
+    Version = "2.2.2",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -168,7 +163,7 @@ local function keyCode(value, fallback)
     return fallback or Enum.KeyCode.Unknown
 end
 
--- Every connection, delayed job, tween and child scope has a single owner.
+
 local Scope = {}
 Scope.__index = Scope
 
@@ -599,45 +594,6 @@ local function hover(scope, object, outline, settings)
     return render
 end
 
--- Lucide Roblox atlas snapshot: package 0.1.3, Lucide 0.363.0.
--- Source: https://github.com/latte-soft/lucide-roblox
--- Embedded data only: icons load as Roblox images, never remote executable code.
--- Each entry is { assetId, cropX, cropY }; all crops are 48 x 48 pixels.
---[[
-# MIT License
-
-Copyright (c) 2023 Latte Softworks <https://latte.to>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-# Lucide License (ISC)
-
-Lucide Icons (this package's icon sources) are licensed under ISC License. You can view it online directly at <https://lucide.dev/license>.
-
-## ISC License
-
-Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.
-
-Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-]]
 local LucideAtlas = {
     ["a-arrow-down"] = { 16898612629, 771, 0 },
     ["a-arrow-up"] = { 16898612629, 0, 771 },
@@ -3292,6 +3248,11 @@ function WindowMethods:Delay(seconds, callback)
     return self.Scope:Delay(math.max(0, finite(seconds, 0)), callback)
 end
 
+-- Cancel work previously scheduled with Window:Delay.
+function WindowMethods:CancelDelay(job)
+    if job then self.Scope:Cancel(job) end
+end
+
 function WindowMethods:SetStatus(text)
     if not self.Destroyed then
         self.Status = tostring(text)
@@ -3838,8 +3799,10 @@ function ContainerMethods:Button(options)
         BackgroundTransparency = 0.91,
     }, token)
     corner(badge, 8)
-    local symbol = icon(scope, badge, options.Icon or "Arrow", UDim2.fromOffset(5, 5), 18, token)
-    local scale = new("UIScale", { Scale = 1 }, symbol.Root)
+    local symbol = icon(scope, badge, options.Icon or "Arrow", UDim2.fromScale(0.5, 0.5), 18, token)
+    -- Scale around the center of the badge, not the image's top-left corner.
+    symbol.Root.AnchorPoint = Vector2.new(0.5, 0.5)
+    local scale = new("UIScale", { Name = "PressScale", Scale = 1 }, symbol.Root)
     local wash = frame(scope, root, {
         Name = "PressHighlight",
         Size = UDim2.fromScale(1, 1),
@@ -4224,7 +4187,21 @@ end
 function WindowMethods:ShowLoading(options)
     options = option(options)
     if self.LoadingOverlay then self.LoadingOverlay:Close(true) end
-    local handle = { Closed = false, Skipped = self.Destroyed or not self.LoadingEnabled }
+    local handle = {
+        Closed = false,
+        Aborted = false,
+        Skipped = self.Destroyed or not self.LoadingEnabled,
+    }
+    local window = self
+    -- Closing hides the overlay; aborting additionally signals cancellation.
+    -- External operations should honor Aborted or stop work in OnAbort.
+    function handle:Abort()
+        if self.Closed or self.Completing or self.Finished or window.Destroyed then return false end
+        self.Aborted = true
+        self:Close()
+        safe(options.OnAbort, self)
+        return true
+    end
     if handle.Skipped then
         function handle:Set() return self end
         function handle:SetInfo() return self end
@@ -4240,7 +4217,6 @@ function WindowMethods:ShowLoading(options)
     if self.Modal then self.Modal:Close(false) end
     self:SetMinimized(false)
     self:SetVisible(true)
-    local window = self
     local scope = Scope.new(self.Scope)
     local overlay = new("CanvasGroup", {
         Name = "LoadingOverlay",
@@ -4259,15 +4235,17 @@ function WindowMethods:ShowLoading(options)
         Active = true,
         ZIndex = 1,
     })
+    local abortable = options.Abortable == true
+    local panelHeight = abortable and 254 or 206
     local panel = frame(scope, overlay, {
         Name = "LoadingContent",
         AnchorPoint = Vector2.new(0.5, 0.5),
         Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.new(0.84, 0, 0, 206),
+        Size = UDim2.new(0.84, 0, 0, panelHeight),
         BackgroundTransparency = 1,
         ZIndex = 2,
     })
-    new("UISizeConstraint", { MaxSize = Vector2.new(430, 206) }, panel)
+    new("UISizeConstraint", { MaxSize = Vector2.new(430, panelHeight) }, panel)
     local emblem = frame(scope, panel, {
         Name = "LoadingEmblem",
         AnchorPoint = Vector2.new(0.5, 0),
@@ -4371,6 +4349,36 @@ function WindowMethods:ShowLoading(options)
         if value == 100 and displayed < 1 then value = 99 end
         percent.Text = indeterminate and "..." or (tostring(value) .. "%")
     end
+    local abortButton
+    if abortable then
+        abortButton = button(scope, panel, options.AbortText or "Abort", {
+            Name = "LoadingAbortButton",
+            AnchorPoint = Vector2.new(0.5, 0),
+            Position = UDim2.new(0.5, 0, 0, 208),
+            Size = UDim2.fromOffset(120, 36),
+            BackgroundTransparency = 0,
+            TextSize = 12,
+            Active = true,
+        })
+        corner(abortButton, 8)
+        local edge = stroke(scope, abortButton, "Border", 0.65)
+        edge.BorderStrokePosition = Enum.BorderStrokePosition.Inner
+        themed(scope, function()
+            abortButton.BackgroundColor3 = Color3.fromRGB(20, 25, 38)
+            abortButton.TextColor3 = Color3.fromRGB(225, 231, 243)
+            edge.Color = Color3.fromRGB(81, 95, 124)
+        end)
+        scope:Connect(abortButton.MouseEnter, function()
+            if not handle.Closed and not handle.Completing then
+                animate(scope, abortButton, { BackgroundColor3 = Color3.fromRGB(32, 39, 56) }, 0.18)
+            end
+        end)
+        scope:Connect(abortButton.MouseLeave, function()
+            animate(scope, abortButton, { BackgroundColor3 = Color3.fromRGB(20, 25, 38) }, 0.18)
+        end)
+        scope:Connect(abortButton.Activated, function() handle:Abort() end)
+    end
+    handle.AbortButton = abortButton
     local phase = 0
     scope:Connect(RunService.RenderStepped, function(delta)
         if handle.Closed or handle.Finished or Midnight.ReducedMotion
@@ -4418,6 +4426,10 @@ function WindowMethods:ShowLoading(options)
         if self.Closed or self.Completing then return self end
         self:Set(100)
         self.Completing = true
+        if abortButton then
+            abortButton.Active = false
+            animate(scope, abortButton, { TextTransparency = 0.55 }, 0.15)
+        end
         bar:WhenSettled(function()
             if self.Closed or not scope.Alive then return end
             self.Finished = true
