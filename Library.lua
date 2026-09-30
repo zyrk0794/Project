@@ -1,6 +1,6 @@
 --[[
     Midnight UI Library
-    Version: 2.3.0
+    Version: 2.3.1
     Credits: Original implementation by OpenAI for this project.
     Date: 2026-09-30
     License: MIT
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.3.0",
+    Version = "2.3.1",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -264,6 +264,7 @@ local DefaultTheme = {
     Secondary = Color3.fromRGB(139, 92, 246),
     Text = Color3.fromRGB(229, 233, 240),
     Muted = Color3.fromRGB(138, 147, 166),
+    Scrollbar = Color3.fromRGB(116, 121, 132),
     Error = Color3.fromRGB(248, 93, 117),
     Warning = Color3.fromRGB(255, 170, 75),
     Shadow = Color3.fromRGB(0, 0, 0),
@@ -318,6 +319,7 @@ local function resolveTheme(requested)
         theme[token] = readable(theme[token], surfaces, 3)
     end
     theme.OnAccent = readable(theme.Text, { theme.Accent }, 4.5)
+    theme.Scrollbar = readable(theme.Scrollbar, surfaces, 1.8)
     theme.Border = readable(theme.Border, surfaces, 1.4)
     theme.IsLight = light
     return theme
@@ -3137,8 +3139,9 @@ function Midnight:CreateWindow(options)
         BorderSizePixel = 0,
         CanvasSize = UDim2.new(),
         ScrollBarThickness = 2,
+        ScrollBarImageTransparency = 0.55,
     }, window.Body)
-    color(scope, window.TabBar, "ScrollBarImageColor3", "Accent")
+    color(scope, window.TabBar, "ScrollBarImageColor3", "Scrollbar")
     window.TabLayout = layout(window.TabBar, 5)
     window.NavDivider = frame(scope, window.Body, {
         Name = "NavDivider",
@@ -3441,10 +3444,10 @@ function WindowMethods:CreateTab(options)
         CanvasSize = UDim2.new(),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollingDirection = Enum.ScrollingDirection.Y,
-        ScrollBarThickness = 3,
-        ScrollBarImageTransparency = 0.5,
+        ScrollBarThickness = 2,
+        ScrollBarImageTransparency = 0.55,
     }, tab.Page)
-    color(scope, tab.Content, "ScrollBarImageColor3", "Accent")
+    color(scope, tab.Content, "ScrollBarImageColor3", "Scrollbar")
     padding(tab.Content, 3)
     layout(tab.Content, 12)
     local over = false
@@ -3829,41 +3832,92 @@ end
 ContainerMethods.Paragraph = ContainerMethods.Label
 
 -- Console --------------------------------------------------------------------
--- Bounded, read-only log. Entries own their theme bindings and animation scope.
+-- Bounded rows with separate metadata. Copy can be enabled per console.
 function ContainerMethods:Console(options)
     options = option(options)
     local item, scope, root = control(self, options, math.clamp(finite(options.Height, 230), 120, 600))
     local heading = label(scope, root, options.Title or "Console", {
-        Name = "ConsoleTitle", Position = UDim2.fromOffset(14, 9),
+        Name = "ConsoleTitle", Position = UDim2.fromOffset(14, 10),
         Size = UDim2.new(1, -90, 0, 23), Font = Enum.Font.GothamBold,
     })
-    local count = label(scope, root, "0 entries", {
-        Name = "EntryCount", Position = UDim2.new(1, -88, 0, 9),
-        Size = UDim2.fromOffset(74, 23), TextSize = 10,
-        TextXAlignment = Enum.TextXAlignment.Right,
-    }, "Muted")
+    local copyButton = button(scope, root, "Copy", {
+        Name = "CopyActivity", AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -14, 0, 10), Size = UDim2.fromOffset(58, 24),
+        TextSize = 11, BackgroundTransparency = 0.5,
+    })
+    color(scope, copyButton, "BackgroundColor3", "Raised")
+    corner(copyButton, 6)
+    frame(scope, root, { Name = "ConsoleDivider", Position = UDim2.fromOffset(14, 40),
+        Size = UDim2.new(1, -28, 0, 1), BackgroundTransparency = 0.5 }, "Border")
     local list = new("ScrollingFrame", {
-        Name = "ConsoleEntries", Position = UDim2.fromOffset(12, 40),
-        Size = UDim2.new(1, -24, 1, -50), BackgroundTransparency = 1,
+        Name = "ConsoleEntries", Position = UDim2.fromOffset(14, 49),
+        Size = UDim2.new(1, -28, 1, -61), BackgroundTransparency = 1,
         BorderSizePixel = 0, CanvasSize = UDim2.new(),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 2,
+        ScrollBarImageTransparency = 0.55,
     }, root)
-    color(scope, list, "ScrollBarImageColor3", "Accent")
-    local flow = layout(list, 7)
+    color(scope, list, "ScrollBarImageColor3", "Scrollbar")
+    local flow = layout(list, 9)
+    local export = new("TextBox", {
+        Name = "ActivityCopyText", Position = list.Position, Size = list.Size,
+        BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+        Text = "", ClearTextOnFocus = false, MultiLine = true, TextEditable = false,
+        TextWrapped = true, TextSize = 12, Font = Enum.Font.Code,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+    }, root)
+    color(scope, export, "TextColor3", "Text")
     item.Entries = {}
     item.NextOrder = 0
     item.MaxEntries = math.clamp(math.floor(finite(options.MaxEntries, 100)), 1, 500)
     item.AutoScroll = options.AutoScroll ~= false
     item.List = list
     local levels = { Info = "Muted", Success = "Secondary", Warning = "Warning", Error = "Error", Update = "Accent" }
-    function item:Clear()
-        for _, entry in ipairs(self.Entries) do
-            entry.Scope:Destroy()
-            entry.Root:Destroy()
+    function item:SetCopyable(enabled)
+        self.Copyable = enabled == true
+        copyButton.Visible = self.Copyable
+        if not self.Copyable then
+            if export:IsFocused() then export:ReleaseFocus() end
+            export.Visible = false list.Visible = true copyButton.Text = "Copy"
         end
+        return self
+    end
+    function item:GetText()
+        local lines = {}
+        for _, entry in ipairs(self.Entries) do
+            local prefix = entry.Time ~= "" and (entry.Time .. "  ") or ""
+            table.insert(lines, prefix .. string.upper(entry.Level) .. "  " .. entry.Text)
+        end
+        return table.concat(lines, "\n")
+    end
+    function item:Copy()
+        if not scope.Alive or not self.Copyable then return false end
+        local text = self:GetText()
+        local setClipboard = capability("setclipboard") or capability("toclipboard")
+        if setClipboard then
+            local ok = pcall(setClipboard, text)
+            if ok then
+                copyButton.Text = "Copied"
+                scope:Delay(1.4, function() copyButton.Text = "Copy" end)
+                return true
+            end
+        end
+        -- Studio does not expose the system clipboard. Offer native selectable text.
+        export.Text = text export.Visible = true list.Visible = false
+        copyButton.Text = "Close"
+        export:CaptureFocus()
+        export.SelectionStart = 1 export.CursorPosition = #text + 1
+        return false
+    end
+    scope:Connect(copyButton.Activated, function()
+        if export.Visible then
+            export:ReleaseFocus() export.Visible = false list.Visible = true copyButton.Text = "Copy"
+        else item:Copy() end
+    end)
+    function item:Clear()
+        for _, entry in ipairs(self.Entries) do entry.Scope:Destroy() entry.Root:Destroy() end
         table.clear(self.Entries)
-        count.Text = "0 entries"
+        export.Text = ""
         self.NextOrder = 0
         return self
     end
@@ -3880,29 +3934,40 @@ function ContainerMethods:Console(options)
         local entryScope = Scope.new(scope)
         self.NextOrder = self.NextOrder + 1
         local entryRoot = frame(entryScope, list, {
-            Name = "ConsoleEntry", Size = UDim2.new(1, -6, 0, 0),
+            Name = "ConsoleEntry_" .. self.NextOrder, Size = UDim2.new(1, -5, 0, 0),
             AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
             LayoutOrder = self.NextOrder,
         })
         local textValue = tostring(text or "")
-        local timeValue = stamp or (options.Timestamps and os.date("%H:%M:%S") or "")
-        local prefix = (timeValue ~= "" and (timeValue .. "  ") or "") .. string.upper(level) .. "  "
-        local line = label(entryScope, entryRoot, prefix .. textValue, {
-            Name = "LogLine", Size = UDim2.new(1, 0, 0, 0),
+        local timeValue = tostring(stamp or (options.Timestamps and os.date("%H:%M:%S") or ""))
+        local meta = frame(entryScope, entryRoot, { Name = "LogMetadata",
+            Size = UDim2.new(1, 0, 0, 15), BackgroundTransparency = 1 })
+        local dot = frame(entryScope, meta, { Name = "LevelIndicator",
+            Position = UDim2.fromOffset(0, 5), Size = UDim2.fromOffset(4, 4),
+            BackgroundTransparency = 0.2 }, levels[level])
+        corner(dot, 2)
+        label(entryScope, meta, string.upper(level), { Name = "LogLevel",
+            Position = UDim2.fromOffset(11, 0), Size = UDim2.fromOffset(78, 15),
+            TextSize = 9, Font = Enum.Font.GothamBold }, levels[level])
+        if timeValue ~= "" then
+            label(entryScope, meta, timeValue, { Name = "LogTimestamp", AnchorPoint = Vector2.new(1, 0),
+                Position = UDim2.fromScale(1, 0), Size = UDim2.fromOffset(74, 15),
+                TextSize = 10, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Right }, "Muted")
+        end
+        local line = label(entryScope, entryRoot, textValue, {
+            Name = "LogMessage", Position = UDim2.fromOffset(11, 17), Size = UDim2.new(1, -11, 0, 0),
             AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
             TextTruncate = Enum.TextTruncate.None, TextSize = 12,
-            Font = Enum.Font.Code, RichText = false, TextTransparency = 0.18,
-        }, levels[level])
+            Font = Enum.Font.Code, RichText = false, TextTransparency = 0.16,
+        }, level == "Error" and "Error" or "Text")
         animate(entryScope, line, { TextTransparency = 0 }, 0.2)
         table.insert(self.Entries, {
             Text = textValue, Level = level, Time = timeValue, Root = entryRoot, Scope = entryScope,
         })
         while #self.Entries > self.MaxEntries do
             local old = table.remove(self.Entries, 1)
-            old.Scope:Destroy()
-            old.Root:Destroy()
+            old.Scope:Destroy() old.Root:Destroy()
         end
-        count.Text = tostring(#self.Entries) .. " entries"
         return self
     end
     function item:SetEntries(entries)
@@ -3924,6 +3989,7 @@ function ContainerMethods:Console(options)
             list.CanvasPosition = Vector2.new(0, height)
         end
     end)
+    item:SetCopyable(options.Copyable == true)
     item:SetEntries(options.Entries)
     item.Log = item.Append
     return item
@@ -4653,13 +4719,13 @@ function ContainerMethods:Dropdown(options)
         Size = UDim2.new(1, 0, 1, searchable and -40 or 0),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        ScrollBarThickness = 3,
+        ScrollBarThickness = 2,
         ScrollBarImageTransparency = 0.35,
         CanvasSize = UDim2.new(),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollingDirection = Enum.ScrollingDirection.Y,
     }, panel)
-    color(scope, list, "ScrollBarImageColor3", "Accent")
+    color(scope, list, "ScrollBarImageColor3", "Scrollbar")
     layout(list, 4)
     local empty = label(scope, panel, "No matching options", {
         Name = "Empty",
@@ -4843,7 +4909,9 @@ function ContainerMethods:Dropdown(options)
                     end
                     item:Set(values)
                 else
+                    local repeated = item.Value == value
                     item:Set(value)
+                    if repeated and options.FireOnReselect then item:_Commit(false, true) end
                     item:SetOpen(false)
                 end
             end)
