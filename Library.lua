@@ -1,9 +1,14 @@
 --[[
     Midnight UI Library
-    Version: 2.2.2
-    Credits: Original
-    Date: 2026-09-28
+    Version: 2.3.0
+    Credits: Original implementation by OpenAI for this project.
+    Date: 2026-09-30
     License: MIT
+
+    Client-side Roblox Luau module with optional host capabilities.
+    Studio: put this file in a ModuleScript and require it from a LocalScript.
+    External hosts: this file returns the library for a loadstring loader.
+    Lucide icons use Roblox-hosted atlases; no remote Lua modules are executed.
 ]]
 
 -- 1. Services and utilities ----------------------------------------------------
@@ -15,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.2.2",
+    Version = "2.3.0",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -163,7 +168,7 @@ local function keyCode(value, fallback)
     return fallback or Enum.KeyCode.Unknown
 end
 
-
+-- Every connection, delayed job, tween and child scope has a single owner.
 local Scope = {}
 Scope.__index = Scope
 
@@ -594,6 +599,45 @@ local function hover(scope, object, outline, settings)
     return render
 end
 
+-- Lucide Roblox atlas snapshot: package 0.1.3, Lucide 0.363.0.
+-- Source: https://github.com/latte-soft/lucide-roblox
+-- Embedded data only: icons load as Roblox images, never remote executable code.
+-- Each entry is { assetId, cropX, cropY }; all crops are 48 x 48 pixels.
+--[[
+# MIT License
+
+Copyright (c) 2023 Latte Softworks <https://latte.to>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+# Lucide License (ISC)
+
+Lucide Icons (this package's icon sources) are licensed under ISC License. You can view it online directly at <https://lucide.dev/license>.
+
+## ISC License
+
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+]]
 local LucideAtlas = {
     ["a-arrow-down"] = { 16898612629, 771, 0 },
     ["a-arrow-up"] = { 16898612629, 0, 771 },
@@ -3783,6 +3827,107 @@ function ContainerMethods:Label(options)
 end
 
 ContainerMethods.Paragraph = ContainerMethods.Label
+
+-- Console --------------------------------------------------------------------
+-- Bounded, read-only log. Entries own their theme bindings and animation scope.
+function ContainerMethods:Console(options)
+    options = option(options)
+    local item, scope, root = control(self, options, math.clamp(finite(options.Height, 230), 120, 600))
+    local heading = label(scope, root, options.Title or "Console", {
+        Name = "ConsoleTitle", Position = UDim2.fromOffset(14, 9),
+        Size = UDim2.new(1, -90, 0, 23), Font = Enum.Font.GothamBold,
+    })
+    local count = label(scope, root, "0 entries", {
+        Name = "EntryCount", Position = UDim2.new(1, -88, 0, 9),
+        Size = UDim2.fromOffset(74, 23), TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    }, "Muted")
+    local list = new("ScrollingFrame", {
+        Name = "ConsoleEntries", Position = UDim2.fromOffset(12, 40),
+        Size = UDim2.new(1, -24, 1, -50), BackgroundTransparency = 1,
+        BorderSizePixel = 0, CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 2,
+    }, root)
+    color(scope, list, "ScrollBarImageColor3", "Accent")
+    local flow = layout(list, 7)
+    item.Entries = {}
+    item.NextOrder = 0
+    item.MaxEntries = math.clamp(math.floor(finite(options.MaxEntries, 100)), 1, 500)
+    item.AutoScroll = options.AutoScroll ~= false
+    item.List = list
+    local levels = { Info = "Muted", Success = "Secondary", Warning = "Warning", Error = "Error", Update = "Accent" }
+    function item:Clear()
+        for _, entry in ipairs(self.Entries) do
+            entry.Scope:Destroy()
+            entry.Root:Destroy()
+        end
+        table.clear(self.Entries)
+        count.Text = "0 entries"
+        self.NextOrder = 0
+        return self
+    end
+    function item:GetEntries()
+        local values = {}
+        for _, entry in ipairs(self.Entries) do
+            table.insert(values, { Text = entry.Text, Level = entry.Level, Time = entry.Time })
+        end
+        return values
+    end
+    function item:Append(text, level, stamp)
+        if not scope.Alive then return self end
+        level = levels[level] and level or "Info"
+        local entryScope = Scope.new(scope)
+        self.NextOrder = self.NextOrder + 1
+        local entryRoot = frame(entryScope, list, {
+            Name = "ConsoleEntry", Size = UDim2.new(1, -6, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+            LayoutOrder = self.NextOrder,
+        })
+        local textValue = tostring(text or "")
+        local timeValue = stamp or (options.Timestamps and os.date("%H:%M:%S") or "")
+        local prefix = (timeValue ~= "" and (timeValue .. "  ") or "") .. string.upper(level) .. "  "
+        local line = label(entryScope, entryRoot, prefix .. textValue, {
+            Name = "LogLine", Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+            TextTruncate = Enum.TextTruncate.None, TextSize = 12,
+            Font = Enum.Font.Code, RichText = false, TextTransparency = 0.18,
+        }, levels[level])
+        animate(entryScope, line, { TextTransparency = 0 }, 0.2)
+        table.insert(self.Entries, {
+            Text = textValue, Level = level, Time = timeValue, Root = entryRoot, Scope = entryScope,
+        })
+        while #self.Entries > self.MaxEntries do
+            local old = table.remove(self.Entries, 1)
+            old.Scope:Destroy()
+            old.Root:Destroy()
+        end
+        count.Text = tostring(#self.Entries) .. " entries"
+        return self
+    end
+    function item:SetEntries(entries)
+        self:Clear()
+        for _, entry in ipairs(entries or {}) do
+            if type(entry) == "string" then self:Append(entry)
+            else self:Append(entry.Text, entry.Level, entry.Time) end
+        end
+        return self
+    end
+    function item:SetTitle(text)
+        if scope.Alive then revealText(scope, heading, text) end
+        return self
+    end
+    scope:Connect(flow:GetPropertyChangedSignal("AbsoluteContentSize"), function()
+        if item.AutoScroll then
+            local scale = math.max(item.Window.Scale.Scale, 0.01)
+            local height = math.max(0, (flow.AbsoluteContentSize.Y - list.AbsoluteSize.Y) / scale)
+            list.CanvasPosition = Vector2.new(0, height)
+        end
+    end)
+    item:SetEntries(options.Entries)
+    item.Log = item.Append
+    return item
+end
 
 -- Buttons --------------------------------------------------------------------
 
