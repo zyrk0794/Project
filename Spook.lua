@@ -1,6 +1,6 @@
 --[[
-    Midnight Spooky Hunter 1.0.0 - Lumber Tycoon 2
-    October 1, 2026. Standalone client script; no UI-library download required.
+    Midnight Spooky Hunter 1.1.1 - Lumber Tycoon 2
+    October 2, 2026. Standalone client script; no UI-library download required.
     Modwood is an experimental reconstruction of the supplied Dark X source.
     A failed burn, missing plank, or unconfirmed save stops the cycle in place.
     Use the companion loader or set Script URL for continuation after a hop.
@@ -35,6 +35,7 @@ local function finite(v) return type(v) == "number" and v == v and math.abs(v) <
 local function value(object, name)
     local field = object and object:FindFirstChild(name)
     if field and field:IsA("ValueBase") then return field.Value end
+    return nil
 end
 local function owned(model) return value(model, "Owner") == Player end
 local function partOf(model)
@@ -102,8 +103,13 @@ function H:SetStage(text, progress, detail)
     if progress then self.Progress = math.clamp(progress, 0, 1) end
     if self.UI then
         self.UI.Stage.Text = text self.UI.Detail.Text = detail or ""
+        if self.StageTween then self.StageTween:Cancel() end
+        self.UI.Stage.TextTransparency = 0.28
+        self.StageTween = S.TweenService:Create(self.UI.Stage, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+            {TextTransparency = 0})
+        self.StageTween:Play()
         if self.ProgressTween then self.ProgressTween:Cancel() end
-        self.ProgressTween = S.TweenService:Create(self.UI.Fill, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+        self.ProgressTween = S.TweenService:Create(self.UI.Fill, TweenInfo.new(0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
             { Size = UDim2.fromScale(self.Progress, 1) })
         self.ProgressTween:Play()
     end
@@ -158,13 +164,16 @@ function H:Token()
         end
         table.clear(self.Cleanups)
     end
-    function token:Await(fn, timeout)
+    function token:Await(fn, timeout, onWaiting)
         local result
         local thread = task.spawn(function() result = table.pack(pcall(fn)) end)
         local deadline = os.clock() + (timeout or 20)
         local function cancel() if not result then pcall(task.cancel, thread) end end
         self:Finally(cancel)
-        while not result and os.clock() < deadline do self:Sleep(0.08) end
+        while not result and os.clock() < deadline do
+            if onWaiting then onWaiting() end
+            self:Sleep(0.08)
+        end
         if not result then cancel() error("Request timed out - it may still complete on the server", 0) end
         self:Check()
         if not result[1] then error(result[2], 0) end
@@ -191,9 +200,13 @@ function H:Teleport(cf)
     root.AssemblyLinearVelocity = Vector3.zero root.AssemblyAngularVelocity = Vector3.zero
 end
 function H:Plot()
-    local properties = S.Workspace:FindFirstChild("Properties")
-    for _, plot in ipairs(properties and properties:GetChildren() or {}) do
-        if owned(plot) then return plot end
+    -- Both spellings have been reported. Ownership is an ObjectValue, never a name.
+    for _, folderName in ipairs({"Propertie", "Properties"}) do
+        local properties = S.Workspace:FindFirstChild(folderName)
+        for _, plot in ipairs(properties and properties:GetChildren() or {}) do
+            local owner = plot:FindFirstChild("Owner")
+            if owner and owner:IsA("ObjectValue") and owner.Value == Player then return plot end
+        end
     end
 end
 function H:PlotCenter(plot)
@@ -219,37 +232,131 @@ function H:PlotCenter(plot)
     end
     return CFrame.new(nearest)
 end
+-- Exact game buttons supplied by the user. Each step fires once and waits for
+-- the next dialog; captions and unrelated purchase buttons are never searched.
+function H:LoadConfirmation(token)
+    local state = {Step = 1, Seen = false, LastCheck = -math.huge}
+    local fire = cap("firesignal", firesignal)
+    local function visible(button, gui)
+        if not button or not button:IsA("GuiButton") or not gui.Enabled then return false end
+        local node = button
+        while node and node ~= gui do
+            if node:IsA("GuiObject") and not node.Visible then return false end
+            node = node.Parent
+        end
+        return node == gui
+    end
+    local function buttons()
+        local playerGui = Player:FindFirstChildOfClass("PlayerGui")
+        local gui = playerGui and playerGui:FindFirstChild("PropertyPurchasingGUI")
+        if not gui or not gui:IsA("ScreenGui") then return nil end
+        local selectPanel = gui:FindFirstChild("SelectPurchase")
+        local confirmPanel = gui:FindFirstChild("ConfirmPurchase")
+        return gui, selectPanel and selectPanel:FindFirstChild("Purchase"),
+            confirmPanel and confirmPanel:FindFirstChild("Purchase")
+    end
+    function state:Open()
+        local gui, first, second = buttons()
+        return gui and (visible(first, gui) or visible(second, gui)) or false
+    end
+    local function service()
+        token:Check()
+        if os.clock() - state.LastCheck < 0.1 then return end
+        state.LastCheck = os.clock()
+        local gui, first, second = buttons()
+        if not gui then return end
+        if visible(first, gui) or visible(second, gui) then state.Seen = true end
+        if state.Step > 2 then return end
+        local button = state.Step == 1 and first or second
+        if not visible(button, gui) then return end
+        assert(fire, "Slot confirmation requires firesignal in this executor")
+        local step = state.Step
+        -- Advance before firing, since the callback can immediately show step two.
+        state.Step = step + 1
+        local ok = pcall(fire, button.MouseButton1Click)
+        assert(ok, "Could not activate PropertyPurchasingGUI." ..
+            (step == 1 and "SelectPurchase" or "ConfirmPurchase") .. ".Purchase")
+        H:SetStage(step == 1 and "Confirming property" or "Waiting for the plot", step == 1 and 0.13 or 0.15)
+        H:Log("Slot confirmation " .. step .. "/2 activated")
+    end
+    return service, state
+end
 function H:LoadSlot(token)
     self:SetStage("Loading slot " .. self.Config.Slot, 0.12)
     local slot = self.Config.Slot
-    local deadline = os.clock() + 90
+    local confirm, confirmation = self:LoadConfirmation(token)
+    local deadline = os.clock() + 120
+    local resuming = tonumber(value(Player, "CurrentSaveSlot")) == slot and confirmation:Open()
+    -- Resume our selected slot if a previous request is still awaiting these
+    -- dialogs. Do not activate them for a different slot that is saving/loading.
     while value(Player, "CurrentlySavingOrLoading") == true do
-        assert(os.clock() < deadline, "The game is still saving or loading") token:Sleep(0.25)
+        if tonumber(value(Player, "CurrentSaveSlot")) == slot then resuming = true confirm() end
+        assert(os.clock() < deadline, "The previous save/load has not finished")
+        token:Sleep(0.1)
     end
-    if value(Player, "CurrentSaveSlot") ~= slot then
+    local requested = false
+    if not resuming and (tonumber(value(Player, "CurrentSaveSlot")) ~= slot or not self:Plot()) then
         local may = self:Remote("LoadSaveRequests", "ClientMayLoad", "RemoteFunction")
         repeat
             local permitted = token:Await(function() return may:InvokeServer(Player) end)
             if permitted == true then break end
-            assert(os.clock() < deadline, "Slot loading cooldown exceeded") token:Sleep(3)
+            assert(os.clock() < deadline, "Slot loading cooldown exceeded") token:Sleep(2)
         until false
+        requested = true
         local load = self:Remote("LoadSaveRequests", "RequestLoad", "RemoteFunction")
-        local result = token:Await(function() return load:InvokeServer(slot, Player) end, 40)
+        local result = token:Await(function() return load:InvokeServer(slot, Player) end, 120, confirm)
         assert(result ~= false, "The game rejected the selected slot")
     end
-    deadline = os.clock() + 90
+    deadline = os.clock() + 120
+    local stableSince, lastPlot, lastTiles, lastModels
+    local loadedPlot
     repeat
         token:Check()
-        if value(Player, "CurrentSaveSlot") == slot and value(Player, "CurrentlySavingOrLoading") == false and self:Plot() then break end
-        assert(os.clock() < deadline, "The loaded slot and plot were not confirmed") token:Sleep(0.3)
+        confirm()
+        local plot = self:Plot()
+        local tiles, models = 0, 0
+        if plot then
+            for _, tile in ipairs(plot:GetChildren()) do
+                if tile:IsA("BasePart") and (tile.Name == "OriginSquare" or tile.Name == "Square") then
+                    tiles = tiles + 1
+                end
+            end
+            local playerModels = S.Workspace:FindFirstChild("PlayerModels")
+            for _, model in ipairs(playerModels and playerModels:GetChildren() or {}) do
+                if owned(model) then models = models + 1 end
+            end
+        end
+        local currentSlot = value(Player, "CurrentSaveSlot")
+        local busy = value(Player, "CurrentlySavingOrLoading")
+        -- Optional indicators strengthen the check when replicated, but a missing
+        -- BoolValue must not trap an already loaded, owned plot forever.
+        local slotMatches = currentSlot == nil or tonumber(currentSlot) == slot
+        local dialogsDone = (not requested and not confirmation.Seen or confirmation.Step == 3)
+            and not confirmation:Open()
+        local character = Player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local ready = plot and tiles > 0 and slotMatches and busy ~= true and dialogsDone
+            and character and character.Parent and humanoid and humanoid.Health > 0 and root
+        if ready then
+            if plot ~= lastPlot or tiles ~= lastTiles or models ~= lastModels then stableSince = os.clock() end
+            stableSince = stableSince or os.clock()
+            if os.clock() - stableSince >= 2 then loadedPlot = plot break end
+        else stableSince = nil end
+        lastPlot, lastTiles, lastModels = plot, tiles, models
+        assert(os.clock() < deadline, string.format(
+            "Slot load not confirmed - owner: %s, land: %d, slot: %s, busy: %s, confirmation: %d/2",
+            plot and "local player" or "missing", tiles, tostring(currentSlot), tostring(busy), confirmation.Step-1))
+        token:Sleep(0.15)
     until false
+    self:SetStage("Slot loaded", 0.18, "Owned plot confirmed")
     local character, _, root = self:Character()
     token.Character = character
     local origin = root.CFrame
     token:Finally(function()
         if self.Alive and Player.Character == character and root.Parent then pcall(self.Teleport, self, origin) end
     end)
-    return self:Plot()
+    return loadedPlot
 end
 function H:FindMill(token)
     local deadline = os.clock() + 20
@@ -325,12 +432,16 @@ function H:EnsureAxe(kind, plot, token)
 end
 function H:Scan(token)
     local matches, counts = {}, { Spooky = 0, SpookyNeon = 0, SpookyVolume = 0, SpookyNeonVolume = 0 }
-    local regions, inspected = 0, 0
+    local regions, inspected, ready = 0, 0, 0
+    local snapshot, budgetStart = {}, os.clock()
+    token:Check()
     for _, region in ipairs(S.Workspace:GetChildren()) do
         if region.Name == "TreeRegion" then
             regions = regions + 1
             for _, model in ipairs(region:GetChildren()) do
-                local kind, ownerField = value(model,"TreeClass"), model:FindFirstChild("Owner")
+                local kind = value(model,"TreeClass")
+                if kind then ready = ready + 1 snapshot[model] = kind end
+                local ownerField = rare(kind) and model:FindFirstChild("Owner")
                 if model:IsA("Model") and rare(kind) and ownerField and ownerField:IsA("ObjectValue") and ownerField.Value == nil
                     and model:FindFirstChild("CutEvent") and not model:FindFirstChild("RootCut") then
                     local trunk, volume = nil, 0
@@ -345,15 +456,52 @@ function H:Scan(token)
                         counts[kind] = counts[kind] + 1 counts[kind .. "Volume"] = counts[kind .. "Volume"] + volume
                     end
                 end
-                inspected = inspected + 1 if inspected % 80 == 0 then token:Sleep(0.01) end
+                inspected = inspected + 1
+                if inspected % 64 == 0 and os.clock() - budgetStart >= 0.004 then
+                    token:Sleep(0.001) budgetStart = os.clock()
+                end
             end
         end
     end
     table.sort(matches, function(a,b) return a.Volume > b.Volume end)
     self.Counts = counts
-    if self.UI then self.UI.Found.Text = string.format("Spooky  %d / %.0f studs3     Neon  %d / %.0f studs3",
-        counts.Spooky, counts.SpookyVolume, counts.SpookyNeon, counts.SpookyNeonVolume) end
-    return matches, regions
+    if self.UI then
+        self.UI.Spooky.Text = tostring(counts.Spooky)
+        self.UI.Neon.Text = tostring(counts.SpookyNeon)
+        self.UI.SpookyVolume.Text = string.format("%.0f studs3", counts.SpookyVolume)
+        self.UI.NeonVolume.Text = string.format("%.0f studs3", counts.SpookyNeonVolume)
+    end
+    return matches, regions, snapshot, ready
+end
+function H:ScanReady(token)
+    local started, stableSince = os.clock(), os.clock()
+    local previous, previousRegions, previousCount, previousVolume
+    self:SetStage("Scanning trees", 0.04)
+    repeat
+        token:Check()
+        if game:IsLoaded() then
+            local matches, regions, snapshot, ready = self:Scan(token)
+            local volume = self.Counts.SpookyVolume + self.Counts.SpookyNeonVolume
+            local changed = not previous or regions ~= previousRegions or #matches ~= previousCount or volume ~= previousVolume
+            if not changed then
+                for model, kind in pairs(snapshot) do if previous[model] ~= kind then changed = true break end end
+                if not changed then
+                    for model in pairs(previous) do if snapshot[model] == nil then changed = true break end end
+                end
+            end
+            if changed then stableSince = os.clock() end
+            previous, previousRegions, previousCount, previousVolume = snapshot, regions, #matches, volume
+            -- Positive results settle briefly; an empty result needs a longer
+            -- quiet window. ScanWait is a deadline, never an unconditional sleep.
+            if regions > 0 and ready > 0 and os.clock() - stableSince >= (#matches > 0 and 0.6 or 2)
+                and (#matches > 0 or os.clock() - started >= 4) then
+                self:Log(string.format("Scan complete - %.2fs / %d trees checked", os.clock()-started, ready))
+                return matches
+            end
+        else stableSince = os.clock() end
+        assert(os.clock()-started < self.Config.ScanWait, "World scan did not stabilize - staying in this server")
+        token:Sleep(0.25)
+    until false
 end
 function H:Chop(entry, tool, stats, token)
     local tree, trunk = entry.Model, entry.Trunk
@@ -553,24 +701,31 @@ function H:SaveSlot(token)
     end
     token:Sleep(2)
 end
-function H:SendWebhook(title, description, token)
+function H:SendWebhook(title, description, token, receipt)
     local url = self.Config.Webhook
     if url == "" then return end
     assert(webhookURL(url), "Webhook must be a Discord webhook URL without extra parameters")
     assert(type(Request) == "function", "Your executor has no HTTP request function")
     local fields = {
         {name = "Server", value = game.JobId, inline = false},
-        {name = "Detected at (UTC)", value = os.date("!%Y-%m-%d %H:%M:%S"), inline = true},
+        {name = "Date (UTC)", value = os.date("!%Y-%m-%d %H:%M:%S"), inline = true},
         {name = "Hunt duration", value = duration(os.time() - self.StartedAt), inline = true},
-        {name = "Server age / creation", value = "Unavailable - not exposed by the game", inline = false},
         {name = "Slot", value = tostring(self.Config.Slot), inline = true},
     }
-    if self.Counts then
+    if receipt then
+        table.insert(fields, {name="Trees processed", value=tostring(receipt.Trees), inline=true})
+        table.insert(fields, {name="Planks delivered", value=tostring(receipt.Planks), inline=true})
+        table.insert(fields, {name="Processing time", value=duration(receipt.Seconds), inline=true})
+        table.insert(fields, {name="Slot save", value="Confirmed", inline=true})
+        if receipt.Skipped > 0 then
+            table.insert(fields, {name="Unavailable trees skipped", value=tostring(receipt.Skipped), inline=true})
+        end
+    elseif self.Counts then
         table.insert(fields, {name="Spooky", value=string.format("%d trees / %.1f studs3",self.Counts.Spooky,self.Counts.SpookyVolume), inline=true})
         table.insert(fields, {name="SpookyNeon", value=string.format("%d trees / %.1f studs3",self.Counts.SpookyNeon,self.Counts.SpookyNeonVolume), inline=true})
     end
     local body = S.HttpService:JSONEncode({ username = "Midnight Spooky Hunter", allowed_mentions = {parse = {}},
-        embeds = {{title = title, description = description, color = 4881663, fields = fields,
+        embeds = {{title = title, description = description, color = receipt and 8641782 or 4881663, fields = fields,
             timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}} })
     local response = token:Await(function()
         local ok, result = pcall(Request, {Url=url .. "?wait=true",Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
@@ -669,18 +824,12 @@ function H:Run(token)
     if self.Config.Webhook~="" then assert(webhookURL(self.Config.Webhook),"Invalid Discord webhook URL") end
     self.Visited[game.JobId]=os.time() self.Stats.Servers=self.Stats.Servers+1
     local saved,saveError=self:Persist(false) assert(saved,saveError)
-    self:SetStage("Waiting for the world",0.03)
-    token:Sleep(self.Config.ScanWait)
-    local entries,regions=self:Scan(token)
-    assert(regions>0,"No TreeRegion loaded - not hopping from an incomplete world")
-    -- Two scans separated in time avoid acting on the first replication frame.
-    token:Sleep(3) entries,regions=self:Scan(token)
+    local entries=self:ScanReady(token)
     if #entries==0 then self:SetStage("No rare tree found",0.1) return self:Hop(token) end
-    local plan=self.Config.FullCycle and "Load slot, collect axe, cut each tree, attempt Modwood, deliver planks, save, then hop."
-        or "Search-only mode: stay in this server."
     self:SetStage("Rare trees found",0.1,tostring(#entries).." trees")
-    self:SendWebhook("Rare trees found",plan,token)
+    self:SendWebhook("Rare trees found",self.Config.FullCycle and "Spooky wood detected." or "Spooky wood detected - search paused.",token)
     if not self.Config.FullCycle then return "Found - search paused in this server" end
+    local batchStarted, initialPlanks = os.clock(), self.Stats.Planks
     local plot=self:LoadSlot(token)
     local mill,inlet=self:FindMill(token)
     self:FindLava() -- Fail before chopping if the reconstructed procedure cannot even start.
@@ -702,7 +851,9 @@ function H:Run(token)
         else self:Log("Tree no longer available - skipped","WARNING") end
     end
     if processed>0 then
-        self:SendWebhook("Batch saved","Planks delivered and slot save confirmed. Moving to the next server.",token)
+        self:SendWebhook(processed == #entries and "Harvest complete" or "Harvest complete - some trees unavailable",
+            "Wood collected, Modwood completed, planks delivered to your plot and slot save confirmed.",token,
+            {Trees=processed, Planks=self.Stats.Planks-initialPlanks, Seconds=os.clock()-batchStarted, Skipped=#entries-processed})
     else
         self:SendWebhook("Trees no longer available","No harvest was performed. Moving to the next server.",token)
     end
@@ -713,14 +864,14 @@ function H:Start()
     if self.Busy or not self.Alive then return end
     self.Running=true self.Busy=true
     local token=self:Token() self.ActiveToken=token
-    if self.UI then self.UI.Start.Text="Running" end
+    if self.UI then self.UI.Start.Text="Hunting..." end
     self.Worker=task.defer(function()
         local ok,result=pcall(self.Run,self,token)
         token:Clean()
         self.Running=false self.Busy=false self.ActiveToken=nil
         self:Persist(false)
         if not self.Alive then return end
-        if self.UI then self.UI.Start.Text="Start" end
+        if self.UI then self.UI.Start.Text="Start hunt" end
         if result==CANCEL then self:SetStage("Stopped",self.Progress,"No further task will be started")
         elseif not ok then self:SetStage("Paused - action required",self.Progress,tostring(result)) self:Log(tostring(result),"ERROR")
         else self:SetStage(tostring(result or "Done"),1) end
@@ -738,31 +889,56 @@ function H:Destroy()
     if self.Worker then pcall(task.cancel,self.Worker) end
     for _,c in ipairs(self.Connections) do c:Disconnect() end
     if self.ProgressTween then self.ProgressTween:Cancel() end
+    if self.StageTween then self.StageTween:Cancel() end
+    for _,animation in pairs(self.Motion or {}) do animation:Cancel() end
     if self.Gui then self.Gui:Destroy() end
     if Env.MidnightSpookyHunter==self then Env.MidnightSpookyHunter=nil end
 end
 
--- Compact Midnight-style UI, made entirely with native instances.
-local P = {Background=Color3.fromRGB(10,14,26),Panel=Color3.fromRGB(17,24,39),Raised=Color3.fromRGB(25,33,51),
-    Accent=Color3.fromRGB(74,124,255),Purple=Color3.fromRGB(139,92,246),Text=Color3.fromRGB(229,233,240),Muted=Color3.fromRGB(138,147,166)}
+-- Midnight UI: one quiet dashboard, with separate activity and settings pages.
+local P = {Background=Color3.fromRGB(10,14,26),Panel=Color3.fromRGB(16,22,37),Raised=Color3.fromRGB(23,31,49),
+    Accent=Color3.fromRGB(74,124,255),Purple=Color3.fromRGB(139,92,246),Text=Color3.fromRGB(235,239,247),Muted=Color3.fromRGB(137,148,171)}
 local function new(class,name,props,parent)
     local o=Instance.new(class) o.Name=name
     for k,v in pairs(props or {}) do o[k]=v end
     o.Parent=parent return o
 end
 local function round(o,r) new("UICorner","Corner",{CornerRadius=UDim.new(0,r or 8)},o) end
+local motion = setmetatable({}, {__mode="k"})
+local function tween(object, goals, seconds)
+    if motion[object] then motion[object]:Cancel() end
+    local animation=S.TweenService:Create(object,TweenInfo.new(seconds or 0.22,Enum.EasingStyle.Quart,Enum.EasingDirection.Out),goals)
+    motion[object]=animation animation:Play()
+end
+H.Motion = motion
 local function label(parent,name,text,pos,size,fontSize,color)
     return new("TextLabel",name,{Position=pos,Size=size,Text=text,TextSize=fontSize or 12,Font=Enum.Font.Gotham,
         TextColor3=color or P.Text,BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,
         TextTruncate=Enum.TextTruncate.AtEnd},parent)
 end
 local function button(parent,name,text,pos,size,callback,primary)
-    local b=new("TextButton",name,{Position=pos,Size=size,Text=text,TextSize=12,Font=Enum.Font.GothamMedium,
-        TextColor3=P.Text,BackgroundColor3=primary and P.Accent or P.Raised,AutoButtonColor=false,BorderSizePixel=0},parent)
-    round(b,7)
+    -- Scale around the center, including icon/text, without shifting to a corner.
+    local base=primary and P.Accent or P.Raised
+    local centered=UDim2.new(pos.X.Scale+size.X.Scale/2,pos.X.Offset+size.X.Offset/2,
+        pos.Y.Scale+size.Y.Scale/2,pos.Y.Offset+size.Y.Offset/2)
+    local b=new("TextButton",name,{AnchorPoint=Vector2.new(0.5,0.5),Position=centered,Size=size,Text=text,
+        TextSize=12,Font=Enum.Font.GothamMedium,TextColor3=P.Text,BackgroundColor3=base,
+        AutoButtonColor=false,BorderSizePixel=0,TextTruncate=Enum.TextTruncate.AtEnd},parent)
+    round(b,8)
+    local press=new("UIScale","PressScale",{Scale=1},b)
     H:Connect(b.Activated,callback)
-    H:Connect(b.MouseEnter,function() b.BackgroundTransparency=0.15 end)
-    H:Connect(b.MouseLeave,function() b.BackgroundTransparency=0 end)
+    H:Connect(b.MouseEnter,function() tween(b,{BackgroundColor3=base:Lerp(P.Text,0.07)}) end)
+    H:Connect(b.MouseLeave,function() tween(b,{BackgroundColor3=base}) tween(press,{Scale=1}) end)
+    H:Connect(b.InputBegan,function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            tween(press,{Scale=0.97},0.15)
+        end
+    end)
+    H:Connect(b.InputEnded,function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            tween(press,{Scale=1},0.25)
+        end
+    end)
     return b
 end
 local gui=new("ScreenGui","MidnightSpookyHunter",{ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,
@@ -776,66 +952,88 @@ if playerGui then table.insert(parents,playerGui) end
 for _,parent in ipairs(parents) do local ok=pcall(function() gui.Parent=parent end) if ok and gui.Parent then break end end
 assert(gui.Parent,"No available UI container")
 local root=new("Frame","HunterWindow",{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),
-    Size=UDim2.fromOffset(520,330),BackgroundTransparency=1,BorderSizePixel=0},gui)
+    Size=UDim2.fromOffset(480,314),BackgroundTransparency=1,BorderSizePixel=0},gui)
 local scale=new("UIScale","ViewportScale",{Scale=1},root)
 for i=3,1,-1 do
     local halo=new("Frame","WindowHalo"..i,{Position=UDim2.fromOffset(-i*3,-i*3),Size=UDim2.new(1,i*6,1,i*6),
-        BorderSizePixel=0,BackgroundColor3=P.Accent,BackgroundTransparency=0.975},root) round(halo,12+i*2)
+        BorderSizePixel=0,BackgroundTransparency=1},root) round(halo,12+i*3)
+    new("UIStroke","HaloStroke",{Color=P.Accent,Thickness=3,Transparency=0.9+i*0.025},halo)
 end
-local shell=new("Frame","WindowSurface",{Size=UDim2.fromScale(1,1),BackgroundColor3=P.Background,BorderSizePixel=0},root) round(shell,11)
-new("UIStroke","WindowBorder",{Color=Color3.fromRGB(35,48,72),Transparency=0.4,Thickness=1},shell)
-local header=new("Frame","TitleBar",{Size=UDim2.new(1,0,0,49),BackgroundColor3=P.Panel,BorderSizePixel=0},shell) round(header,11)
-new("UIGradient","TitleTint",{Color=ColorSequence.new(P.Accent:Lerp(P.Background,0.87),P.Purple:Lerp(P.Background,0.9))},header)
-local title=label(header,"WindowTitle","SPOOKY HUNTER",UDim2.fromOffset(55,6),UDim2.new(1,-120,0,23),13)
+local shell=new("Frame","WindowSurface",{Size=UDim2.fromScale(1,1),BackgroundColor3=P.Background,BorderSizePixel=0},root) round(shell,12)
+new("UIStroke","WindowBorder",{Color=Color3.fromRGB(45,58,86),Transparency=0.48,Thickness=1},shell)
+local header=new("Frame","TitleBar",{Size=UDim2.new(1,0,0,58),BackgroundTransparency=1,BorderSizePixel=0},shell)
+local title=label(header,"WindowTitle","Spooky Hunter",UDim2.fromOffset(56,11),UDim2.new(1,-158,0,21),15)
 title.Font=Enum.Font.GothamBold
-label(header,"WindowSubtitle","Midnight - Lumber Tycoon 2",UDim2.fromOffset(55,27),UDim2.new(1,-120,0,14),10,P.Muted)
-local content=new("Frame","HuntPage",{Position=UDim2.fromOffset(16,60),Size=UDim2.new(1,-32,1,-74),BackgroundTransparency=1},shell)
-local stage=label(content,"Stage","Ready",UDim2.fromOffset(0,0),UDim2.new(1,0,0,23),17) stage.Font=Enum.Font.GothamBold
-local detail=label(content,"StageDetail","Configure the slot and webhook using the gear.",UDim2.fromOffset(0,28),UDim2.new(1,0,0,31),11,P.Muted)
-detail.TextWrapped=true detail.TextTruncate=Enum.TextTruncate.None
-local rail=new("Frame","ProgressRail",{Position=UDim2.fromOffset(0,67),Size=UDim2.new(1,0,0,4),BackgroundColor3=P.Raised,BorderSizePixel=0},content) round(rail,4)
-local fill=new("Frame","ProgressFill",{Size=UDim2.fromScale(0,1),BackgroundColor3=P.Accent,BorderSizePixel=0},rail) round(fill,4)
+label(header,"WindowSubtitle","MIDNIGHT 1.1.1",UDim2.fromOffset(56,34),UDim2.new(1,-158,0,12),9,P.Muted)
+local divider=new("Frame","HeaderDivider",{Position=UDim2.fromOffset(20,58),Size=UDim2.new(1,-40,0,1),
+    BorderSizePixel=0,BackgroundColor3=P.Accent,BackgroundTransparency=0.72},shell)
+new("UIGradient","DividerTint",{Color=ColorSequence.new(P.Accent,P.Purple)},divider)
+local content=new("Frame","HuntPage",{Position=UDim2.fromOffset(20,76),Size=UDim2.new(1,-40,1,-94),BackgroundTransparency=1},shell)
+local stage=label(content,"Stage","Ready to hunt",UDim2.fromOffset(0,0),UDim2.new(1,0,0,24),19) stage.Font=Enum.Font.GothamBold
+local detail=label(content,"StageDetail","Spooky and SpookyNeon",UDim2.fromOffset(0,28),UDim2.new(1,0,0,29),11,P.Muted)
+detail.TextWrapped=true detail.TextTruncate=Enum.TextTruncate.None detail.TextYAlignment=Enum.TextYAlignment.Top
+local rail=new("Frame","ProgressRail",{Position=UDim2.fromOffset(0,65),Size=UDim2.new(1,0,0,3),BackgroundColor3=P.Raised,BorderSizePixel=0},content) round(rail,3)
+local fill=new("Frame","ProgressFill",{Size=UDim2.fromScale(0,1),BackgroundColor3=P.Accent,BorderSizePixel=0},rail) round(fill,3)
 new("UIGradient","ProgressGradient",{Color=ColorSequence.new(P.Accent,P.Purple)},fill)
-local found=label(content,"TreeSummary","Spooky  0     Neon  0",UDim2.fromOffset(0,82),UDim2.new(1,0,0,20),12)
-local stats=label(content,"SessionStats","",UDim2.fromOffset(0,107),UDim2.new(1,0,0,18),10,P.Muted)
-local scroll=new("ScrollingFrame","ActivityViewport",{Position=UDim2.fromOffset(0,134),Size=UDim2.new(1,0,1,-185),
+local function treeCard(name,text,position,color)
+    local card=new("Frame",name.."Card",{Position=position,Size=UDim2.new(0.5,-5,0,62),
+        BackgroundColor3=P.Panel,BorderSizePixel=0},content) round(card,9)
+    label(card,name.."Title",text,UDim2.fromOffset(12,8),UDim2.new(1,-65,0,16),11,P.Muted)
+    local count=label(card,name.."Count","0",UDim2.new(1,-57,0,10),UDim2.fromOffset(44,35),26,color)
+    count.Font=Enum.Font.GothamMedium count.TextXAlignment=Enum.TextXAlignment.Right
+    local volume=label(card,name.."Volume","0 studs3",UDim2.fromOffset(12,32),UDim2.new(1,-70,0,17),10,P.Muted)
+    return count,volume
+end
+local spooky,spookyVolume=treeCard("Spooky","Spooky",UDim2.fromOffset(0,81),P.Accent)
+local neon,neonVolume=treeCard("Neon","SpookyNeon",UDim2.new(0.5,5,0,81),P.Purple)
+local stats=label(content,"SessionStats","",UDim2.fromOffset(0,150),UDim2.new(1,0,0,18),10,P.Muted)
+local startButton=button(content,"StartHunt","Start hunt",UDim2.new(0,0,1,-36),UDim2.new(0.68,-5,0,36),function() H:Start() end,true)
+button(content,"StopHunt","Stop",UDim2.new(0.68,5,1,-36),UDim2.new(0.32,-5,0,36),function() H:Stop() end)
+local activityPage=new("Frame","ActivityPage",{Position=content.Position,Size=content.Size,Visible=false,BackgroundTransparency=1},shell)
+label(activityPage,"ActivityTitle","Activity",UDim2.fromOffset(0,0),UDim2.new(1,-90,0,25),16).Font=Enum.Font.GothamBold
+local scroll=new("ScrollingFrame","ActivityViewport",{Position=UDim2.fromOffset(0,38),Size=UDim2.new(1,0,1,-38),
     BackgroundColor3=P.Panel,BorderSizePixel=0,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,
-    ScrollBarThickness=2,ScrollBarImageColor3=Color3.fromRGB(112,117,128),ScrollBarImageTransparency=0.45},content) round(scroll,7)
-local activity=label(scroll,"ActivityLog","",UDim2.fromOffset(9,5),UDim2.new(1,-22,0,0),10,P.Muted)
+    ScrollBarThickness=2,ScrollBarImageColor3=Color3.fromRGB(112,117,128),ScrollBarImageTransparency=0.45},activityPage) round(scroll,8)
+local activity=label(scroll,"ActivityLog","",UDim2.fromOffset(11,9),UDim2.new(1,-26,0,0),11,P.Muted)
 activity.Font=Enum.Font.Code activity.AutomaticSize=Enum.AutomaticSize.Y activity.TextWrapped=true activity.TextTruncate=Enum.TextTruncate.None
 activity.TextYAlignment=Enum.TextYAlignment.Top
-local startButton=button(content,"StartHunt","Start",UDim2.new(0,0,1,-35),UDim2.new(0.42,-6,0,35),function() H:Start() end,true)
-button(content,"StopHunt","Stop",UDim2.new(0.42,0,1,-35),UDim2.new(0.28,-6,0,35),function() H:Stop() end)
-button(content,"CopyActivity","Copy log",UDim2.new(0.7,0,1,-35),UDim2.new(0.3,0,0,35),function()
-    local text="Spooky Hunter 1.0.0\n"..table.concat(H.Logs,"\n")
+button(activityPage,"CopyActivity","Copy",UDim2.new(1,-64,0,0),UDim2.fromOffset(64,27),function()
+    local text="Spooky Hunter 1.1.1\n"..table.concat(H.Logs,"\n")
     local copy=cap("setclipboard",setclipboard) or cap("toclipboard",toclipboard)
     if copy and pcall(copy,text) then H:Log("Activity copied") else
-        local output=new("TextBox","ManualLogCopy",{Position=UDim2.fromOffset(0,134),Size=scroll.Size,Text=text,
-            BackgroundColor3=P.Panel,TextColor3=P.Text,TextSize=10,Font=Enum.Font.Code,TextWrapped=true,
+        local previous=activityPage:FindFirstChild("ManualLogCopy") if previous then previous:Destroy() end
+        local output=new("TextBox","ManualLogCopy",{Position=scroll.Position,Size=scroll.Size,Text=text,
+            BackgroundColor3=P.Panel,TextColor3=P.Text,TextSize=11,Font=Enum.Font.Code,TextWrapped=true,
             ClearTextOnFocus=false,TextEditable=false,MultiLine=true,TextXAlignment=Enum.TextXAlignment.Left,
-            TextYAlignment=Enum.TextYAlignment.Top},content)
+            TextYAlignment=Enum.TextYAlignment.Top},activityPage) round(output,8)
         output:CaptureFocus() output.SelectionStart=1 output.CursorPosition=#text+1
-        local connection
-        connection=output.FocusLost:Connect(function() connection:Disconnect() output:Destroy() end)
+        H:Connect(output.FocusLost,function() output:Destroy() end)
     end
 end)
-H.UI={Stage=stage,Detail=detail,Fill=fill,Found=found,Activity=activity,Start=startButton}
-local settings=new("ScrollingFrame","SettingsPage",{Position=UDim2.fromOffset(16,60),Size=UDim2.new(1,-32,1,-74),Visible=false,
+H.UI={Stage=stage,Detail=detail,Fill=fill,Spooky=spooky,Neon=neon,SpookyVolume=spookyVolume,
+    NeonVolume=neonVolume,Activity=activity,Start=startButton}
+local settings=new("ScrollingFrame","SettingsPage",{Position=content.Position,Size=content.Size,Visible=false,
     BackgroundTransparency=1,BorderSizePixel=0,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,
     ScrollBarThickness=2,ScrollBarImageColor3=Color3.fromRGB(112,117,128)},shell)
-new("UIListLayout","SettingsLayout",{Padding=UDim.new(0,9),SortOrder=Enum.SortOrder.LayoutOrder},settings)
-local function settingsRow(name,height)
-    local row=new("Frame",name,{Size=UDim2.new(1,-5,0,height or 62),BackgroundColor3=P.Panel,BorderSizePixel=0},settings) round(row,8) return row
-end
+new("UIListLayout","SettingsLayout",{Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder},settings)
 local order=0
-local function field(titleText,key,numeric,secret)
-    local row=settingsRow(key.."Row") order=order+1 row.LayoutOrder=order
+local advancedRows={}
+local function settingsRow(name,height,advanced)
+    order=order+1
+    local row=new("Frame",name,{Size=UDim2.new(1,-5,0,height or 62),LayoutOrder=order,
+        Visible=not advanced,BackgroundColor3=P.Panel,BorderSizePixel=0},settings) round(row,8)
+    if advanced then table.insert(advancedRows,row) end
+    return row
+end
+local function field(titleText,key,numeric,secret,advanced)
+    local row=settingsRow(key.."Row",62,advanced)
     label(row,key.."Label",titleText,UDim2.fromOffset(10,4),UDim2.new(1,-20,0,17),10,P.Muted)
     local function display() return secret and H.Config[key]~="" and "Configured - click to edit" or tostring(H.Config[key]) end
     local box=new("TextBox",key.."Input",{Position=UDim2.fromOffset(10,24),Size=UDim2.new(1,-20,0,29),BackgroundColor3=P.Raised,
         TextColor3=P.Text,Text=display(),PlaceholderText=key=="ScriptURL" and "https://raw.githubusercontent.com/.../SpookyHunter.client.lua" or "",
         PlaceholderColor3=P.Muted,TextSize=11,Font=Enum.Font.Gotham,ClearTextOnFocus=false,TextTruncate=Enum.TextTruncate.AtEnd,
         TextXAlignment=Enum.TextXAlignment.Left,BorderSizePixel=0},row) round(box,5)
+    new("UIPadding","InputPadding",{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8)},box)
     H:Connect(box.Focused,function() if secret then box.Text=H.Config[key] end end)
     H:Connect(box.FocusLost,function()
         if H.Busy then box.Text=display() H:Log("Stop the hunt before editing settings","WARNING") return end
@@ -850,31 +1048,44 @@ local function field(titleText,key,numeric,secret)
     end)
 end
 field("Save slot (1-6)","Slot",true)
-field("Discord webhook (optional)","Webhook",false,true)
-field("Script URL - needed when not using the loader","ScriptURL")
-local mode=settingsRow("ProcessingMode",46) order=order+1 mode.LayoutOrder=order
+field("Discord webhook","Webhook",false,true)
+local mode=settingsRow("ProcessingMode",46)
 local modeButton
-modeButton=button(mode,"ModeToggle",H.Config.FullCycle and "Full cycle - experimental Modwood" or "Search only - stop when found",
+modeButton=button(mode,"ModeToggle",H.Config.FullCycle and "Full cycle - experimental Modwood" or "Search only",
     UDim2.fromOffset(8,7),UDim2.new(1,-16,0,32),function()
         if H.Busy then return end
         H.Config.FullCycle=not H.Config.FullCycle
-        modeButton.Text=H.Config.FullCycle and "Full cycle - experimental Modwood" or "Search only - stop when found"
+        modeButton.Text=H.Config.FullCycle and "Full cycle - experimental Modwood" or "Search only"
         H:Persist(false)
     end)
-field("Delay between servers (seconds)","HopDelay",true)
-field("Initial world loading wait (seconds)","ScanWait",true)
-field("Chop timeout (seconds)","ChopTimeout",true)
-field("Modwood burn timeout (seconds)","BurnTimeout",true)
-field("Sawmill output timeout (seconds)","MillTimeout",true)
-local info=settingsRow("ModwoodNotice",58) order=order+1 info.LayoutOrder=order
-local note=label(info,"ModwoodNoticeText","Modwood is reconstructed. If burn, plank output or saving is not confirmed, the hunt stays in this server.",
-    UDim2.fromOffset(10,5),UDim2.new(1,-20,1,-10),10,P.Muted) note.TextWrapped=true note.TextTruncate=Enum.TextTruncate.None
-button(header,"SettingsGear","⚙",UDim2.fromOffset(12,10),UDim2.fromOffset(30,29),function()
-    settings.Visible=not settings.Visible content.Visible=not settings.Visible
-    root.Size=UDim2.fromOffset(520,settings.Visible and 470 or 330)
+local advanced=settingsRow("AdvancedSettings",36)
+local advancedButton
+local expanded=false
+advancedButton=button(advanced,"ExpandAdvanced","Advanced settings +",UDim2.fromOffset(0,0),UDim2.fromScale(1,1),function()
+    expanded=not expanded
+    advancedButton.Text=expanded and "Advanced settings -" or "Advanced settings +"
+    for _,row in ipairs(advancedRows) do row.Visible=expanded end
 end)
-button(header,"CloseWindow","X",UDim2.new(1,-39,0,10),UDim2.fromOffset(27,29),function() H:Destroy() end)
-local dragZone=new("Frame","TitleDragZone",{Position=UDim2.fromOffset(50,0),Size=UDim2.new(1,-96,0,49),BackgroundTransparency=1,Active=true},header)
+field("Script URL - only without the loader","ScriptURL",false,false,true)
+field("Server hop delay (seconds)","HopDelay",true,false,true)
+field("World scan timeout (seconds)","ScanWait",true,false,true)
+field("Chop timeout (seconds)","ChopTimeout",true,false,true)
+field("Burn timeout (seconds)","BurnTimeout",true,false,true)
+field("Sawmill timeout (seconds)","MillTimeout",true,false,true)
+local function showPage(page)
+    content.Visible=page==content settings.Visible=page==settings activityPage.Visible=page==activityPage
+    tween(root,{Size=UDim2.fromOffset(480,page==content and 314 or 408)},0.3)
+    page.Position=UDim2.fromOffset(20,82)
+    tween(page,{Position=UDim2.fromOffset(20,76)},0.25)
+end
+button(header,"SettingsGear","⚙",UDim2.fromOffset(16,15),UDim2.fromOffset(29,29),function()
+    showPage(settings.Visible and content or settings)
+end)
+button(header,"OpenActivity","Log",UDim2.new(1,-91,0,15),UDim2.fromOffset(42,29),function()
+    showPage(activityPage.Visible and content or activityPage)
+end)
+button(header,"CloseWindow","X",UDim2.new(1,-41,0,15),UDim2.fromOffset(25,29),function() H:Destroy() end)
+local dragZone=new("Frame","TitleDragZone",{Position=UDim2.fromOffset(50,0),Size=UDim2.new(1,-150,0,58),BackgroundTransparency=1,Active=true},header)
 local dragInput,dragStart,dragOrigin
 H:Connect(dragZone.InputBegan,function(input)
     if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
@@ -900,7 +1111,7 @@ local tick=0
 H:Connect(S.RunService.RenderStepped,function(dt)
     tick=tick+dt if tick<0.25 then return end tick=0
     local viewport=gui.AbsoluteSize
-    scale.Scale=math.min(1,math.max(0.35,(viewport.X-24)/520),math.max(0.35,(viewport.Y-24)/root.Size.Y.Offset))
+    scale.Scale=math.min(1,math.max(0.35,(viewport.X-24)/480),math.max(0.35,(viewport.Y-24)/root.Size.Y.Offset))
     stats.Text=string.format("%s  -  %d servers  -  %d trees  -  %d planks",duration(os.time()-H.StartedAt),H.Stats.Servers,H.Stats.Trees,H.Stats.Planks)
 end)
 H:Connect(activity:GetPropertyChangedSignal("AbsoluteSize"),function()
