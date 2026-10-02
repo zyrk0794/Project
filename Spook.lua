@@ -1,8 +1,8 @@
 --[[
-    Midnight Spooky Hunter 1.1.3 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.2.0 - Lumber Tycoon 2
     October 2, 2026. Standalone client script; no UI-library download required.
     Modwood is an experimental reconstruction of the supplied Dark X source.
-    A failed burn, missing plank, or unconfirmed save stops the cycle in place.
+    Unconfirmed wood is preserved; other available trees can still be attempted.
     Use the companion loader or set Script URL for continuation after a hop.
 ]]
 local S = {}
@@ -25,9 +25,10 @@ local Queue = cap("queue_on_teleport", queue_on_teleport) or cap("queueontelepor
 local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local FILE = "MidnightSpookyHunter.json"
 local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 15, ScanWait = 12,
-    ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, FullCycle = true }
+    ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true }
 local H = { Alive = true, Running = false, Busy = false, Connections = {}, Logs = {},
-    Config = table.clone(DEFAULT), Visited = {}, Stats = { Servers = 0, Trees = 0, Planks = 0 },
+    Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
+    Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
 Env.MidnightSpookyHunter = H
 local CANCEL = {}
@@ -61,34 +62,66 @@ local function configFrom(source)
     for key in pairs(result) do if type(source[key]) == type(result[key]) then result[key] = source[key] end end
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
     for key, limits in pairs({HopDelay = {12, 180}, ScanWait = {8, 120}, ChopTimeout = {15, 180},
-        BurnTimeout = {10, 120}, MillTimeout = {15, 180}}) do
+        BurnTimeout = {10, 120}, MillTimeout = {15, 180}, TaskTimeout = {300, 1800}}) do
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
     end
     result.Webhook = cleanURL(result.Webhook):sub(1, 400)
     result.ScriptURL = cleanURL(result.ScriptURL):sub(1, 1000)
     return result
 end
+function H:RememberServer(id)
+    if type(id) ~= "string" or id == "" then return end
+    for i = #self.ServerHistory, 1, -1 do
+        if self.ServerHistory[i] == id then table.remove(self.ServerHistory, i) end
+    end
+    table.insert(self.ServerHistory, id)
+    while #self.ServerHistory > 50 do table.remove(self.ServerHistory, 1) end
+    table.clear(self.Visited)
+    for _, serverId in ipairs(self.ServerHistory) do self.Visited[serverId] = true end
+end
 local restored
 if Read then
-    local ok, text = pcall(Read, FILE)
-    if ok then
-        local decoded, data = pcall(S.HttpService.JSONDecode, S.HttpService, text)
-        if decoded and type(data) == "table" and data.Schema == 1 then
-            H.Config = configFrom(data.Config)
-            restored = data
-            if type(data.Visited) == "table" then
-                for id, stamp in pairs(data.Visited) do
-                    if type(id) == "string" and finite(stamp) and os.time() - stamp < 14400 then H.Visited[id] = stamp end
-                end
-            end
-            if type(data.Stats) == "table" then
-                for key in pairs(H.Stats) do
-                    if finite(data.Stats[key]) then H.Stats[key] = math.max(0, math.floor(data.Stats[key])) end
-                end
-            end
-            if finite(data.StartedAt) then H.StartedAt = math.min(os.time(), data.StartedAt) end
-        elseif ok then H.ConfigWarning = "Settings file unreadable - defaults loaded" end
+    for _, path in ipairs({FILE, FILE .. ".bak"}) do
+        local ok, encoded = pcall(Read, path)
+        if ok then
+            local decoded, data = pcall(S.HttpService.JSONDecode, S.HttpService, encoded)
+            if decoded and type(data) == "table" and (data.Schema == 1 or data.Schema == 2) then
+                restored = data
+                if path ~= FILE then H.ConfigWarning = "Settings recovered from backup" end
+                break
+            else H.ConfigWarning = "Settings file unreadable - checking backup" end
+        end
     end
+end
+if restored then
+    H.Config = configFrom(restored.Config)
+    if type(restored.ServerHistory) == "table" then
+        for _, id in ipairs(restored.ServerHistory) do H:RememberServer(id) end
+    elseif type(restored.Visited) == "table" then
+        local legacy = {}
+        for id, stamp in pairs(restored.Visited) do
+            if type(id) == "string" and finite(stamp) then table.insert(legacy, {Id=id, Stamp=stamp}) end
+        end
+        table.sort(legacy, function(a,b) if a.Stamp == b.Stamp then return a.Id < b.Id end return a.Stamp < b.Stamp end)
+        for _, entry in ipairs(legacy) do H:RememberServer(entry.Id) end
+    end
+    if type(restored.FailedServers) == "table" then
+        for id, untilTime in pairs(restored.FailedServers) do
+            if type(id)=="string" and finite(untilTime) and untilTime>os.time() then H.FailedServers[id]=untilTime end
+        end
+    end
+    if type(restored.Stats) == "table" then
+        for key in pairs(H.Stats) do
+            if finite(restored.Stats[key]) then H.Stats[key] = math.max(0, math.floor(restored.Stats[key])) end
+        end
+    end
+    if finite(restored.StartedAt) then H.StartedAt = math.min(os.time(), restored.StartedAt) end
+    H.LastCountedServer = restored.LastCountedServer
+end
+local function uiText(text) return tostring(text):gsub("SpookyNeon", "Sinister") end
+local function cleanError(err)
+    local message = tostring(err)
+    return (message:gsub("^.-:%d+: ", "")):sub(1, 350)
 end
 function H:Log(message, level)
     message = tostring(message)
@@ -96,13 +129,14 @@ function H:Log(message, level)
     if self.Config.Webhook ~= "" then message = message:gsub(self.Config.Webhook:gsub("([^%w])", "%%%1"), "[webhook]") end
     table.insert(self.Logs, os.date("!%H:%M:%S") .. "  " .. (level or "INFO") .. "  " .. message)
     while #self.Logs > 70 do table.remove(self.Logs, 1) end
-    if self.UI then self.UI.Activity.Text = table.concat(self.Logs, "\n") end
+    if self.UI then self.UI.Activity.Text = uiText(table.concat(self.Logs, "\n")) end
 end
 function H:SetStage(text, progress, detail)
+    if self.Stage ~= text then self.StageStarted = os.clock() end
     self.Stage = text
     if progress then self.Progress = math.clamp(progress, 0, 1) end
     if self.UI then
-        self.UI.Stage.Text = text self.UI.Detail.Text = detail or ""
+        self.UI.Stage.Text = uiText(text) self.UI.Detail.Text = uiText(detail or "")
         if self.StageTween then self.StageTween:Cancel() end
         self.UI.Stage.TextTransparency = 0.28
         self.StageTween = S.TweenService:Create(self.UI.Stage, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
@@ -126,26 +160,38 @@ function H:Connect(signal, callback)
 end
 function H:Persist(resume, target)
     if not Write or not Read then return false, "readfile/writefile unavailable" end
-    local entries = {}
-    for id, stamp in pairs(self.Visited) do table.insert(entries, {id, stamp}) end
-    table.sort(entries, function(a,b) return a[2] > b[2] end)
-    local visited = {}
-    for index = 1, math.min(#entries, 200) do visited[entries[index][1]] = entries[index][2] end
-    local data = { Schema = 1, Config = self.Config, Visited = visited, Stats = self.Stats,
+    local failed = {}
+    for id, untilTime in pairs(self.FailedServers) do
+        if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
+    end
+    local data = { Schema = 2, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
+        FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
         StartedAt = self.StartedAt, Resume = resume == true, Target = target, TicketTime = os.time() }
     local ok = pcall(function()
         local encoded = S.HttpService:JSONEncode(data)
+        Write(FILE .. ".tmp", encoded)
+        assert(Read(FILE .. ".tmp") == encoded, "Settings staging verification failed")
+        local previousOK, previous = pcall(Read, FILE)
+        if previousOK then
+            local valid, decoded = pcall(S.HttpService.JSONDecode, S.HttpService, previous)
+            if valid and type(decoded)=="table" and (decoded.Schema==1 or decoded.Schema==2) then
+                Write(FILE .. ".bak", previous)
+            end
+        end
         Write(FILE, encoded)
         assert(Read(FILE) == encoded, "Settings write verification failed")
     end)
     if ok then return true end
     return false, "Settings could not be saved"
 end
-function H:Token()
-    self.Generation = self.Generation + 1
-    local token = { Generation = self.Generation, Cleanups = {} }
+function H:Token(parent)
+    if not parent then self.Generation = self.Generation + 1 end
+    local token = { Generation = parent and parent.Generation or self.Generation, Cleanups = {},
+        Character = parent and parent.Character, Deadline = parent and parent.Deadline or os.clock()+self.Config.TaskTimeout }
+
     function token:Check()
         if not H.Alive or not H.Running or H.Generation ~= self.Generation then error(CANCEL, 0) end
+        assert(os.clock() < self.Deadline, "Task time limit reached - the current task was stopped")
         if self.Character and (Player.Character ~= self.Character or not self.Character.Parent
             or not self.Character:FindFirstChildOfClass("Humanoid") or self.Character:FindFirstChildOfClass("Humanoid").Health <= 0) then
             error("Character changed - cycle stopped in this server", 0)
@@ -165,6 +211,7 @@ function H:Token()
         table.clear(self.Cleanups)
     end
     function token:Await(fn, timeout, onWaiting)
+        self:Check()
         local result
         local thread = task.spawn(function() result = table.pack(pcall(fn)) end)
         local deadline = os.clock() + (timeout or 20)
@@ -179,6 +226,7 @@ function H:Token()
         if not result[1] then error(result[2], 0) end
         return table.unpack(result, 2, result.n)
     end
+    if parent then parent:Finally(function() token:Clean() end) end
     return token
 end
 function H:Remote(folder, name, class)
@@ -662,8 +710,23 @@ function H:ModwoodParts(log)
         if a.Direct ~= b.Direct then return a.Direct end
         return a.Width < b.Width
     end)
-    assert(root and candidates[1], "Modwood - no supported leaf/ParentID topology; wood left in this server")
+    if not root or not candidates[1] then
+        return nil, nil, nil, "The felled tree has no supported branch structure for Modwood"
+    end
     return root, candidates[1].Leaf, candidates[1].Parent
+end
+function H:WaitForModwood(log, token)
+    self:SetStage("Checking felled tree", 0.48, "Waiting for branch data")
+    local deadline, reason = os.clock() + 4, nil
+    repeat
+        token:Check()
+        if not log.Parent or not owned(log) then return false, "Felled tree is no longer owned" end
+        local root, _, _, message = self:ModwoodParts(log)
+        if root then return true end
+        reason = message
+        token:Sleep(0.2)
+    until os.clock() >= deadline
+    return false, reason
 end
 function H:FindLava()
     local region = S.Workspace:FindFirstChild("Region_Volcano")
@@ -681,7 +744,8 @@ function H:FindLava()
 end
 function H:Modwood(log, mill, inlet, token)
     assert(owned(log) and owned(mill), "Modwood requires your wood and your sawmill")
-    local _, leaf, parent = self:ModwoodParts(log)
+    local root, leaf, parent, reason = self:ModwoodParts(log)
+    assert(root, reason)
     local originalSections = {}
     for _, section in ipairs(log:GetDescendants()) do
         if section:IsA("BasePart") and section.Name == "WoodSection" then
@@ -774,8 +838,13 @@ function H:Modwood(log, mill, inlet, token)
     until os.clock() >= deadline
     error("Modwood - whole-tree conversion or finished output not confirmed; wood left in this server", 0)
 end
-function H:Deliver(planks, center, token)
+function H:Deliver(planks, center, token, checkpoint)
+    local remaining = {}
+    if checkpoint then checkpoint.Delivered = checkpoint.Delivered or {} end
     for _, plank in ipairs(planks) do
+        if not checkpoint or not checkpoint.Delivered[plank] then table.insert(remaining, plank) end
+    end
+    for _, plank in ipairs(remaining) do
         local bounds, size = plank:GetBoundingBox()
         local relative = plank:GetPivot():ToObjectSpace(bounds)
         -- Upright bounding frame; place directly on the owned land tile and stack without overlap.
@@ -790,6 +859,7 @@ function H:Deliver(planks, center, token)
         self:Move(plank, target, token)
         self.StackHeight = self.StackHeight + size.Y + 0.05
         self.Stats.Planks = self.Stats.Planks + 1
+        if checkpoint then checkpoint.Delivered[plank] = true end
     end
 end
 function H:SaveSlot(token)
@@ -859,33 +929,51 @@ function H:SendWebhook(title, description, token, receipt)
     assert(status and status >= 200 and status < 300, "Webhook failed with HTTP " .. tostring(status))
     self:Log("Webhook delivered")
 end
+function H:TryWebhook(title, description, token, receipt)
+    local ok, err = pcall(self.SendWebhook, self, title, description, token, receipt)
+    if not ok then
+        if err == CANCEL then error(CANCEL, 0) end
+        token:Check()
+        self:Log("Webhook unavailable - " .. cleanError(err), "WARNING")
+    end
+    return ok
+end
 function H:Servers(token)
     assert(type(Request) == "function", "An HTTP request function is required for server search")
-    local cursor, servers = nil, {}
-    for _ = 1, 5 do
+    local cursor, servers, ids, cursors = nil, {}, {}, {}
+    for _ = 1, 10 do
         local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
         if cursor then url = url .. "&cursor=" .. S.HttpService:UrlEncode(cursor) end
-        local response
+        local response, lastError
         for attempt = 1, 3 do
-            response = token:Await(function()
-                local ok, r = pcall(Request,{Url=url,Method="GET"})
-                assert(ok and type(r)=="table","Server-list transport failed") return r
-            end,20)
-            local code = tonumber(response.StatusCode or response.Status)
-            if code == 200 then break end
-            assert((code==429 or (code and code>=500)) and attempt<3,"Server list HTTP "..tostring(code))
-            token:Sleep(attempt*5)
+            local ok, result = pcall(function()
+                return token:Await(function()
+                    local sent, r = pcall(Request,{Url=url,Method="GET"})
+                    assert(sent and type(r)=="table","Server-list transport failed") return r
+                end,15)
+            end)
+            if not ok and result == CANCEL then error(CANCEL, 0) end
+            token:Check()
+            local code = ok and tonumber(result.StatusCode or result.Status)
+            if code == 200 then response = result break end
+            lastError = code and ("Server list HTTP "..code) or "Server-list connection failed"
+            if code and code ~= 429 and code < 500 then error(lastError,0) end
+            if attempt < 3 then token:Sleep(attempt*2) end
         end
+        assert(response, lastError)
         local data = S.HttpService:JSONDecode(response.Body)
         assert(type(data)=="table" and type(data.data)=="table","Unexpected server-list response")
         for _, server in ipairs(data.data) do
-            if type(server.id)=="string" and server.id~=game.JobId and finite(server.playing) and finite(server.maxPlayers)
-                and server.playing<server.maxPlayers and (not self.Visited[server.id] or os.time()-self.Visited[server.id]>14400) then
-                table.insert(servers,server.id)
+            if type(server)=="table" and type(server.id)=="string" and server.id~="" and server.id~=game.JobId
+                and not ids[server.id] and finite(server.playing) and finite(server.maxPlayers)
+                and server.playing>=0 and server.playing<server.maxPlayers and not self.Visited[server.id]
+                and (not self.FailedServers[server.id] or self.FailedServers[server.id]<=os.time()) then
+                ids[server.id]=true table.insert(servers,server.id)
             end
         end
-        if #servers >= 15 or type(data.nextPageCursor)~="string" or data.nextPageCursor=="" then break end
-        cursor=data.nextPageCursor token:Sleep(1)
+        if #servers >= 15 or type(data.nextPageCursor)~="string" or data.nextPageCursor==""
+            or cursors[data.nextPageCursor] then break end
+        cursor=data.nextPageCursor cursors[cursor]=true token:Sleep(0.2)
     end
     for i=#servers,2,-1 do local j=math.random(i) servers[i],servers[j]=servers[j],servers[i] end
     return servers
@@ -909,24 +997,44 @@ function H:Bootstrap()
         .. "env.MidnightSpookyBootServer=game.JobId;env.MidnightSpookyResume=true;" .. loader
 end
 function H:Hop(token)
+    assert(not self.Dirty, "Unfinished wood is still in this server")
     local bootstrap=self:Bootstrap()
-    self:SetStage("Next server",0.98,"Waiting "..self.Config.HopDelay.." seconds") token:Sleep(self.Config.HopDelay)
-    local servers=self:Servers(token) assert(#servers>0,"No unvisited public server found - try again later")
+    self:RememberServer(game.JobId)
+    local stored, storeError = self:Persist(false) assert(stored, storeError)
+    local leaveAt = os.clock() + self.Config.HopDelay
+    self:SetStage("Next server",0.98,"Preparing the next server")
+    repeat
+        if self.UI then self.UI.Detail.Text="Joining in "..math.ceil(math.max(0,leaveAt-os.clock())).."s" end
+        token:Sleep(math.min(1, math.max(0,leaveAt-os.clock())))
+    until os.clock()>=leaveAt
+    local servers
+    for round=1,3 do
+        self:SetStage("Finding another server",0.98,"Recent servers excluded: "..#self.ServerHistory.." / 50")
+        servers=self:Servers(token)
+        if #servers>0 then break end
+        if round<3 then
+            self:SetStage("Waiting for available servers",0.98,"Refreshing in "..(round*10).."s")
+            token:Sleep(round*10)
+        end
+    end
+    assert(#servers>0,"No eligible server available - recent-server history was preserved")
     for i=1,math.min(#servers,8) do
         token:Check()
-        local id=servers[i] self.Visited[id]=os.time()
+        local id=servers[i]
+        self.FailedServers[id]=os.time()+600
         local saved,err=self:Persist(true,id) assert(saved,err)
         -- Executors differ on whether a failed teleport consumes the queue.
         -- Requeue each attempt; the bootstrap permits only one launch per server.
         local queued=pcall(Queue,bootstrap) assert(queued,"Could not queue continuation")
         local attempt={Id=id} self.HopAttempt=attempt
+        self.PendingTeleportTarget=id
         self:SetStage("Joining another server",1,"Attempt "..i)
         local ok=pcall(S.TeleportService.TeleportToPlaceInstance,S.TeleportService,game.PlaceId,id,Player)
         if not ok then attempt.Error="Teleport request rejected" end
         local deadline=os.clock()+35
         while not attempt.Error and os.clock()<deadline do token:Sleep(0.2) end
         self.HopAttempt=nil
-        if not attempt.Error then error("Teleport outcome unknown - no second request sent",0) end
+        if not attempt.Error then self.HopUncertain=true error("Teleport outcome unknown - no second request sent",0) end
         self:Log(attempt.Error,"WARNING") token:Sleep(4)
     end
     error("No server could be joined",0)
@@ -935,60 +1043,145 @@ function H:Run(token)
     assert(game.PlaceId==13822889,"This script targets Lumber Tycoon 2 (13822889)")
     assert(not S.Workspace.StreamingEnabled,"Streaming is enabled - a complete tree scan cannot be confirmed")
     self:Bootstrap()
-    if self.Config.Webhook~="" then assert(webhookURL(self.Config.Webhook),"Invalid Discord webhook URL") end
-    self.Visited[game.JobId]=os.time() self.Stats.Servers=self.Stats.Servers+1
+    local resuming = #self.PendingWood>0
+    if self.Dirty and not resuming then
+        self.NeedsAttention=true
+        return "An interrupted cut needs inspection before another hunt can start"
+    end
+    self:RememberServer(game.JobId)
+    if self.LastCountedServer~=game.JobId then
+        self.Stats.Servers=self.Stats.Servers+1 self.LastCountedServer=game.JobId
+    end
     local saved,saveError=self:Persist(false) assert(saved,saveError)
-    local entries=self:ScanReady(token)
-    if #entries==0 then self:SetStage("No rare tree found",0.1) return self:Hop(token) end
-    self:SetStage("Rare trees found",0.1,tostring(#entries).." trees")
-    self:SendWebhook("Rare trees found",self.Config.FullCycle and "Spooky wood detected." or "Spooky wood detected - search paused.",token)
-    if not self.Config.FullCycle then return "Found - search paused in this server" end
+    self.CanRecover=not resuming
+    local entries, plot = {}, nil
+    if resuming then
+        local receipt=self.LoadReceipt
+        if not receipt or receipt.Slot~=self.Config.Slot or receipt.JobId~=game.JobId or receipt.Plot~=self:Plot() then
+            self.NeedsAttention=true
+            return "The saved task no longer matches the loaded plot"
+        end
+        plot=receipt.Plot
+        token.Character=self:Character()
+        for _,work in ipairs(self.PendingWood) do
+            if not work.Planks and (not work.Log or not work.Log.Parent or not owned(work.Log)) then
+                self.NeedsAttention=true
+                return "An interrupted cut has no confirmed owned log - inspect this server before continuing"
+            end
+            table.insert(entries,{Model=work.Log,Kind=work.Kind,Work=work})
+        end
+        self:SetStage("Resuming unfinished wood",0.42,tostring(#entries).." tasks")
+    else
+        entries=self:ScanReady(token)
+        if #entries==0 then self:SetStage("No rare tree found",0.1) return self:Hop(token) end
+        self:SetStage("Rare trees found",0.1,tostring(#entries).." trees")
+        self:TryWebhook("Rare trees found",self.Config.FullCycle and "Spooky wood detected." or "Search paused in this server.",token)
+        if not self.Config.FullCycle then return "Found - search paused in this server" end
+        self.CanRecover=false
+        plot=self:LoadSlot(token)
+    end
+    self.CanRecover=false
     local batchStarted, initialPlanks = os.clock(), self.Stats.Planks
-    local plot=self:LoadSlot(token)
     local mill,inlet=self:FindMill(token)
-    self:FindLava() -- Fail before chopping if the reconstructed procedure cannot even start.
     local center=self:PlotCenter(plot) self.StackHeight=0
-    local processed=0
+    local processed, skipped = 0, 0
     for index,entry in ipairs(entries) do
         token:Check()
-        if entry.Model.Parent and value(entry.Model,"Owner")==nil and not entry.Model:FindFirstChild("RootCut") then
-            self:ModwoodParts(entry.Model) -- Reject unsupported geometry before cutting the tree.
-            local tool,stats=self:EnsureAxe(entry.Kind,token)
-            self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
-            local log=self:Chop(entry,tool,stats,token)
-            self.Stats.Trees=self.Stats.Trees+1
-            self:BringTreeToBase(log,plot,token)
-            local planks=self:Modwood(log,mill,inlet,token)
-            self:SetStage("Delivering planks",0.86,"Center of your plot")
-            self:Deliver(planks,center,token)
-            self:SaveSlot(token)
-            processed=processed+1
-        else self:Log("Tree no longer available - skipped","WARNING") end
+        if entry.Work or (entry.Model.Parent and value(entry.Model,"Owner")==nil and not entry.Model:FindFirstChild("RootCut")) then
+            local scope=self:Token(token)
+            local work=entry.Work
+            local log=work and work.Log
+            local cutStarted=work~=nil
+            local ok,result=pcall(function()
+                if not work then
+                    local tool,stats=self:EnsureAxe(entry.Kind,scope)
+                    self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
+                    work={Kind=entry.Kind,Reason="Cut started"}
+                    table.insert(self.PendingWood,work)
+                    cutStarted=true self.Dirty=true
+                    log=self:Chop(entry,tool,stats,scope)
+                    work.Log=log self.Stats.Trees=self.Stats.Trees+1
+                end
+                if not work.Planks then
+                    self:BringTreeToBase(log,plot,scope)
+                    -- Inspect only the felled, owned log; replication can finish here.
+                    local supported, reason=self:WaitForModwood(log,scope)
+                    if not supported then return reason end
+                    work.Planks=self:Modwood(log,mill,inlet,scope)
+                end
+                self:SetStage("Delivering planks",0.86,"Center of your plot")
+                self:Deliver(work.Planks,center,scope,work)
+                self:SaveSlot(scope)
+                return true
+            end)
+            scope:Clean()
+            if result==CANCEL then error(CANCEL,0) end
+            token:Check()
+            if ok and result==true then
+                processed=processed+1
+                local workIndex=table.find(self.PendingWood,work)
+                if workIndex then table.remove(self.PendingWood,workIndex) end
+                self.Dirty=#self.PendingWood>0
+            else
+                local reason=cleanError(result or "Tree processing was not confirmed")
+                skipped=skipped+1 self.Stats.Skipped=self.Stats.Skipped+1
+                self:Log("Tree "..index.." skipped - "..reason,"WARNING")
+                if cutStarted then
+                    work.Reason=reason
+                    self.Dirty=true
+                else
+                    self.NeedsAttention=true
+                    self:Log("Inventory or character needs attention before another tree can be cut","WARNING")
+                    break
+                end
+                self:SetStage("Moving to the next tree",self.Progress,"Previous wood remains in this server")
+                scope=nil
+            end
+        else
+            skipped=skipped+1 self.Stats.Skipped=self.Stats.Skipped+1
+            self:Log("Tree no longer available - skipped","WARNING")
+        end
     end
+    if self.Dirty then
+        self.NeedsAttention=true
+        self:TryWebhook("Harvest needs attention","Some wood could not be fully processed. Staying in this server; no completion claimed.",token)
+        return "Wood remains at your base - Retry resumes these tasks without cutting another tree"
+    end
+    if self.NeedsAttention then return "Equip a compatible inventory axe, then retry" end
     if processed>0 then
-        self:SendWebhook(processed == #entries and "Harvest complete" or "Harvest complete - some trees unavailable",
+        self:TryWebhook(processed == #entries and "Harvest complete" or "Harvest complete - some trees unavailable",
             "Wood collected, Modwood completed, planks delivered to your plot and slot save confirmed.",token,
-            {Trees=processed, Planks=self.Stats.Planks-initialPlanks, Seconds=os.clock()-batchStarted, Skipped=#entries-processed})
-    else
-        self:SendWebhook("Trees no longer available","No harvest was performed. Moving to the next server.",token)
-    end
+            {Trees=processed, Planks=self.Stats.Planks-initialPlanks, Seconds=os.clock()-batchStarted, Skipped=skipped})
+    else self:TryWebhook("Trees no longer available","No harvest was performed. Moving to the next server.",token) end
     token:Clean() token.Character=nil
     return self:Hop(token)
 end
 function H:Start()
     if self.Busy or not self.Alive then return end
-    self.Running=true self.Busy=true
+    self.Running=true self.Busy=true self.NeedsAttention=false self.CanRecover=false self.HopUncertain=false
     local token=self:Token() self.ActiveToken=token
     if self.UI then self.UI.Start.Text="Hunting..." end
     self.Worker=task.defer(function()
         local ok,result=pcall(self.Run,self,token)
+        if not ok and result~=CANCEL and self.CanRecover and not self.Dirty and not self.HopUncertain then
+            self:Log("Recovering from a temporary issue - "..cleanError(result),"WARNING")
+            token:Clean() token.Character=nil
+            local recovered, outcome=pcall(function()
+                token:Sleep(3)
+                return self:Hop(token)
+            end)
+            ok,result=recovered,outcome
+        end
         token:Clean()
         self.Running=false self.Busy=false self.ActiveToken=nil
-        self:Persist(false)
+        -- A late successful teleport can still use its queued bootstrap. An
+        -- explicit Stop always clears this ticket through Stop(), below.
+        self:Persist(self.HopUncertain==true, self.HopUncertain and self.PendingTeleportTarget or nil)
         if not self.Alive then return end
-        if self.UI then self.UI.Start.Text="Start hunt" end
-        if result==CANCEL then self:SetStage("Stopped",self.Progress,"No further task will be started")
-        elseif not ok then self:SetStage("Paused - action required",self.Progress,tostring(result)) self:Log(tostring(result),"ERROR")
+        if self.UI then self.UI.Start.Text=(not ok or self.NeedsAttention) and "Review / retry" or "Start hunt" end
+        if result==CANCEL then self:SetStage("Stopped",self.Progress,"Current task cleaned up")
+        elseif not ok then self:SetStage("Task stopped",self.Progress,cleanError(result)) self:Log(cleanError(result),"WARNING")
+        elseif self.NeedsAttention then self:SetStage("Needs attention",self.Progress,tostring(result))
         else self:SetStage(tostring(result or "Done"),1) end
     end)
 end
@@ -1011,7 +1204,7 @@ function H:Destroy()
 end
 
 -- Midnight UI: one quiet dashboard, with separate activity and settings pages.
-local P = {Background=Color3.fromRGB(10,14,26),Panel=Color3.fromRGB(16,22,37),Raised=Color3.fromRGB(23,31,49),
+local P = {Background=Color3.fromRGB(10,14,26),Panel=Color3.fromRGB(17,24,39),Raised=Color3.fromRGB(23,31,49),
     Accent=Color3.fromRGB(74,124,255),Purple=Color3.fromRGB(139,92,246),Text=Color3.fromRGB(235,239,247),Muted=Color3.fromRGB(137,148,171)}
 local function new(class,name,props,parent)
     local o=Instance.new(class) o.Name=name
@@ -1067,53 +1260,66 @@ if playerGui then table.insert(parents,playerGui) end
 for _,parent in ipairs(parents) do local ok=pcall(function() gui.Parent=parent end) if ok and gui.Parent then break end end
 assert(gui.Parent,"No available UI container")
 local root=new("Frame","HunterWindow",{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),
-    Size=UDim2.fromOffset(480,314),BackgroundTransparency=1,BorderSizePixel=0},gui)
+    Size=UDim2.fromOffset(500,380),BackgroundTransparency=1,BorderSizePixel=0},gui)
 local scale=new("UIScale","ViewportScale",{Scale=1},root)
 for i=3,1,-1 do
     local halo=new("Frame","WindowHalo"..i,{Position=UDim2.fromOffset(-i*3,-i*3),Size=UDim2.new(1,i*6,1,i*6),
         BorderSizePixel=0,BackgroundTransparency=1},root) round(halo,12+i*3)
-    new("UIStroke","HaloStroke",{Color=P.Accent,Thickness=3,Transparency=0.9+i*0.025},halo)
+    new("UIStroke","HaloStroke",{Color=P.Accent,Thickness=3,Transparency=0.91+i*0.02},halo)
 end
 local shell=new("Frame","WindowSurface",{Size=UDim2.fromScale(1,1),BackgroundColor3=P.Background,BorderSizePixel=0},root) round(shell,12)
 new("UIStroke","WindowBorder",{Color=Color3.fromRGB(45,58,86),Transparency=0.48,Thickness=1},shell)
-local header=new("Frame","TitleBar",{Size=UDim2.new(1,0,0,58),BackgroundTransparency=1,BorderSizePixel=0},shell)
-local title=label(header,"WindowTitle","Spooky Hunter",UDim2.fromOffset(56,11),UDim2.new(1,-158,0,21),15)
+local header=new("Frame","TitleBar",{Size=UDim2.new(1,0,0,58),BackgroundColor3=P.Panel,BorderSizePixel=0},shell)
+round(header,12)
+new("UIGradient","TitleWash",{Color=ColorSequence.new(P.Accent:Lerp(P.Background,0.91),P.Purple:Lerp(P.Background,0.95))},header)
+local title=label(header,"WindowTitle","Spooky Hunter",UDim2.fromOffset(56,11),UDim2.new(1,-195,0,21),15)
 title.Font=Enum.Font.GothamBold
-label(header,"WindowSubtitle","MIDNIGHT 1.1.3",UDim2.fromOffset(56,34),UDim2.new(1,-158,0,12),9,P.Muted)
+label(header,"WindowSubtitle","MIDNIGHT 1.2.0",UDim2.fromOffset(56,34),UDim2.new(1,-195,0,12),9,P.Muted)
 local divider=new("Frame","HeaderDivider",{Position=UDim2.fromOffset(20,58),Size=UDim2.new(1,-40,0,1),
     BorderSizePixel=0,BackgroundColor3=P.Accent,BackgroundTransparency=0.72},shell)
 new("UIGradient","DividerTint",{Color=ColorSequence.new(P.Accent,P.Purple)},divider)
-local content=new("Frame","HuntPage",{Position=UDim2.fromOffset(20,76),Size=UDim2.new(1,-40,1,-94),BackgroundTransparency=1},shell)
-local stage=label(content,"Stage","Ready to hunt",UDim2.fromOffset(0,0),UDim2.new(1,0,0,24),19) stage.Font=Enum.Font.GothamBold
-local detail=label(content,"StageDetail","Spooky and SpookyNeon",UDim2.fromOffset(0,28),UDim2.new(1,0,0,29),11,P.Muted)
-detail.TextWrapped=true detail.TextTruncate=Enum.TextTruncate.None detail.TextYAlignment=Enum.TextYAlignment.Top
+local content=new("Frame","HuntPage",{Position=UDim2.fromOffset(20,116),Size=UDim2.new(1,-40,1,-134),BackgroundTransparency=1},shell)
+local stage=label(content,"Stage","Ready to hunt",UDim2.fromOffset(0,0),UDim2.new(1,-76,0,24),18) stage.Font=Enum.Font.GothamBold
+local detail=label(content,"StageDetail","Spooky and Sinister",UDim2.fromOffset(0,28),UDim2.new(1,0,0,29),11,P.Muted)
+detail.TextWrapped=true detail.TextTruncate=Enum.TextTruncate.AtEnd detail.TextYAlignment=Enum.TextYAlignment.Top
 local rail=new("Frame","ProgressRail",{Position=UDim2.fromOffset(0,65),Size=UDim2.new(1,0,0,3),BackgroundColor3=P.Raised,BorderSizePixel=0},content) round(rail,3)
 local fill=new("Frame","ProgressFill",{Size=UDim2.fromScale(0,1),BackgroundColor3=P.Accent,BorderSizePixel=0},rail) round(fill,3)
 new("UIGradient","ProgressGradient",{Color=ColorSequence.new(P.Accent,P.Purple)},fill)
 local function treeCard(name,text,position,color)
-    local card=new("Frame",name.."Card",{Position=position,Size=UDim2.new(0.5,-5,0,62),
+    local card=new("Frame",name.."Card",{Position=position,Size=UDim2.new(0.5,-5,0,72),
         BackgroundColor3=P.Panel,BorderSizePixel=0},content) round(card,9)
-    label(card,name.."Title",text,UDim2.fromOffset(12,8),UDim2.new(1,-65,0,16),11,P.Muted)
-    local count=label(card,name.."Count","0",UDim2.new(1,-57,0,10),UDim2.fromOffset(44,35),26,color)
+    new("UIStroke",name.."Border",{Color=color,Transparency=0.88,Thickness=1},card)
+    label(card,name.."Title",text,UDim2.fromOffset(12,8),UDim2.new(1,-65,0,20),12,P.Text)
+    local count=label(card,name.."Count","0",UDim2.new(1,-57,0,17),UDim2.fromOffset(44,35),26,color)
     count.Font=Enum.Font.GothamMedium count.TextXAlignment=Enum.TextXAlignment.Right
-    local volume=label(card,name.."Volume","0 studs3",UDim2.fromOffset(12,32),UDim2.new(1,-70,0,17),10,P.Muted)
+    local volume=label(card,name.."Volume","0 studs3",UDim2.fromOffset(12,39),UDim2.new(1,-70,0,17),10,P.Muted)
     return count,volume
 end
-local spooky,spookyVolume=treeCard("Spooky","Spooky",UDim2.fromOffset(0,81),P.Accent)
-local neon,neonVolume=treeCard("Neon","SpookyNeon",UDim2.new(0.5,5,0,81),P.Purple)
-local stats=label(content,"SessionStats","",UDim2.fromOffset(0,150),UDim2.new(1,0,0,18),10,P.Muted)
+local spooky,spookyVolume=treeCard("Spooky","Spooky",UDim2.fromOffset(0,86),P.Accent)
+local neon,neonVolume=treeCard("Neon","Sinister",UDim2.new(0.5,5,0,86),P.Purple)
+local stageTimer=label(content,"StageTimer","00:00",UDim2.new(1,-72,0,3),UDim2.fromOffset(72,18),10,P.Muted)
+stageTimer.TextXAlignment=Enum.TextXAlignment.Right
+local statusChip=label(header,"StatusChip","READY",UDim2.new(1,-146,0,20),UDim2.fromOffset(92,20),10,P.Accent)
+statusChip.TextXAlignment=Enum.TextXAlignment.Right
+local stats=label(content,"SessionStats","",UDim2.fromOffset(0,168),UDim2.new(1,0,0,18),10,P.Muted)
 local startButton=button(content,"StartHunt","Start hunt",UDim2.new(0,0,1,-36),UDim2.new(0.68,-5,0,36),function() H:Start() end,true)
 button(content,"StopHunt","Stop",UDim2.new(0.68,5,1,-36),UDim2.new(0.32,-5,0,36),function() H:Stop() end)
 local activityPage=new("Frame","ActivityPage",{Position=content.Position,Size=content.Size,Visible=false,BackgroundTransparency=1},shell)
-label(activityPage,"ActivityTitle","Activity",UDim2.fromOffset(0,0),UDim2.new(1,-90,0,25),16).Font=Enum.Font.GothamBold
+label(activityPage,"ActivityTitle","Activity",UDim2.fromOffset(0,0),UDim2.new(1,-150,0,25),16).Font=Enum.Font.GothamBold
 local scroll=new("ScrollingFrame","ActivityViewport",{Position=UDim2.fromOffset(0,38),Size=UDim2.new(1,0,1,-38),
     BackgroundColor3=P.Panel,BorderSizePixel=0,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,
     ScrollBarThickness=2,ScrollBarImageColor3=Color3.fromRGB(112,117,128),ScrollBarImageTransparency=0.45},activityPage) round(scroll,8)
+local followLog=true
 local activity=label(scroll,"ActivityLog","",UDim2.fromOffset(11,9),UDim2.new(1,-26,0,0),11,P.Muted)
 activity.Font=Enum.Font.Code activity.AutomaticSize=Enum.AutomaticSize.Y activity.TextWrapped=true activity.TextTruncate=Enum.TextTruncate.None
 activity.TextYAlignment=Enum.TextYAlignment.Top
+local followButton
+followButton=button(activityPage,"FollowActivity","Follow",UDim2.new(1,-137,0,0),UDim2.fromOffset(65,27),function()
+    followLog=not followLog followButton.Text=followLog and "Follow" or "Paused"
+end)
 button(activityPage,"CopyActivity","Copy",UDim2.new(1,-64,0,0),UDim2.fromOffset(64,27),function()
-    local text="Spooky Hunter 1.1.3\n"..table.concat(H.Logs,"\n")
+    local text=string.format("Spooky Hunter 1.2.0\nServer: %s\nSlot: %d\nRecent servers: %d/50\nPending wood: %d\n\n",
+        game.JobId,H.Config.Slot,#H.ServerHistory,#H.PendingWood)..table.concat(H.Logs,"\n")
     local copy=cap("setclipboard",setclipboard) or cap("toclipboard",toclipboard)
     if copy and pcall(copy,text) then H:Log("Activity copied") else
         local previous=activityPage:FindFirstChild("ManualLogCopy") if previous then previous:Destroy() end
@@ -1173,6 +1379,13 @@ modeButton=button(mode,"ModeToggle",H.Config.FullCycle and "Full cycle - experim
         modeButton.Text=H.Config.FullCycle and "Full cycle - experimental Modwood" or "Search only"
         H:Persist(false)
     end)
+local historyRow=settingsRow("RecentServers",44)
+local historyLabel=label(historyRow,"HistoryCount","Recent servers - 0 / 50",UDim2.fromOffset(10,10),UDim2.new(1,-88,0,22),11,P.Muted)
+button(historyRow,"CopyServerHistory","Copy",UDim2.new(1,-72,0,8),UDim2.fromOffset(62,28),function()
+    local copy=cap("setclipboard",setclipboard) or cap("toclipboard",toclipboard)
+    if copy and pcall(copy,table.concat(H.ServerHistory,"\n")) then H:Log("Recent server history copied")
+    else H:Log("Clipboard is unavailable in this executor","WARNING") end
+end)
 local advanced=settingsRow("AdvancedSettings",36)
 local advancedButton
 local expanded=false
@@ -1187,17 +1400,31 @@ field("World scan timeout (seconds)","ScanWait",true,false,true)
 field("Chop timeout (seconds)","ChopTimeout",true,false,true)
 field("Burn timeout (seconds)","BurnTimeout",true,false,true)
 field("Sawmill timeout (seconds)","MillTimeout",true,false,true)
+field("Task time limit (seconds)","TaskTimeout",true,false,true)
+local navigation=new("Frame","PageNavigation",{Position=UDim2.fromOffset(20,70),Size=UDim2.new(1,-40,0,32),
+    BackgroundColor3=P.Panel,BorderSizePixel=0},shell) round(navigation,9)
+local navButtons,navGlows={},{}
 local function showPage(page)
     content.Visible=page==content settings.Visible=page==settings activityPage.Visible=page==activityPage
-    tween(root,{Size=UDim2.fromOffset(480,page==content and 314 or 408)},0.3)
-    page.Position=UDim2.fromOffset(20,82)
-    tween(page,{Position=UDim2.fromOffset(20,76)},0.25)
+    -- The window size is fixed; each page scrolls within the same viewport.
+    page.Position=UDim2.fromOffset(20,120)
+    tween(page,{Position=UDim2.fromOffset(20,116)},0.22)
+    for target,nav in pairs(navButtons) do
+        local selected=target==page
+        tween(nav,{TextColor3=selected and P.Text or P.Muted})
+        tween(navGlows[target],{Transparency=selected and 0.56 or 1})
+    end
+end
+for index,entry in ipairs({{content,"Hunt"},{activityPage,"Activity"},{settings,"Settings"}}) do
+    local page,text=entry[1],entry[2]
+    local nav=button(navigation,text.."Tab",text,UDim2.new((index-1)/3,3,0,3),UDim2.new(1/3,-6,1,-6),function() showPage(page) end)
+    nav.BackgroundColor3=P.Panel
+    local glow=new("UIStroke",text.."ActiveGlow",{Color=P.Accent,Thickness=1.5,Transparency=index==1 and 0.56 or 1},nav)
+    new("UIGradient",text.."GlowTint",{Color=ColorSequence.new(P.Accent,P.Purple)},glow)
+    navButtons[page]=nav navGlows[page]=glow
 end
 button(header,"SettingsGear","⚙",UDim2.fromOffset(16,15),UDim2.fromOffset(29,29),function()
     showPage(settings.Visible and content or settings)
-end)
-button(header,"OpenActivity","Log",UDim2.new(1,-91,0,15),UDim2.fromOffset(42,29),function()
-    showPage(activityPage.Visible and content or activityPage)
 end)
 button(header,"CloseWindow","X",UDim2.new(1,-41,0,15),UDim2.fromOffset(25,29),function() H:Destroy() end)
 local dragZone=new("Frame","TitleDragZone",{Position=UDim2.fromOffset(50,0),Size=UDim2.new(1,-150,0,58),BackgroundTransparency=1,Active=true},header)
@@ -1226,11 +1453,14 @@ local tick=0
 H:Connect(S.RunService.RenderStepped,function(dt)
     tick=tick+dt if tick<0.25 then return end tick=0
     local viewport=gui.AbsoluteSize
-    scale.Scale=math.min(1,math.max(0.35,(viewport.X-24)/480),math.max(0.35,(viewport.Y-24)/root.Size.Y.Offset))
-    stats.Text=string.format("%s  -  %d servers  -  %d trees  -  %d planks",duration(os.time()-H.StartedAt),H.Stats.Servers,H.Stats.Trees,H.Stats.Planks)
+    scale.Scale=math.min(1,math.max(0.35,(viewport.X-24)/500),math.max(0.35,(viewport.Y-24)/root.Size.Y.Offset))
+    stats.Text=string.format("%s  -  %d servers  -  %d planks  -  %d skipped",duration(os.time()-H.StartedAt),H.Stats.Servers,H.Stats.Planks,H.Stats.Skipped)
+    stageTimer.Text=H.Running and duration(os.clock()-(H.StageStarted or os.clock())):sub(4) or ""
+    statusChip.Text=H.Running and "RUNNING" or (H.NeedsAttention and "ATTENTION" or "READY")
+    historyLabel.Text="Recent servers - "..#H.ServerHistory.." / 50"
 end)
 H:Connect(activity:GetPropertyChangedSignal("AbsoluteSize"),function()
-    scroll.CanvasPosition=Vector2.new(0,math.max(0,(activity.AbsoluteSize.Y-scroll.AbsoluteSize.Y+10)/math.max(scale.Scale,0.01)))
+    if followLog then scroll.CanvasPosition=Vector2.new(0,math.max(0,(activity.AbsoluteSize.Y-scroll.AbsoluteSize.Y+18)/math.max(scale.Scale,0.01))) end
 end)
 if H.ConfigWarning then H:Log(H.ConfigWarning,"WARNING") end
 H:Log("Ready - settings are saved locally. Right Shift toggles the interface.")
