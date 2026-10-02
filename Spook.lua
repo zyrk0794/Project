@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.1.1 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.1.2 - Lumber Tycoon 2
     October 2, 2026. Standalone client script; no UI-library download required.
     Modwood is an experimental reconstruction of the supplied Dark X source.
     A failed burn, missing plank, or unconfirmed save stops the cycle in place.
@@ -199,19 +199,47 @@ function H:Teleport(cf)
     humanoid.Sit = false character:PivotTo(cf)
     root.AssemblyLinearVelocity = Vector3.zero root.AssemblyAngularVelocity = Vector3.zero
 end
-function H:Plot()
-    -- Both spellings have been reported. Ownership is an ObjectValue, never a name.
-    for _, folderName in ipairs({"Propertie", "Properties"}) do
-        local properties = S.Workspace:FindFirstChild(folderName)
-        for _, plot in ipairs(properties and properties:GetChildren() or {}) do
-            local owner = plot:FindFirstChild("Owner")
-            if owner and owner:IsA("ObjectValue") and owner.Value == Player then return plot end
+function H:PlotTiles(plot)
+    local tiles = {}
+    for _, part in ipairs(plot and plot:GetDescendants() or {}) do
+        if part:IsA("BasePart") and (part.Name == "OriginSquare" or part.Name == "Square") then
+            table.insert(tiles, part)
         end
     end
+    return tiles
+end
+function H:Plot()
+    local candidates, seen = {}, {}
+    local function visit(node)
+        if seen[node] then return end
+        seen[node] = true
+        local owner = node:FindFirstChild("Owner")
+        if owner then
+            if owner:IsA("ObjectValue") and owner.Value == Player then table.insert(candidates, node) end
+            return
+        end
+        for _, child in ipairs(node:GetChildren()) do
+            if child:IsA("Model") or child:IsA("Folder") then visit(child) end
+        end
+    end
+    -- GetChildren is intentional: several sibling instances may share a name.
+    for _, container in ipairs(S.Workspace:GetChildren()) do
+        if container.Name == "Properties" or container.Name == "Propertie" or container.Name == "Property" then
+            visit(container)
+        end
+    end
+    local best, bestScore
+    for _, plot in ipairs(candidates) do
+        local count = #self:PlotTiles(plot)
+        local score = (count > 0 and 100000 or 0) + (plot == self.LoadedPlot and 1 or 0)
+        if not best or score > bestScore then best, bestScore = plot, score end
+    end
+    self.LoadedPlot = best
+    return best
 end
 function H:PlotCenter(plot)
     local minX, maxX, minZ, maxZ, y = math.huge, -math.huge, math.huge, -math.huge, -math.huge
-    for _, tile in ipairs(plot:GetChildren()) do
+    for _, tile in ipairs(self:PlotTiles(plot)) do
         if tile:IsA("BasePart") and (tile.Name == "Square" or tile.Name == "OriginSquare") then
             minX, maxX = math.min(minX, tile.Position.X - tile.Size.X / 2), math.max(maxX, tile.Position.X + tile.Size.X / 2)
             minZ, maxZ = math.min(minZ, tile.Position.Z - tile.Size.Z / 2), math.max(maxZ, tile.Position.Z + tile.Size.Z / 2)
@@ -222,7 +250,7 @@ function H:PlotCenter(plot)
     local desired = Vector3.new((minX + maxX) / 2, y, (minZ + maxZ) / 2)
     -- For an L-shaped plot, use the nearest owned tile to the geometric center.
     local nearest, distance
-    for _, tile in ipairs(plot:GetChildren()) do
+    for _, tile in ipairs(self:PlotTiles(plot)) do
         if tile:IsA("BasePart") and (tile.Name == "Square" or tile.Name == "OriginSquare") then
             local point = Vector3.new(math.clamp(desired.X, tile.Position.X - tile.Size.X/2 + 2, tile.Position.X + tile.Size.X/2 - 2),
                 tile.Position.Y + tile.Size.Y/2, math.clamp(desired.Z, tile.Position.Z - tile.Size.Z/2 + 2, tile.Position.Z + tile.Size.Z/2 - 2))
@@ -232,11 +260,13 @@ function H:PlotCenter(plot)
     end
     return CFrame.new(nearest)
 end
--- Exact game buttons supplied by the user. Each step fires once and waits for
--- the next dialog; captions and unrelated purchase buttons are never searched.
+-- A successful firesignal call is only an attempt, not proof that the game
+-- accepted the click. Wait for the next panel before advancing to step two.
 function H:LoadConfirmation(token)
-    local state = {Step = 1, Seen = false, LastCheck = -math.huge}
+    local state = {Step=1, Seen=false, SeenFirst=false, FirstSent=false, SecondSent=false,
+        LastCheck=-math.huge, Attempts={0,0}, LastAttempt={-math.huge,-math.huge}, HavePlot=false}
     local fire = cap("firesignal", firesignal)
+    local getConnections = cap("getconnections", getconnections)
     local function visible(button, gui)
         if not button or not button:IsA("GuiButton") or not gui.Enabled then return false end
         local node = button
@@ -259,25 +289,69 @@ function H:LoadConfirmation(token)
         local gui, first, second = buttons()
         return gui and (visible(first, gui) or visible(second, gui)) or false
     end
+    local function signalFor(button, attempt)
+        local names = {"MouseButton1Click", "MouseButton1Down", "Activated"}
+        if getConnections then
+            local connected = {}
+            for _, name in ipairs(names) do
+                local ok, listeners = pcall(getConnections, button[name])
+                if ok and type(listeners) == "table" then
+                    for _, listener in ipairs(listeners) do
+                        if listener.Enabled ~= false and listener.Connected ~= false then
+                            table.insert(connected, name)
+                            break
+                        end
+                    end
+                end
+            end
+            if #connected > 0 then return connected[attempt % #connected + 1] end
+        end
+        return names[attempt % #names + 1]
+    end
     local function service()
         token:Check()
         if os.clock() - state.LastCheck < 0.1 then return end
         state.LastCheck = os.clock()
         local gui, first, second = buttons()
         if not gui then return end
-        if visible(first, gui) or visible(second, gui) then state.Seen = true end
-        if state.Step > 2 then return end
-        local button = state.Step == 1 and first or second
-        if not visible(button, gui) then return end
-        assert(fire, "Slot confirmation requires firesignal in this executor")
+        local firstVisible, secondVisible = visible(first, gui), visible(second, gui)
+        if firstVisible or secondVisible then state.Seen = true end
+        if firstVisible then state.SeenFirst = true end
+        if state.Step == 1 and secondVisible and
+            ((state.FirstSent and (not state.SecondVisibleBeforeClick or not firstVisible))
+                or (state.SeenFirst and not firstVisible)) then
+            state.Step = 2
+            H:SetStage("Confirming property", 0.14, "Selection accepted by the game")
+        end
+        if state.SecondSent and (state.HavePlot or not secondVisible) then state.Step = 3 end
+        if state.Step == 3 then return end
+        local button
+        -- Do not use `condition and first or second`: a missing first button
+        -- would silently select the second one while replication is incomplete.
+        if state.Step == 1 then button = first else button = second end
+        if not visible(button, gui) then state.VisibleSince = nil return end
+        if state.VisibleButton ~= button then
+            state.VisibleButton = button state.VisibleSince = os.clock() return
+        end
+        state.VisibleSince = state.VisibleSince or os.clock()
         local step = state.Step
-        -- Advance before firing, since the callback can immediately show step two.
-        state.Step = step + 1
-        local ok = pcall(fire, button.MouseButton1Click)
-        assert(ok, "Could not activate PropertyPurchasingGUI." ..
-            (step == 1 and "SelectPurchase" or "ConfirmPurchase") .. ".Purchase")
-        H:SetStage(step == 1 and "Confirming property" or "Waiting for the plot", step == 1 and 0.13 or 0.15)
-        H:Log("Slot confirmation " .. step .. "/2 activated")
+        if os.clock() - state.VisibleSince < 0.2 or os.clock() - state.LastAttempt[step] < 1 then return end
+        assert(fire, "Slot confirmation requires firesignal in this executor")
+        assert(state.Attempts[step] < 6, "Property button did not respond - " ..
+            (step == 1 and "SelectPurchase.Purchase" or "ConfirmPurchase.Purchase"))
+        local signalName = signalFor(button, state.Attempts[step])
+        if step == 1 and not state.FirstSent then state.SecondVisibleBeforeClick = secondVisible end
+        state.Attempts[step] = state.Attempts[step] + 1 state.LastAttempt[step] = os.clock()
+        local ok
+        if signalName == "MouseButton1Down" then
+            ok = pcall(fire, button[signalName], button.AbsolutePosition.X + button.AbsoluteSize.X/2,
+                button.AbsolutePosition.Y + button.AbsoluteSize.Y/2)
+        elseif signalName == "Activated" then ok = pcall(fire, button[signalName], nil, 1)
+        else ok = pcall(fire, button[signalName]) end
+        assert(ok, "Could not fire property button signal: " .. signalName)
+        if step == 1 then state.FirstSent = true else state.SecondSent = true end
+        H:SetStage(step == 1 and "Selecting property" or "Waiting for the plot", step == 1 and 0.13 or 0.15)
+        H:Log(string.format("Property step %d - %s - attempt %d", step, signalName, state.Attempts[step]))
     end
     return service, state
 end
@@ -290,7 +364,10 @@ function H:LoadSlot(token)
     -- Resume our selected slot if a previous request is still awaiting these
     -- dialogs. Do not activate them for a different slot that is saving/loading.
     while value(Player, "CurrentlySavingOrLoading") == true do
-        if tonumber(value(Player, "CurrentSaveSlot")) == slot then resuming = true confirm() end
+        if tonumber(value(Player, "CurrentSaveSlot")) == slot then
+            resuming = true
+            break -- The owned-plot readiness check below also handles a stale busy indicator.
+        end
         assert(os.clock() < deadline, "The previous save/load has not finished")
         token:Sleep(0.1)
     end
@@ -308,45 +385,47 @@ function H:LoadSlot(token)
         assert(result ~= false, "The game rejected the selected slot")
     end
     deadline = os.clock() + 120
-    local stableSince, lastPlot, lastTiles, lastModels
-    local loadedPlot
+    local stableSince, lastPlot, lastTiles, lastBusy
+    local loadedPlot, nextDiagnostic = nil, 0
     repeat
         token:Check()
-        confirm()
         local plot = self:Plot()
-        local tiles, models = 0, 0
-        if plot then
-            for _, tile in ipairs(plot:GetChildren()) do
-                if tile:IsA("BasePart") and (tile.Name == "OriginSquare" or tile.Name == "Square") then
-                    tiles = tiles + 1
-                end
-            end
-            local playerModels = S.Workspace:FindFirstChild("PlayerModels")
-            for _, model in ipairs(playerModels and playerModels:GetChildren() or {}) do
-                if owned(model) then models = models + 1 end
-            end
-        end
+        local tiles = #self:PlotTiles(plot)
         local currentSlot = value(Player, "CurrentSaveSlot")
         local busy = value(Player, "CurrentlySavingOrLoading")
-        -- Optional indicators strengthen the check when replicated, but a missing
-        -- BoolValue must not trap an already loaded, owned plot forever.
         local slotMatches = currentSlot == nil or tonumber(currentSlot) == slot
-        local dialogsDone = (not requested and not confirmation.Seen or confirmation.Step == 3)
-            and not confirmation:Open()
+        confirmation.HavePlot = plot ~= nil and tiles > 0 and slotMatches
+        confirm()
+        -- The owned, usable plot is the completion signal. A stale purchase
+        -- panel or a busy flag left true must not keep a loaded base waiting.
+        -- A known different slot still blocks the rest of the cycle.
+        local confirmed = confirmation.SecondSent or
+            (not requested and not confirmation.Seen) or
+            (not confirmation:Open() and confirmation.HavePlot and not confirmation.Seen)
         local character = Player.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
         local root = character and character:FindFirstChild("HumanoidRootPart")
-        local ready = plot and tiles > 0 and slotMatches and busy ~= true and dialogsDone
-            and character and character.Parent and humanoid and humanoid.Health > 0 and root
+        local ready = confirmation.HavePlot and confirmed and character and character.Parent
+            and humanoid and humanoid.Health > 0 and root
         if ready then
-            if plot ~= lastPlot or tiles ~= lastTiles or models ~= lastModels then stableSince = os.clock() end
+            if plot ~= lastPlot or tiles ~= lastTiles or busy ~= lastBusy then stableSince = os.clock() end
             stableSince = stableSince or os.clock()
-            if os.clock() - stableSince >= 2 then loadedPlot = plot break end
+            if os.clock() - stableSince >= (busy == true and 3 or 1) then
+                loadedPlot = plot
+                if busy == true then self:Log("Owned terrain is ready; the optional busy indicator is still true", "WARNING") end
+                break
+            end
         else stableSince = nil end
-        lastPlot, lastTiles, lastModels = plot, tiles, models
+        lastPlot, lastTiles, lastBusy = plot, tiles, busy
+        if os.clock() >= nextDiagnostic then
+            nextDiagnostic = os.clock() + 5
+            self:SetStage("Waiting for the plot", 0.15, string.format(
+                "Owner: %s - land: %d - slot: %s - confirmation: %s",
+                plot and "you" or "pending", tiles, tostring(currentSlot), confirmed and "accepted" or "pending"))
+        end
         assert(os.clock() < deadline, string.format(
-            "Slot load not confirmed - owner: %s, land: %d, slot: %s, busy: %s, confirmation: %d/2",
-            plot and "local player" or "missing", tiles, tostring(currentSlot), tostring(busy), confirmation.Step-1))
+            "Slot load not confirmed - owner: %s, land: %d, slot: %s, busy: %s",
+            plot and "local player" or "missing", tiles, tostring(currentSlot), tostring(busy)))
         token:Sleep(0.15)
     until false
     self:SetStage("Slot loaded", 0.18, "Owned plot confirmed")
@@ -405,7 +484,7 @@ function H:EnsureAxe(kind, plot, token)
         for _, item in ipairs(models and models:GetChildren() or {}) do
             local main = partOf(item)
             if owned(item) and main and value(item,"ToolName") and self:AxeStats(item, kind) then
-                for _, tile in ipairs(plot:GetChildren()) do
+                for _, tile in ipairs(self:PlotTiles(plot)) do
                     if tile:IsA("BasePart") and (tile.Name == "Square" or tile.Name == "OriginSquare") then
                         local relative = tile.CFrame:PointToObjectSpace(main.Position)
                         if math.abs(relative.X) <= tile.Size.X/2 and math.abs(relative.Z) <= tile.Size.Z/2
@@ -964,7 +1043,7 @@ new("UIStroke","WindowBorder",{Color=Color3.fromRGB(45,58,86),Transparency=0.48,
 local header=new("Frame","TitleBar",{Size=UDim2.new(1,0,0,58),BackgroundTransparency=1,BorderSizePixel=0},shell)
 local title=label(header,"WindowTitle","Spooky Hunter",UDim2.fromOffset(56,11),UDim2.new(1,-158,0,21),15)
 title.Font=Enum.Font.GothamBold
-label(header,"WindowSubtitle","MIDNIGHT 1.1.1",UDim2.fromOffset(56,34),UDim2.new(1,-158,0,12),9,P.Muted)
+label(header,"WindowSubtitle","MIDNIGHT 1.1.2",UDim2.fromOffset(56,34),UDim2.new(1,-158,0,12),9,P.Muted)
 local divider=new("Frame","HeaderDivider",{Position=UDim2.fromOffset(20,58),Size=UDim2.new(1,-40,0,1),
     BorderSizePixel=0,BackgroundColor3=P.Accent,BackgroundTransparency=0.72},shell)
 new("UIGradient","DividerTint",{Color=ColorSequence.new(P.Accent,P.Purple)},divider)
@@ -998,7 +1077,7 @@ local activity=label(scroll,"ActivityLog","",UDim2.fromOffset(11,9),UDim2.new(1,
 activity.Font=Enum.Font.Code activity.AutomaticSize=Enum.AutomaticSize.Y activity.TextWrapped=true activity.TextTruncate=Enum.TextTruncate.None
 activity.TextYAlignment=Enum.TextYAlignment.Top
 button(activityPage,"CopyActivity","Copy",UDim2.new(1,-64,0,0),UDim2.fromOffset(64,27),function()
-    local text="Spooky Hunter 1.1.1\n"..table.concat(H.Logs,"\n")
+    local text="Spooky Hunter 1.1.2\n"..table.concat(H.Logs,"\n")
     local copy=cap("setclipboard",setclipboard) or cap("toclipboard",toclipboard)
     if copy and pcall(copy,text) then H:Log("Activity copied") else
         local previous=activityPage:FindFirstChild("ManualLogCopy") if previous then previous:Destroy() end
