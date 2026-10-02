@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.1.2 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.1.3 - Lumber Tycoon 2
     October 2, 2026. Standalone client script; no UI-library download required.
     Modwood is an experimental reconstruction of the supplied Dark X source.
     A failed burn, missing plank, or unconfirmed save stops the cycle in place.
@@ -355,16 +355,22 @@ function H:LoadConfirmation(token)
     end
     return service, state
 end
+function H:KnownSlot()
+    local slot = tonumber(value(Player, "CurrentSaveSlot"))
+    if finite(slot) and slot >= 1 and slot <= 6 and slot % 1 == 0 then return slot end
+    return nil -- -1, 0 and missing values are not usable slot identifiers.
+end
 function H:LoadSlot(token)
     self:SetStage("Loading slot " .. self.Config.Slot, 0.12)
     local slot = self.Config.Slot
+    self.LoadReceipt = nil
     local confirm, confirmation = self:LoadConfirmation(token)
     local deadline = os.clock() + 120
-    local resuming = tonumber(value(Player, "CurrentSaveSlot")) == slot and confirmation:Open()
+    local resuming = (self:KnownSlot() == nil or self:KnownSlot() == slot) and confirmation:Open()
     -- Resume our selected slot if a previous request is still awaiting these
     -- dialogs. Do not activate them for a different slot that is saving/loading.
     while value(Player, "CurrentlySavingOrLoading") == true do
-        if tonumber(value(Player, "CurrentSaveSlot")) == slot then
+        if self:KnownSlot() == slot or resuming then
             resuming = true
             break -- The owned-plot readiness check below also handles a stale busy indicator.
         end
@@ -372,7 +378,7 @@ function H:LoadSlot(token)
         token:Sleep(0.1)
     end
     local requested = false
-    if not resuming and (tonumber(value(Player, "CurrentSaveSlot")) ~= slot or not self:Plot()) then
+    if not resuming and (self:KnownSlot() ~= slot or not self:Plot()) then
         local may = self:Remote("LoadSaveRequests", "ClientMayLoad", "RemoteFunction")
         repeat
             local permitted = token:Await(function() return may:InvokeServer(Player) end)
@@ -393,15 +399,16 @@ function H:LoadSlot(token)
         local tiles = #self:PlotTiles(plot)
         local currentSlot = value(Player, "CurrentSaveSlot")
         local busy = value(Player, "CurrentlySavingOrLoading")
-        local slotMatches = currentSlot == nil or tonumber(currentSlot) == slot
+        local knownSlot = self:KnownSlot()
+        local slotMatches = knownSlot == nil or knownSlot == slot
         confirmation.HavePlot = plot ~= nil and tiles > 0 and slotMatches
         confirm()
         -- The owned, usable plot is the completion signal. A stale purchase
         -- panel or a busy flag left true must not keep a loaded base waiting.
         -- A known different slot still blocks the rest of the cycle.
         local confirmed = confirmation.SecondSent or
-            (not requested and not confirmation.Seen) or
-            (not confirmation:Open() and confirmation.HavePlot and not confirmation.Seen)
+            (not requested and not confirmation.Seen and knownSlot == slot) or
+            (not confirmation:Open() and confirmation.HavePlot and not confirmation.Seen and knownSlot == slot)
         local character = Player.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
         local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -428,6 +435,10 @@ function H:LoadSlot(token)
             plot and "local player" or "missing", tiles, tostring(currentSlot), tostring(busy)))
         token:Sleep(0.15)
     until false
+    self.LoadReceipt = {Slot=slot, Plot=loadedPlot, JobId=game.JobId}
+    if self:KnownSlot() == nil then
+        self:Log("Slot indicator unavailable - confirmed property belongs to you after the load sequence")
+    end
     self:SetStage("Slot loaded", 0.18, "Owned plot confirmed")
     local character, _, root = self:Character()
     token.Character = character
@@ -464,49 +475,37 @@ function H:AxeStats(tool, kind)
     if finite(stats.Damage) and stats.Damage > 0 and finite(stats.SwingCooldown) and stats.SwingCooldown > 0 then return stats end
 end
 function H:FindAxe(kind)
+    local character = Player.Character
+    for _, tool in ipairs(character and character:GetChildren() or {}) do
+        if tool:IsA("Tool") then
+            local stats = self:AxeStats(tool, kind)
+            if stats then return tool, stats end
+        end
+    end
     local best, bestStats, score = nil, nil, -1
-    for _, container in ipairs({Player.Character, Player:FindFirstChildOfClass("Backpack")}) do
-        for _, tool in ipairs(container and container:GetChildren() or {}) do
-            if tool:IsA("Tool") then
-                local stats = self:AxeStats(tool, kind)
-                if stats and stats.Damage / stats.SwingCooldown > score then best, bestStats, score = tool, stats, stats.Damage / stats.SwingCooldown end
+    local backpack = Player:FindFirstChildOfClass("Backpack")
+    for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
+        if tool:IsA("Tool") then
+            local stats = self:AxeStats(tool, kind)
+            if stats and stats.Damage / stats.SwingCooldown > score then
+                best, bestStats, score = tool, stats, stats.Damage / stats.SwingCooldown
             end
         end
     end
     return best, bestStats
 end
-function H:EnsureAxe(kind, plot, token)
+function H:EnsureAxe(kind, token)
+    token:Check()
     local tool, stats = self:FindAxe(kind)
-    if not tool then
-        self:SetStage("Collecting an axe from your base", 0.2)
-        local models = S.Workspace:FindFirstChild("PlayerModels")
-        local candidates = {}
-        for _, item in ipairs(models and models:GetChildren() or {}) do
-            local main = partOf(item)
-            if owned(item) and main and value(item,"ToolName") and self:AxeStats(item, kind) then
-                for _, tile in ipairs(self:PlotTiles(plot)) do
-                    if tile:IsA("BasePart") and (tile.Name == "Square" or tile.Name == "OriginSquare") then
-                        local relative = tile.CFrame:PointToObjectSpace(main.Position)
-                        if math.abs(relative.X) <= tile.Size.X/2 and math.abs(relative.Z) <= tile.Size.Z/2
-                            and math.abs(relative.Y) < 60 then table.insert(candidates,item) break end
-                    end
-                end
-            end
-        end
-        assert(#candidates > 0, "No usable axe in inventory or on your loaded plot")
-        local pickup = self:Remote("Interaction", "ClientInteracted")
-        for _, item in ipairs(candidates) do
-            self:Teleport(partOf(item).CFrame + Vector3.new(0, 3, 3))
-            pickup:FireServer(item, "Pick up tool")
-            local deadline = os.clock() + 5
-            repeat
-                token:Sleep(0.2) tool, stats = self:FindAxe(kind)
-            until tool or os.clock() >= deadline
-            if tool then break end
-        end
+    assert(tool, "No compatible axe in your Backpack or character - equip an axe and retry")
+    local _, humanoid = self:Character()
+    self:SetStage("Equipping inventory axe", 0.23, tostring(value(tool, "ToolName") or tool.Name))
+    humanoid:EquipTool(tool)
+    local deadline = os.clock() + 3
+    while tool.Parent ~= Player.Character do
+        assert(os.clock() < deadline, "Inventory axe could not be equipped")
+        token:Sleep(0.1)
     end
-    assert(tool, "Axe pickup was not confirmed")
-    local _, humanoid = self:Character() humanoid:EquipTool(tool)
     return tool, stats
 end
 function H:Scan(token)
@@ -628,6 +627,18 @@ function H:Move(model, destination, token)
     token:Sleep(0.4)
     assert(model.Parent and (model:GetPivot().Position - destination.Position).Magnitude < 5, "The wood did not remain at its destination")
 end
+function H:BringTreeToBase(log, plot, token)
+    local owner = plot and plot:FindFirstChild("Owner")
+    assert(owner and owner:IsA("ObjectValue") and owner.Value == Player, "Your plot is no longer owned")
+    self:SetStage("Bringing tree to your base", 0.43)
+    local center = self:PlotCenter(plot)
+    local bounds, size = log:GetBoundingBox()
+    local relative = log:GetPivot():ToObjectSpace(bounds)
+    local target = CFrame.new(center.Position.X, center.Position.Y + size.Y/2 + 0.1, center.Position.Z)
+        * relative:Inverse()
+    self:Move(log, target, token)
+    self:Log("Felled tree delivered to your plot before Modwood")
+end
 function H:ModwoodParts(log)
     local sections, root, candidates = {}, nil, {}
     for _, section in ipairs(log:GetChildren()) do
@@ -668,9 +679,15 @@ function H:FindLava()
     assert(found, "Modwood - the source's lava part could not be identified")
     return found
 end
-function H:Modwood(log, mill, inlet, tool, stats, token)
+function H:Modwood(log, mill, inlet, token)
     assert(owned(log) and owned(mill), "Modwood requires your wood and your sawmill")
-    local root, leaf, parent = self:ModwoodParts(log)
+    local _, leaf, parent = self:ModwoodParts(log)
+    local originalSections = {}
+    for _, section in ipairs(log:GetDescendants()) do
+        if section:IsA("BasePart") and section.Name == "WoodSection" then
+            table.insert(originalSections, section)
+        end
+    end
     local lava = self:FindLava()
     local lavaState = { CFrame = lava.CFrame, Size = lava.Size }
     local restoredLava = false
@@ -710,12 +727,9 @@ function H:Modwood(log, mill, inlet, tool, stats, token)
     local playerModels = S.Workspace:FindFirstChild("PlayerModels") assert(playerModels, "PlayerModels missing")
     local before = {} for _, model in ipairs(playerModels:GetChildren()) do before[model] = true end
     local kind = value(log,"TreeClass")
-    local cut = log:FindFirstChild("CutEvent")
-    local proxy = self:Remote("Interaction", "RemoteProxy")
-    local nextSwing = 0
     local planks, seen = {}, {}
     deadline = os.clock() + self.Config.MillTimeout
-    local stableSince
+    local stableSince, outputVolume, outputParts
     self:SetStage("Modwood - feeding retained branch", 0.7, "Waiting for a new owned plank")
     repeat
         token:Check() assert(mill.Parent and owned(mill) and inlet.Parent, "The selected sawmill disappeared")
@@ -728,7 +742,24 @@ function H:Modwood(log, mill, inlet, tool, stats, token)
         end
         local leafModel=leaf.Parent and leaf:FindFirstAncestorOfClass("Model")
         local consumed=not leaf.Parent or (leafModel and seen[leafModel]==true)
-        if #planks > 0 and consumed and stableSince and os.clock() - stableSince > 1.5 then return planks end
+        local remaining = 0
+        for _, section in ipairs(originalSections) do
+            local model = section.Parent and section:FindFirstAncestorOfClass("Model")
+            if section.Parent and not (model and seen[model]) then remaining = remaining + 1 end
+        end
+        local volume, parts = 0, 0
+        for _, plank in ipairs(planks) do
+            assert(plank.Parent and owned(plank), "Sawmill output disappeared or changed owner")
+            for _, section in ipairs(plank:GetDescendants()) do
+                if section:IsA("BasePart") and section.Name == "WoodSection" then
+                    parts = parts + 1 volume = volume + section.Size.X * section.Size.Y * section.Size.Z
+                end
+            end
+        end
+        if volume ~= outputVolume or parts ~= outputParts then stableSince = os.clock() end
+        outputVolume, outputParts = volume, parts
+        if #planks > 0 and consumed and remaining == 0 and volume > 0
+            and stableSince and os.clock() - stableSince > 2 then return planks end
         if leaf.Parent and not consumed then
             local ownerModel = leaf:FindFirstAncestorOfClass("Model")
             assert(ownerModel and owned(ownerModel), "Modwood - branch ownership is no longer confirmed")
@@ -736,15 +767,12 @@ function H:Modwood(log, mill, inlet, tool, stats, token)
             leaf.CFrame = inlet.CFrame + Vector3.new(0.7, 0, 0)
             leaf.AssemblyLinearVelocity = Vector3.zero leaf.AssemblyAngularVelocity = Vector3.zero
         end
-        if log.Parent and root.Parent == log and cut and cut.Parent and os.clock() >= nextSwing then
-            self:Teleport(root.CFrame * CFrame.new(root.Size.X/2 + 4, -root.Size.Y/2 + 3, 0))
-            proxy:FireServer(cut, {tool = tool, sectionId = 1, height = 0.3, faceVector = Vector3.new(1,0,0),
-                hitPoints = stats.Damage, cooldown = stats.SwingCooldown, cuttingClass = "Axe"})
-            nextSwing = os.clock() + math.clamp(stats.SwingCooldown, 0.1, 5)
-        end
+        -- No additional axe strikes after felling. This no-recut variation of
+        -- the supplied burn/retained-branch procedure is experimental. Never
+        -- accept a lone branch plank while the rest of the original tree remains.
         token:Sleep(0.06)
     until os.clock() >= deadline
-    error("Modwood - no confirmed plank output; cycle stopped, no server hop", 0)
+    error("Modwood - whole-tree conversion or finished output not confirmed; wood left in this server", 0)
 end
 function H:Deliver(planks, center, token)
     for _, plank in ipairs(planks) do
@@ -766,7 +794,14 @@ function H:Deliver(planks, center, token)
 end
 function H:SaveSlot(token)
     self:SetStage("Saving slot " .. self.Config.Slot, 0.94, "Waiting for confirmation before leaving")
-    assert(value(Player,"CurrentSaveSlot") == self.Config.Slot, "The active slot changed")
+    local knownSlot = self:KnownSlot()
+    local receipt = self.LoadReceipt
+    if knownSlot then
+        assert(knownSlot == self.Config.Slot, "The active slot changed")
+    else
+        assert(receipt and receipt.Slot == self.Config.Slot and receipt.JobId == game.JobId
+            and receipt.Plot == self:Plot(), "Cannot save an unknown slot without a confirmed load in this session")
+    end
     local deadline = os.clock() + 90
     while value(Player,"CurrentlySavingOrLoading") == true do
         assert(os.clock() < deadline, "Game save is still busy") token:Sleep(0.3)
@@ -775,7 +810,7 @@ function H:SaveSlot(token)
     local result = token:Await(function() return remote:InvokeServer(self.Config.Slot, Player) end, 45)
     assert(result == true, "Save not explicitly confirmed - staying in this server")
     deadline = os.clock() + 60
-    while value(Player,"CurrentlySavingOrLoading") ~= false do
+    while value(Player,"CurrentlySavingOrLoading") == true do
         assert(os.clock() < deadline, "Save completion timed out") token:Sleep(0.3)
     end
     token:Sleep(2)
@@ -918,11 +953,12 @@ function H:Run(token)
         token:Check()
         if entry.Model.Parent and value(entry.Model,"Owner")==nil and not entry.Model:FindFirstChild("RootCut") then
             self:ModwoodParts(entry.Model) -- Reject unsupported geometry before cutting the tree.
-            local tool,stats=self:EnsureAxe(entry.Kind,plot,token)
+            local tool,stats=self:EnsureAxe(entry.Kind,token)
             self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
             local log=self:Chop(entry,tool,stats,token)
             self.Stats.Trees=self.Stats.Trees+1
-            local planks=self:Modwood(log,mill,inlet,tool,stats,token)
+            self:BringTreeToBase(log,plot,token)
+            local planks=self:Modwood(log,mill,inlet,token)
             self:SetStage("Delivering planks",0.86,"Center of your plot")
             self:Deliver(planks,center,token)
             self:SaveSlot(token)
@@ -1043,7 +1079,7 @@ new("UIStroke","WindowBorder",{Color=Color3.fromRGB(45,58,86),Transparency=0.48,
 local header=new("Frame","TitleBar",{Size=UDim2.new(1,0,0,58),BackgroundTransparency=1,BorderSizePixel=0},shell)
 local title=label(header,"WindowTitle","Spooky Hunter",UDim2.fromOffset(56,11),UDim2.new(1,-158,0,21),15)
 title.Font=Enum.Font.GothamBold
-label(header,"WindowSubtitle","MIDNIGHT 1.1.2",UDim2.fromOffset(56,34),UDim2.new(1,-158,0,12),9,P.Muted)
+label(header,"WindowSubtitle","MIDNIGHT 1.1.3",UDim2.fromOffset(56,34),UDim2.new(1,-158,0,12),9,P.Muted)
 local divider=new("Frame","HeaderDivider",{Position=UDim2.fromOffset(20,58),Size=UDim2.new(1,-40,0,1),
     BorderSizePixel=0,BackgroundColor3=P.Accent,BackgroundTransparency=0.72},shell)
 new("UIGradient","DividerTint",{Color=ColorSequence.new(P.Accent,P.Purple)},divider)
@@ -1077,7 +1113,7 @@ local activity=label(scroll,"ActivityLog","",UDim2.fromOffset(11,9),UDim2.new(1,
 activity.Font=Enum.Font.Code activity.AutomaticSize=Enum.AutomaticSize.Y activity.TextWrapped=true activity.TextTruncate=Enum.TextTruncate.None
 activity.TextYAlignment=Enum.TextYAlignment.Top
 button(activityPage,"CopyActivity","Copy",UDim2.new(1,-64,0,0),UDim2.fromOffset(64,27),function()
-    local text="Spooky Hunter 1.1.2\n"..table.concat(H.Logs,"\n")
+    local text="Spooky Hunter 1.1.3\n"..table.concat(H.Logs,"\n")
     local copy=cap("setclipboard",setclipboard) or cap("toclipboard",toclipboard)
     if copy and pcall(copy,text) then H:Log("Activity copied") else
         local previous=activityPage:FindFirstChild("ManualLogCopy") if previous then previous:Destroy() end
