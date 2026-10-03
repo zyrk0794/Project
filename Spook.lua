@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.3.5 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.3.6 - Lumber Tycoon 2
     October 3, 2026. Standalone client script; no UI-library download required.
     Modwood is an experimental reconstruction of the supplied Dark X source.
     Unconfirmed wood is preserved; other available trees can still be attempted.
@@ -24,9 +24,9 @@ local Queue = cap("queue_on_teleport", queue_on_teleport) or cap("queueontelepor
     or (type(synAPI) == "table" and synAPI.queue_on_teleport)
 local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local FILE = "MidnightSpookyHunter.json"
-local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 15, ScanWait = 12,
+local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 15, ScanWait = 12, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.3.5", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.3.6", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -78,7 +78,7 @@ local function configFrom(source)
     if type(source) ~= "table" then return result end
     for key in pairs(result) do if type(source[key]) == type(result[key]) then result[key] = source[key] end end
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
-    for key, limits in pairs({HopDelay = {12, 180}, ScanWait = {8, 120}, ChopTimeout = {15, 180},
+    for key, limits in pairs({LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {12, 180}, ScanWait = {8, 120}, ChopTimeout = {15, 180},
         BurnTimeout = {10, 120}, MillTimeout = {15, 180}, TaskTimeout = {300, 1800}}) do
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
     end
@@ -340,6 +340,60 @@ function H:Token(parent)
     end
     if parent then parent:Finally(function() token:Clean() end) end
     return token
+end
+function H:WaitForGame(token)
+    self:SetStage("Loading game",0.01)
+    local deadline=os.clock()+self.Config.LoadTimeout
+    local stableSince,lastSignature,lastReason
+    repeat
+        token:Check()
+        local missing,refs={},{}
+        local function need(parent,name,label)
+            local object=parent and parent:FindFirstChild(name)
+            if object then table.insert(refs,object) else table.insert(missing,label or name) end
+            return object
+        end
+        if not game:IsLoaded() then table.insert(missing,"Game.Loaded") end
+        local char=Player.Character
+        local hum=char and char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health<=0 then table.insert(missing,"Live character") end
+        need(char,"HumanoidRootPart") need(Player,"Backpack") need(Player,"PlayerGui")
+        need(S.Workspace,"LogModels") need(S.Workspace,"PlayerModels")
+        local interaction=need(S.ReplicatedStorage,"Interaction")
+        need(interaction,"RemoteProxy") need(interaction,"ClientIsDragging")
+        if self.Config.FullCycle then
+            need(S.ReplicatedStorage,"AxeClasses")
+            local saves=need(S.ReplicatedStorage,"LoadSaveRequests")
+            need(saves,"RequestLoad") need(saves,"RequestSave")
+        end
+        local regions,trees=0,0
+        for _,region in ipairs(S.Workspace:GetChildren()) do
+            if region.Name=="TreeRegion" then
+                regions=regions+1
+                for _,model in ipairs(region:GetChildren()) do
+                    if model:FindFirstChild("TreeClass") and model:FindFirstChild("Owner") and model:FindFirstChild("WoodSection",true) then trees=trees+1 end
+                end
+            end
+        end
+        if regions==0 or trees==0 then table.insert(missing,"Tree regions") end
+        local signature={regions,trees}
+        for _,object in ipairs(refs) do table.insert(signature,object) end
+        local changed=not lastSignature or #signature~=#lastSignature
+        if not changed then for i,object in ipairs(signature) do if lastSignature[i]~=object then changed=true break end end end
+        if #missing==0 then
+            if changed or not stableSince then stableSince=os.clock() end
+            if os.clock()-stableSince>=2 then
+                self.LoadDiagnostic="Game ready - required objects stable for 2 seconds"
+                self:Log(self.LoadDiagnostic,"DEBUG") return
+            end
+        else stableSince=nil end
+        lastSignature=signature
+        local reason=#missing>0 and table.concat(missing,", ") or "Waiting for stable objects"
+        self.LoadDiagnostic="Game loading - "..reason
+        if reason~=lastReason then self:Log(self.LoadDiagnostic,"DEBUG") lastReason=reason end
+        assert(os.clock()<deadline,"Game data is still loading - "..reason)
+        token:Sleep(0.25)
+    until false
 end
 function H:Remote(folder, name, class)
     local parent = S.ReplicatedStorage:FindFirstChild(folder)
@@ -609,7 +663,7 @@ function H:LoadSlot(token)
     return loadedPlot
 end
 function H:FindMill(token, plot)
-    local deadline=os.clock()+20
+    local deadline=os.clock()+math.min(90,self.Config.LoadTimeout)
     self:SetStage("Selecting your sawmill",0.46,"Looking for an owned Sawmill4L")
     repeat
         token:Check()
@@ -977,36 +1031,74 @@ function H:CaptureModwood(log, mill, reason)
     end
     self.ModwoodDiagnostic = table.concat(lines,"\n")
 end
-function H:WaitForModwood(log, token)
-    self:SetStage("Checking felled tree", 0.48, "Waiting for branch data")
-    local deadline, reason = os.clock() + 4, nil
-    repeat
-        token:Check()
-        if not log.Parent or not owned(log) then return false, "Felled tree is no longer owned" end
-        local root, _, _, message = self:ModwoodParts(log)
-        if root then return true end
-        reason = message
-        token:Sleep(0.2)
-    until os.clock() >= deadline
-    self:CaptureModwood(log, nil, reason)
-    return false, reason
-end
--- Conventional fallback for exactly one trunk and one terminal branch.
-function H:SimpleTreeParts(log)
-    if not log or not log.Parent or not owned(log) then return end
-    local sections,root,leaf={},nil,nil
+-- Build a post-order plan: descendants first, the trunk last.
+function H:DismemberPlan(log)
+    if not log or not under(log,S.Workspace) or not owned(log) then return nil,"Wood is no longer owned" end
+    local byID,jobs={},{}
     for _,part in ipairs(log:GetDescendants()) do
         if part:IsA("BasePart") and part.Name=="WoodSection" then
-            table.insert(sections,part)
-            if tonumber(value(part,"ID"))==1 then root=part else leaf=part end
+            local id=tonumber(value(part,"ID"))
+            if not id then return nil,"Waiting for section IDs" end
+            if byID[id] then return nil,"Duplicate section IDs" end
+            byID[id]=part
         end
     end
-    if #sections~=2 or not root or not leaf or tonumber(value(leaf,"ParentID"))~=1 then return end
-    local children=leaf:FindFirstChild("ChildIDs")
-    local id=tonumber(value(leaf,"ID"))
-    if not children or #children:GetChildren()~=0 or not id or id==1 then return end
-    if root.Size.Y<=0.35 or leaf.Size.Y<=0.35 then return end
-    return root,leaf
+    if not byID[1] then return nil,"Waiting for the root section" end
+    for id,part in pairs(byID) do
+        local seen,depth,current={},0,id
+        while current~=1 do
+            if seen[current] then return nil,"Cyclic branch data" end
+            seen[current]=true
+            local section=byID[current]
+            current=section and tonumber(value(section,"ParentID"))
+            if not current or not byID[current] then return nil,"Waiting for branch parents" end
+            depth=depth+1
+        end
+        local children=part:FindFirstChild("ChildIDs")
+        for _,child in ipairs(children and children:GetChildren() or {}) do
+            local childID=child:IsA("ValueBase") and tonumber(child.Value)
+            if not childID or not byID[childID] then return nil,"Waiting for child sections" end
+            if tonumber(value(byID[childID],"ParentID"))~=id then return nil,"Branch links are inconsistent" end
+        end
+        if part.Size.Y<=0 then return nil,"Invalid section dimensions" end
+        table.insert(jobs,{Section=part,ID=id,Depth=depth,Height=math.min(0.3,part.Size.Y/2),OriginalHeight=part.Size.Y})
+    end
+    table.sort(jobs,function(a,b) return a.Depth==b.Depth and a.ID<b.ID or a.Depth>b.Depth end)
+    if #jobs==1 then jobs[1].Model=log jobs[1].Direct=true end
+    return jobs
+end
+function H:SimpleTreeParts(log)
+    local jobs=self:DismemberPlan(log)
+    if jobs and #jobs==2 and jobs[1].Depth==1 then return jobs[2].Section,jobs[1].Section end
+end
+function H:WaitForModwood(log,token)
+    self:SetStage("Checking felled tree",0.48)
+    local deadline=os.clock()+self.Config.MetadataTimeout
+    local previous,stableSince,reason
+    repeat
+        token:Check()
+        if not log.Parent or not owned(log) then return false,"Felled tree is no longer owned" end
+        local plan,problem=self:DismemberPlan(log)
+        if plan then
+            local rows={}
+            for _,job in ipairs(plan) do
+                table.insert(rows,string.format("%d/%d/%.2f/%.2f/%.2f",job.ID,job.Depth,job.Section.Size.X,job.Section.Size.Y,job.Section.Size.Z))
+            end
+            local signature=table.concat(rows,";")
+            if signature~=previous then previous=signature stableSince=os.clock() end
+            if os.clock()-stableSince>=1 then
+                local root,_,_,message=self:ModwoodParts(log)
+                if root then return true end
+                self:CaptureModwood(log,nil,message)
+                return false,message
+            end
+        else previous=nil stableSince=nil end
+        reason=problem or "Waiting for stable branch data"
+        self.LoadDiagnostic="Felled wood - "..reason
+        token:Sleep(0.2)
+    until os.clock()>=deadline
+    self:CaptureModwood(log,nil,reason)
+    return false,reason
 end
 local function woodDescription(model,inlet)
     if not model then return "Missing reference" end
@@ -1051,6 +1143,7 @@ function H:BuildReport()
     if self.LastFailure then
         table.insert(lines,"Last failure (UTC): "..self.LastFailure.Time.."\nFailed stage: "..self.LastFailure.Stage.."\nReason: "..self.LastFailure.Reason)
     end
+    if self.LoadDiagnostic then table.insert(lines,"Readiness: "..self.LoadDiagnostic) end
     table.insert(lines,"Activity (UTC)\n"..table.concat(self.Logs,"\n"))
     for _,diagnostic in ipairs({self.CutDiagnostic or "",self.ModwoodDiagnostic or "",self.ModwoodRuntimeDiagnostic or ""}) do
         if diagnostic~="" then table.insert(lines,diagnostic) end
@@ -1061,7 +1154,7 @@ function H:BuildReport()
         if work.Classic then
             table.insert(lines,"Classic milling: "..work.Classic.Phase)
             for piece,job in ipairs(work.Classic.Jobs) do
-                table.insert(lines,string.format("Piece %d: cutRequests=%d; separated=%s; milled=%s",piece,job.Strikes or 0,tostring(job.Model~=nil),tostring(job.Done==true)))
+                table.insert(lines,string.format("Piece %d: section=%s; cutHeight=%s; cutRequests=%d; separated=%s; milled=%s",piece,tostring(job.ID),tostring(job.Height),job.Strikes or 0,tostring(job.Model~=nil),tostring(job.Done==true)))
                 if job.FailureSnapshot then table.insert(lines,"At interruption:\n"..job.FailureSnapshot) end
                 local ok,current=pcall(self.MillReport,self,work.Classic,job,piece)
                 table.insert(lines,"Current observation:\n"..(ok and current or "Unavailable"))
@@ -1079,12 +1172,12 @@ function H:ClassicMill(log,mill,inlet,token,work)
     assert(logs and models,"Wood containers are unavailable")
     local state=work.Classic
     if not state then
-        local root,leaf=self:SimpleTreeParts(log)
-        assert(root,"Classic milling requires a trunk and one terminal branch")
+        local jobs,reason=self:DismemberPlan(log)
+        assert(jobs,reason)
         state={Phase="Splitting",Log=log,Kind=value(log,"TreeClass"),Mill=mill,Inlet=inlet,Outputs={},SeenOutput={},
-            Jobs={{Section=leaf,ID=tonumber(value(leaf,"ID"))},{Section=root,ID=1}}}
+            Jobs=jobs}
         work.Classic=state
-        self:Log("Small tree - using standard milling")
+        self:Log("Using standard milling - "..#jobs.." sections")
     end
     assert(state.Mill==mill and state.Inlet==inlet,"Retry with the original sawmill")
     local function check()
@@ -1097,7 +1190,8 @@ function H:ClassicMill(log,mill,inlet,token,work)
         local tool,stats=self:EnsureAxe(state.Kind,token)
         for index,job in ipairs(state.Jobs) do
             if not job.Model then
-                self:SetStage("Separating wood",0.5+index*0.04,"Piece "..index.." / 2")
+                self:SetStage("Separating wood",0.5+0.1*index/#state.Jobs,"Piece "..index.." / "..#state.Jobs)
+                job.Height=job.Height or math.min(0.3,job.Section.Size.Y/2)
                 if not job.Before then
                     job.Before={}
                     for _,model in ipairs(logs:GetChildren()) do job.Before[model]=true end
@@ -1124,9 +1218,11 @@ function H:ClassicMill(log,mill,inlet,token,work)
                         if os.clock()-since>=0.25 then job.Model=candidate break end
                     else candidate=nil since=nil end
                     local section=job.Section
-                    if state.Log.Parent and section.Parent and section.Size.Y>0.35 and not candidate then
-                        assert(owned(state.Log),"Selected wood changed owner")
-                        local event=state.Log:FindFirstChild("CutEvent")
+                    if livePart(section) and section.Size.Y>job.Height+0.001 and not candidate then
+                        local source=section:FindFirstAncestorOfClass("Model")
+                        while source and not source:FindFirstChild("Owner") do source=source:FindFirstAncestorOfClass("Model") end
+                        assert(source and owned(source),"Selected wood changed owner")
+                        local event=source:FindFirstChild("CutEvent")
                         assert(event,"The selected wood has no CutEvent")
                         assert(tool.Parent==Player.Character,"Re-equip your axe and retry")
                         self:Teleport(CFrame.lookAt(section.Position+Vector3.new(5,0,0),section.Position))
@@ -1134,7 +1230,7 @@ function H:ClassicMill(log,mill,inlet,token,work)
                         if not job.LastStrike or os.clock()-job.LastStrike>=math.max(0.1,stats.SwingCooldown)+0.05 then
                             token:Check()
                             job.Origin=section.Position job.LastStrike=os.clock() job.Strikes=job.Strikes+1
-                            self:FireAxe(proxy,event,{tool=tool,sectionId=job.ID,height=0.3,faceVector=Vector3.new(-1,0,0),
+                            self:FireAxe(proxy,event,{tool=tool,sectionId=tonumber(value(section,"ID")) or job.ID,height=job.Height,faceVector=Vector3.new(-1,0,0),
                                 hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
                         end
                     end
@@ -1157,15 +1253,17 @@ function H:ClassicMill(log,mill,inlet,token,work)
                 for _,part in ipairs(piece:GetDescendants()) do
                     if part:IsA("BasePart") and part.Name=="WoodSection" then table.insert(job.Sections,part) end
                 end
-                local mainCount=0
+                local mainCount,largest=0,-1
                 for _,part in ipairs(job.Sections) do
-                    if part.Size.Y>0.35 then mainCount=mainCount+1 job.FeedSection=part end
+                    if part.Size.Y>0.35 then mainCount=mainCount+1 end
+                    local volume=part.Size.X*part.Size.Y*part.Size.Z
+                    if volume>largest then largest=volume job.FeedSection=part end
                 end
-                assert(mainCount==1,"The separated piece still has large branches - wood kept for inspection")
+                assert(mainCount<=1 and job.FeedSection,"The separated piece still has large branches - wood kept for inspection")
                 job.BeforeOutput={} job.Outputs={}
                 for _,model in ipairs(models:GetChildren()) do job.BeforeOutput[model]=true end
             end
-            self:SetStage("Milling wood",0.64+index*0.06,"Piece "..index.." / 2")
+            self:SetStage("Milling wood",0.64+0.14*index/#state.Jobs,"Piece "..index.." / "..#state.Jobs)
             local deadline=os.clock()+self.Config.MillTimeout
             job.MillStarted=os.clock() job.FeedAttempts=0 job.NextFeed=0
             -- Upgrade paused 1.3.3/1.3.4 tasks without recutting their pieces.
@@ -1772,8 +1870,8 @@ function H:Bootstrap()
         assert(url:match("^https://"), "Set Script URL in Settings or start with the companion loader")
         loader = "local source=game:HttpGet(" .. string.format("%q",url) .. ");local env=type(getgenv)=='function' and getgenv() or _G;env.MidnightSpookySource=source;local f,e=loadstring(source);assert(f,e);f()"
     end
-    return "repeat task.wait(0.2) until game:IsLoaded();local ok,d=pcall(function() return game:GetService('HttpService'):JSONDecode(readfile('"..FILE.."')) end);"
-        .. "if not ok or not d.Resume or d.Target~=game.JobId or os.time()-(d.TicketTime or 0)>180 then return end;"
+    return "local deadline=os.clock()+300;repeat task.wait(0.2) until game:IsLoaded() or os.clock()>=deadline;if not game:IsLoaded() then return end;local ok,d=pcall(function() return game:GetService('HttpService'):JSONDecode(readfile('"..FILE.."')) end);"
+        .. "if not ok or not d.Resume or d.Target~=game.JobId or os.time()-(d.TicketTime or 0)>600 then return end;"
         .. "local env=type(getgenv)=='function' and getgenv() or _G;if env.MidnightSpookyBootServer==game.JobId then return end;"
         .. "env.MidnightSpookyBootServer=game.JobId;env.MidnightSpookyResume=true;" .. loader
 end
@@ -1823,6 +1921,7 @@ end
 function H:Run(token)
     assert(game.PlaceId==13822889,"This script targets Lumber Tycoon 2 (13822889)")
     assert(not S.Workspace.StreamingEnabled,"Streaming is enabled - a complete tree scan cannot be confirmed")
+    self:WaitForGame(token)
     self:Bootstrap()
     local resuming = #self.PendingWood>0
     if self.Dirty and not resuming then
@@ -1896,7 +1995,7 @@ function H:Run(token)
                         local supported, reason=self:WaitForModwood(log,scope)
                         if not supported then
                             self:CaptureModwood(log,mill,reason)
-                            if self:SimpleTreeParts(log) then
+                            if self:DismemberPlan(log) then
                                 work.Planks=self:ClassicMill(log,mill,inlet,scope,work)
                             else return reason end
                         end
@@ -2219,6 +2318,8 @@ advancedButton=button(advanced,"ExpandAdvanced","Advanced settings +",UDim2.from
 end)
 field("Script URL - only without the loader","ScriptURL",false,false,true)
 field("Server hop delay (seconds)","HopDelay",true,false,true)
+field("Game loading timeout (seconds)","LoadTimeout",true,false,true)
+field("Wood data timeout (seconds)","MetadataTimeout",true,false,true)
 field("World scan timeout (seconds)","ScanWait",true,false,true)
 field("Chop timeout (seconds)","ChopTimeout",true,false,true)
 field("Burn timeout (seconds)","BurnTimeout",true,false,true)
@@ -2291,7 +2392,7 @@ if H.RecoveredSession then
     H.UI.Start.Text="Review / retry"
 end
 local resume=Env.MidnightSpookyResume==true and restored and restored.Resume==true and restored.Target==game.JobId
-    and finite(restored.TicketTime) and os.time()-restored.TicketTime<180
+    and finite(restored.TicketTime) and os.time()-restored.TicketTime<600
 Env.MidnightSpookyResume=nil
 if resume then H:Start() end
 return H
