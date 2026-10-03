@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.3.0 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.3.1 - Lumber Tycoon 2
     October 3, 2026. Standalone client script; no UI-library download required.
     Modwood is an experimental reconstruction of the supplied Dark X source.
     Unconfirmed wood is preserved; other available trees can still be attempted.
@@ -25,8 +25,8 @@ local Queue = cap("queue_on_teleport", queue_on_teleport) or cap("queueontelepor
 local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local FILE = "MidnightSpookyHunter.json"
 local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 15, ScanWait = 12,
-    ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true }
-local H = { Version = "1.3.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {},
+    ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
+local H = { Version = "1.3.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -130,31 +130,125 @@ local function cleanError(err)
     local message = tostring(err)
     return (message:gsub("^.-:%d+: ", "")):sub(1, 350)
 end
-function H:Log(message, level)
-    message = tostring(message)
-    -- Never print the webhook token or raw HTTP error body.
-    if self.Config.Webhook ~= "" then message = message:gsub(self.Config.Webhook:gsub("([^%w])", "%%%1"), "[webhook]") end
-    table.insert(self.Logs, os.date("!%H:%M:%S") .. "  " .. (level or "INFO") .. "  " .. message)
-    while #self.Logs > 70 do table.remove(self.Logs, 1) end
-    if self.UI then self.UI.Activity.Text = uiText(table.concat(self.Logs, "\n")) end
+local stageTitles = {
+    ["Confirming property"]="Loading property", ["Waiting for the plot"]="Loading property",
+    ["Selecting your sawmill"]="Selecting sawmill", ["Equipping inventory axe"]="Equipping axe",
+    ["Bringing tree to your base"]="Bringing tree home", ["Checking felled tree"]="Preparing wood",
+    ["Modwood - igniting parent section"]="Preparing Modwood",
+    ["Modwood - stabilizing selected tree"]="Preparing Modwood",
+    ["Modwood - waiting for parent separation"]="Preparing Modwood",
+    ["Modwood - triggering conversion"]="Processing wood",
+    ["Modwood - waiting for sawmill output"]="Waiting for planks",
+    ["Finding another server"]="Finding a server", ["Joining another server"]="Joining server",
+    ["Resuming unfinished wood"]="Resuming harvest",
+}
+local function shortError(message)
+    message=cleanError(message)
+    if message:find("Cut not confirmed",1,true) then return "Cut not confirmed - retry this tree" end
+    if message:find("no LavaFire",1,true) then return "Ignition failed - wood kept for retry" end
+    if message:find("whole-tree conversion",1,true) then return "Conversion incomplete - wood kept for retry" end
+    if message:find("Request timed out",1,true) then return "No server response - check before retrying" end
+    return message
+end
+function H:Log(message, level, display)
+    message=tostring(message) level=level or "INFO"
+    if self.Config.Webhook~="" then message=message:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
+    -- Keep technical timings in the copied report, never in the visible feed.
+    table.insert(self.Logs,os.date("!%H:%M:%S").."  "..level.."  "..message)
+    while #self.Logs>160 do table.remove(self.Logs,1) end
+    if level=="DEBUG" or display==false then return end
+    local visible=type(display)=="string" and display or shortError(message)
+    if self.Config.Webhook~="" then visible=visible:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
+    visible=uiText(visible)
+    local entries=self.ActivityEntries
+    local last=entries[#entries]
+    if last and last.Text==visible and last.Level==level then
+        last.Count=last.Count+1
+    else
+        table.insert(entries,{Text=visible,Level=level,Count=1})
+        while #entries>40 do table.remove(entries,1) end
+    end
+    if self.UI then
+        local lines={}
+        for _,entry in ipairs(entries) do
+            local prefix=entry.Level=="ERROR" and "Error - " or entry.Level=="WARNING" and "Attention - " or ""
+            table.insert(lines,prefix..entry.Text..(entry.Count>1 and " (x"..entry.Count..")" or ""))
+        end
+        self.UI.Activity.Text=table.concat(lines,"\n\n")
+    end
 end
 function H:SetStage(text, progress, detail)
-    if self.Stage ~= text then self.StageStarted = os.clock() end
-    self.Stage = text
-    if progress then self.Progress = math.clamp(progress, 0, 1) end
+    local changed=self.Stage~=text
+    if changed then self.StageStarted=os.clock() end
+    self.Stage=text
+    if progress then self.Progress=math.clamp(progress,0,1) end
+    local shown=stageTitles[text] or uiText(text)
+    local useful=detail and (detail:match("^Tree %d") or text=="Equipping inventory axe"
+        or text=="Rare trees found" or text=="Waiting for available servers" or text=="Needs attention"
+        or text=="Task stopped")
+    local caption=useful and uiText(shortError(detail)) or ""
     if self.UI then
-        self.UI.Stage.Text = uiText(text) self.UI.Detail.Text = uiText(detail or "")
-        if self.StageTween then self.StageTween:Cancel() end
-        self.UI.Stage.TextTransparency = 0.28
-        self.StageTween = S.TweenService:Create(self.UI.Stage, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
-            {TextTransparency = 0})
-        self.StageTween:Play()
+        local titleChanged=self.UI.Stage.Text~=shown
+        self.UI.Stage.Text=shown self.UI.Detail.Text=caption
+        if titleChanged then
+            if self.StageTween then self.StageTween:Cancel() end
+            self.UI.Stage.TextTransparency=0.28
+            self.StageTween=S.TweenService:Create(self.UI.Stage,TweenInfo.new(0.2,Enum.EasingStyle.Quart,Enum.EasingDirection.Out),{TextTransparency=0})
+            self.StageTween:Play()
+        end
         if self.ProgressTween then self.ProgressTween:Cancel() end
-        self.ProgressTween = S.TweenService:Create(self.UI.Fill, TweenInfo.new(0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
-            { Size = UDim2.fromScale(self.Progress, 1) })
+        self.ProgressTween=S.TweenService:Create(self.UI.Fill,TweenInfo.new(0.35,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),
+            {Size=UDim2.fromScale(self.Progress,1)})
         self.ProgressTween:Play()
     end
-    self:Log(text .. (detail and (" - " .. detail) or ""))
+    local diagnostic=text..(detail and (" - "..detail) or "")
+    if diagnostic~=self.LastStageDiagnostic then
+        self.LastStageDiagnostic=diagnostic
+        local visible=shown..(caption~="" and " - "..caption or "")
+        self:Log(diagnostic,"INFO",visible~=self.LastStageVisible and visible or false)
+        self.LastStageVisible=visible
+    end
+end
+function H:SetAntiAfk(enabled)
+    self.Config.AntiAfk=enabled==true
+    if self.AntiAfkConnection then self.AntiAfkConnection:Disconnect() self.AntiAfkConnection=nil end
+    if not self.Config.AntiAfk or not self.Alive then return end
+    -- Own only this connection; never disconnect another script's Idled handlers.
+    local ok,connection=pcall(function()
+        return Player.Idled:Connect(function()
+            if not self.Alive or not self.Config.AntiAfk or self.AntiAfkBusy then return end
+            if self.LastIdlePulse and os.clock()-self.LastIdlePulse<60 then return end
+            if S.UserInputService:GetFocusedTextBox() then return end
+            self.LastIdlePulse=os.clock() self.AntiAfkBusy=true
+            local sent=pcall(function()
+                local virtual=game:GetService("VirtualUser")
+                virtual:CaptureController()
+                virtual:ClickButton2(Vector2.new(0,0))
+            end)
+            if not sent then
+                -- Reuse the service. Always release the button, including after a failed press.
+                local got,virtual=pcall(game.GetService,game,"VirtualInputManager")
+                if got and virtual then
+                    local attempted,result=pcall(function()
+                        local pressed=pcall(function() virtual:SendMouseButtonEvent(0,0,1,true,game,0) end)
+                        local released=pcall(function() virtual:SendMouseButtonEvent(0,0,1,false,game,0) end)
+                        return pressed and released
+                    end)
+                    sent=attempted and result==true
+                end
+            end
+            self.AntiAfkBusy=false
+            if sent then
+                self.AntiAfkWarning=false
+                self:Log("Idle input sent","DEBUG")
+            elseif not self.AntiAfkWarning then
+                self.AntiAfkWarning=true
+                self:Log("Anti-AFK input unavailable in this executor","WARNING")
+            end
+        end)
+    end)
+    if ok then self.AntiAfkConnection=connection
+    else self:Log("Anti-AFK could not connect to Idled","WARNING") end
 end
 function H:Connect(signal, callback)
     local connection = signal:Connect(function(...)
@@ -406,7 +500,7 @@ function H:LoadConfirmation(token)
         assert(ok, "Could not fire property button signal: " .. signalName)
         if step == 1 then state.FirstSent = true else state.SecondSent = true end
         H:SetStage(step == 1 and "Selecting property" or "Waiting for the plot", step == 1 and 0.13 or 0.15)
-        H:Log(string.format("Property step %d - %s - attempt %d", step, signalName, state.Attempts[step]))
+        H:Log(string.format("Property step %d - %s - attempt %d", step, signalName, state.Attempts[step]),"DEBUG")
     end
     return service, state
 end
@@ -492,7 +586,7 @@ function H:LoadSlot(token)
     until false
     self.LoadReceipt = {Slot=slot, Plot=loadedPlot, JobId=game.JobId}
     if self:KnownSlot() == nil then
-        self:Log("Slot indicator unavailable - confirmed property belongs to you after the load sequence")
+        self:Log("Slot indicator unavailable - confirmed property belongs to you after the load sequence","DEBUG")
     end
     self:SetStage("Slot loaded", 0.18, "Owned plot confirmed")
     local character, _, root = self:Character()
@@ -524,7 +618,7 @@ function H:FindMill(token, plot)
         end
         if selected then
             self.SelectedMill=selected
-            self:Log("Sawmill selected automatically - "..selected:GetFullName())
+            self:Log("Sawmill selected automatically - "..selected:GetFullName(),"INFO","Sawmill selected")
             return selected,selectedInlet
         end
         token:Sleep(0.3)
@@ -649,7 +743,7 @@ function H:ScanReady(token)
             -- quiet window. ScanWait is a deadline, never an unconditional sleep.
             if regions > 0 and ready > 0 and os.clock() - stableSince >= (#matches > 0 and 0.6 or 2)
                 and (#matches > 0 or os.clock() - started >= 4) then
-                self:Log(string.format("Scan complete - %.2fs / %d trees checked", os.clock()-started, ready))
+                self:Log(string.format("Scan complete - %.2fs / %d trees checked", os.clock()-started, ready),"DEBUG")
                 if self.Counts.IgnoredSmall>0 then self:Log("Trees below 4 studs3 ignored - "..self.Counts.IgnoredSmall) end
                 return matches
             end
@@ -714,7 +808,7 @@ function H:Chop(entry, tool, stats, token, checkpoint)
         token:Check()
         local found=self:FindFelledLog(cut)
         if found then
-            self:Log(string.format("Felled wood confirmed - %d strikes / %.1fs",cut.Strikes,os.clock()-cut.Started))
+            self:Log(string.format("Felled wood confirmed - %d strikes / %.1fs",cut.Strikes,os.clock()-cut.Started),"INFO","Tree cut")
             cut.Result=found
             return found
         end
@@ -746,7 +840,7 @@ function H:Chop(entry, tool, stats, token, checkpoint)
             cut.Strikes,tostring(tree.Parent~=nil),tostring(trunk.Parent~=nil),tostring(rootCut),
             owner==Player and "LocalPlayer" or "Unowned",cut.Candidates or 0)
         self.CutDiagnostic="Cut diagnostic - "..cut.Kind.."\n"..cut.Status
-        if os.clock()>=nextStatus then self:Log("Cut progress - "..cut.Status) nextStatus=os.clock()+10 end
+        if os.clock()>=nextStatus then self:Log("Cut progress - "..cut.Status,"DEBUG") nextStatus=os.clock()+10 end
         -- Poll independently from the axe cooldown so delayed ownership fields
         -- and model reparenting are observed before another strike is sent.
         token:Sleep(0.1)
@@ -781,7 +875,7 @@ function H:BringTreeToBase(log, plot, token)
     local target = CFrame.new(center.Position.X, center.Position.Y + size.Y/2 + 0.1, center.Position.Z)
         * relative:Inverse()
     self:Move(log, target, token)
-    self:Log("Felled tree delivered to your plot before Modwood")
+    self:Log("Felled tree delivered to your plot before Modwood","INFO","Tree delivered")
 end
 function H:ModwoodParts(log)
     local sections, root, candidates, duplicate = {}, nil, {}, false
@@ -901,7 +995,7 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
         for _, model in ipairs(playerModels:GetChildren()) do state.BeforeOutput[model]=true end
         checkpoint.Modwood = state
         self:Log(string.format("Modwood selected - leaf %s / parent %s / %s",
-            tostring(value(leaf,"ID")),tostring(value(parent,"ID")),mill.Name))
+            tostring(value(leaf,"ID")),tostring(value(parent,"ID")),mill.Name),"DEBUG")
     end
     if state.SourceRevision~=2 then
         state.SourceRevision=2
@@ -918,14 +1012,12 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
     local disposalFrame=CFrame.new(315,5,85.4999924)
     local character,_,avatar=self:Character()
     local avatarFrame,avatarAnchored=avatar.CFrame,avatar.Anchored==true
-    local hovering=false
     local function releaseHover()
         if avatar.Parent then avatar.Anchored=avatarAnchored end
-        hovering=false
     end
     local function moveAvatar(frame)
         self:Teleport(frame)
-        avatar.Anchored=true hovering=true
+        avatar.Anchored=true
     end
     token:Finally(function()
         releaseHover()
@@ -1061,7 +1153,7 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
                     end
                     assert(#state.TransformedSections>0,"Modwood - replacement log has no wood sections")
                     state.Phase="Output"
-                    self:Log("Modwood transformation detected - new owned log")
+                    self:Log("Modwood transformation detected - new owned log","INFO","Wood accepted")
                     break
                 end
             else candidate=nil candidateSince=nil end
@@ -1095,7 +1187,7 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
         assert(state.Phase=="Output","Modwood - trigger timed out without a matching new owned log")
     end
     if state.Phase=="Output" then
-        self:Log("Modwood - branch accepted; waiting for sawmill output")
+        self:Log("Modwood - branch accepted; waiting for sawmill output","DEBUG")
         self:Teleport(inlet.CFrame+Vector3.new(0,4,8))
     end
     self:SetStage("Modwood - waiting for sawmill output",0.78,"Waiting for finished planks")
@@ -1235,7 +1327,7 @@ function H:SendWebhook(title, description, token, receipt)
         status = tonumber(response.StatusCode or response.Status)
     end
     assert(status and status >= 200 and status < 300, "Webhook failed with HTTP " .. tostring(status))
-    self:Log("Webhook delivered")
+    self:Log("Webhook delivered","DEBUG")
 end
 function H:TryWebhook(title, description, token, receipt)
     local ok, err = pcall(self.SendWebhook, self, title, description, token, receipt)
@@ -1517,6 +1609,7 @@ function H:Start()
 end
 function H:Stop()
     self.Running=false self.Generation=self.Generation+1
+    self.HopUncertain=false self.PendingTeleportTarget=nil
     self:Persist(false)
     if self.ActiveToken then self.ActiveToken:Clean() end
     if self.Alive then self:SetStage("Stopping",self.Progress,self.HopAttempt and "A teleport already sent cannot be recalled" or "Cleaning up the current task") end
@@ -1524,6 +1617,7 @@ end
 function H:Destroy()
     if not self.Alive then return end
     self:Stop() self.Alive=false
+    if self.AntiAfkConnection then self.AntiAfkConnection:Disconnect() self.AntiAfkConnection=nil end
     if self.Worker then pcall(task.cancel,self.Worker) end
     for _,c in ipairs(self.Connections) do c:Disconnect() end
     if self.ProgressTween then self.ProgressTween:Cancel() end
@@ -1604,12 +1698,12 @@ round(header,12)
 new("UIGradient","TitleWash",{Color=ColorSequence.new(P.Accent:Lerp(P.Background,0.91),P.Purple:Lerp(P.Background,0.95))},header)
 local title=label(header,"WindowTitle","Spooky Hunter",UDim2.fromOffset(56,11),UDim2.new(1,-195,0,21),15)
 title.Font=Enum.Font.GothamBold
-label(header,"WindowSubtitle","MIDNIGHT 1.3.0",UDim2.fromOffset(56,34),UDim2.new(1,-195,0,12),9,P.Muted)
+label(header,"WindowSubtitle","MIDNIGHT",UDim2.fromOffset(56,34),UDim2.new(1,-195,0,12),9,P.Muted)
 local divider=new("Frame","HeaderDivider",{Position=UDim2.fromOffset(20,58),Size=UDim2.new(1,-40,0,1),
     BorderSizePixel=0,BackgroundColor3=P.Accent,BackgroundTransparency=0.72},shell)
 new("UIGradient","DividerTint",{Color=ColorSequence.new(P.Accent,P.Purple)},divider)
 local content=new("Frame","HuntPage",{Position=UDim2.fromOffset(20,116),Size=UDim2.new(1,-40,1,-134),BackgroundTransparency=1},shell)
-local stage=label(content,"Stage","Ready to hunt",UDim2.fromOffset(0,0),UDim2.new(1,-76,0,24),18) stage.Font=Enum.Font.GothamBold
+local stage=label(content,"Stage","Ready to hunt",UDim2.fromOffset(0,0),UDim2.new(1,0,0,24),18) stage.Font=Enum.Font.GothamBold
 local detail=label(content,"StageDetail","Spooky and Sinister",UDim2.fromOffset(0,28),UDim2.new(1,0,0,29),11,P.Muted)
 detail.TextWrapped=true detail.TextTruncate=Enum.TextTruncate.AtEnd detail.TextYAlignment=Enum.TextYAlignment.Top
 local rail=new("Frame","ProgressRail",{Position=UDim2.fromOffset(0,65),Size=UDim2.new(1,0,0,3),BackgroundColor3=P.Raised,BorderSizePixel=0},content) round(rail,3)
@@ -1627,11 +1721,8 @@ local function treeCard(name,text,position,color)
 end
 local spooky,spookyVolume=treeCard("Spooky","Spooky",UDim2.fromOffset(0,86),P.Accent)
 local neon,neonVolume=treeCard("Neon","Sinister",UDim2.new(0.5,5,0,86),P.Purple)
-local stageTimer=label(content,"StageTimer","00:00",UDim2.new(1,-72,0,3),UDim2.fromOffset(72,18),10,P.Muted)
-stageTimer.TextXAlignment=Enum.TextXAlignment.Right
 local statusChip=label(header,"StatusChip","READY",UDim2.new(1,-146,0,20),UDim2.fromOffset(92,20),10,P.Accent)
 statusChip.TextXAlignment=Enum.TextXAlignment.Right
-local stats=label(content,"SessionStats","",UDim2.fromOffset(0,168),UDim2.new(1,0,0,18),10,P.Muted)
 local startButton=button(content,"StartHunt","Start hunt",UDim2.new(0,0,1,-36),UDim2.new(0.68,-5,0,36),function() H:Start() end,true)
 button(content,"StopHunt","Stop",UDim2.new(0.68,5,1,-36),UDim2.new(0.32,-5,0,36),function() H:Stop() end)
 local activityPage=new("Frame","ActivityPage",{Position=content.Position,Size=content.Size,Visible=false,BackgroundTransparency=1},shell)
@@ -1641,14 +1732,14 @@ local scroll=new("ScrollingFrame","ActivityViewport",{Position=UDim2.fromOffset(
     ScrollBarThickness=2,ScrollBarImageColor3=Color3.fromRGB(112,117,128),ScrollBarImageTransparency=0.45},activityPage) round(scroll,8)
 local followLog=true
 local activity=label(scroll,"ActivityLog","",UDim2.fromOffset(11,9),UDim2.new(1,-26,0,0),11,P.Muted)
-activity.Font=Enum.Font.Code activity.AutomaticSize=Enum.AutomaticSize.Y activity.TextWrapped=true activity.TextTruncate=Enum.TextTruncate.None
+activity.Font=Enum.Font.Gotham activity.AutomaticSize=Enum.AutomaticSize.Y activity.TextWrapped=true activity.TextTruncate=Enum.TextTruncate.None
 activity.TextYAlignment=Enum.TextYAlignment.Top
 local followButton
-followButton=button(activityPage,"FollowActivity","Follow",UDim2.new(1,-137,0,0),UDim2.fromOffset(65,27),function()
+followButton=button(activityPage,"FollowActivity","Follow",UDim2.new(1,-157,0,0),UDim2.fromOffset(60,27),function()
     followLog=not followLog followButton.Text=followLog and "Follow" or "Paused"
 end)
-button(activityPage,"CopyActivity","Copy",UDim2.new(1,-64,0,0),UDim2.fromOffset(64,27),function()
-    local text=string.format("Spooky Hunter 1.3.0\nServer: %s\nSlot: %d\nRecent servers: %d/50\nPending wood: %d\n\n",
+button(activityPage,"CopyActivity","Copy report",UDim2.new(1,-91,0,0),UDim2.fromOffset(91,27),function()
+    local text=string.format("Spooky Hunter 1.3.1\nServer: %s\nSlot: %d\nRecent servers: %d/50\nPending wood: %d\n\n",
         game.JobId,H.Config.Slot,#H.ServerHistory,#H.PendingWood)..table.concat(H.Logs,"\n")
     if H.CutDiagnostic then text=text.."\n\n"..H.CutDiagnostic end
     if H.ModwoodDiagnostic then text=text.."\n\n"..H.ModwoodDiagnostic end
@@ -1707,12 +1798,23 @@ field("Save slot (1-6)","Slot",true)
 field("Discord webhook","Webhook",false,true)
 local mode=settingsRow("ProcessingMode",46)
 local modeButton
-modeButton=button(mode,"ModeToggle",H.Config.FullCycle and "Full cycle - experimental Modwood" or "Search only",
+modeButton=button(mode,"ModeToggle",H.Config.FullCycle and "Full harvest" or "Search only",
     UDim2.fromOffset(8,7),UDim2.new(1,-16,0,32),function()
         if H.Busy then return end
         H.Config.FullCycle=not H.Config.FullCycle
-        modeButton.Text=H.Config.FullCycle and "Full cycle - experimental Modwood" or "Search only"
+        modeButton.Text=H.Config.FullCycle and "Full harvest" or "Search only"
         H:Persist(false)
+    end)
+local idleRow=settingsRow("AntiAfkRow",44)
+label(idleRow,"AntiAfkLabel","Anti-AFK",UDim2.fromOffset(10,10),UDim2.new(1,-100,0,22),12)
+local idleButton
+idleButton=button(idleRow,"AntiAfkToggle",H.Config.AntiAfk and "On" or "Off",
+    UDim2.new(1,-76,0,8),UDim2.fromOffset(66,28),function()
+        H:SetAntiAfk(not H.Config.AntiAfk)
+        idleButton.Text=H.Config.AntiAfk and "On" or "Off"
+        local target=(H.Running and H.HopAttempt and H.HopAttempt.Id) or (H.HopUncertain and H.PendingTeleportTarget)
+        local ok,err=H:Persist(target~=nil,target)
+        if not ok then H:Log(err,"WARNING") end
     end)
 local historyRow=settingsRow("RecentServers",44)
 local historyLabel=label(historyRow,"HistoryCount","Recent servers - 0 / 50",UDim2.fromOffset(10,10),UDim2.new(1,-88,0,22),11,P.Muted)
@@ -1789,8 +1891,6 @@ H:Connect(S.RunService.RenderStepped,function(dt)
     tick=tick+dt if tick<0.25 then return end tick=0
     local viewport=gui.AbsoluteSize
     scale.Scale=math.min(1,math.max(0.35,(viewport.X-24)/500),math.max(0.35,(viewport.Y-24)/root.Size.Y.Offset))
-    stats.Text=string.format("%s  -  %d servers  -  %d planks  -  %d skipped",duration(os.time()-H.StartedAt),H.Stats.Servers,H.Stats.Planks,H.Stats.Skipped)
-    stageTimer.Text=H.Running and duration(os.clock()-(H.StageStarted or os.clock())):sub(4) or ""
     statusChip.Text=H.Running and "RUNNING" or (H.NeedsAttention and "ATTENTION" or "READY")
     historyLabel.Text="Recent servers - "..#H.ServerHistory.." / 50"
 end)
@@ -1798,7 +1898,8 @@ H:Connect(activity:GetPropertyChangedSignal("AbsoluteSize"),function()
     if followLog then scroll.CanvasPosition=Vector2.new(0,math.max(0,(activity.AbsoluteSize.Y-scroll.AbsoluteSize.Y+18)/math.max(scale.Scale,0.01))) end
 end)
 if H.ConfigWarning then H:Log(H.ConfigWarning,"WARNING") end
-H:Log("Ready - settings are saved locally. Right Shift toggles the interface.")
+H:Log("Ready")
+H:SetAntiAfk(H.Config.AntiAfk)
 if H.RecoveredSession then
     H:Log("Unfinished wood recovered from the previous script - use Review / retry")
     H.UI.Start.Text="Review / retry"
