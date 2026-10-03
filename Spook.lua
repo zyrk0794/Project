@@ -764,7 +764,7 @@ function H:Scan(token)
                         end
                     end
                     if volume<4 then counts.IgnoredSmall=counts.IgnoredSmall+1 end
-                    if trunk and volume>=20 then
+                    if trunk and volume>=40 then
                         table.insert(matches, { Model = model, Trunk = trunk, Kind = kind, Volume = volume })
                         counts[kind] = counts[kind] + 1 counts[kind .. "Volume"] = counts[kind .. "Volume"] + volume
                     end
