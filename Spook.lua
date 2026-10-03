@@ -1,6 +1,6 @@
 --[[
-    Midnight Spooky Hunter 1.2.1 - Lumber Tycoon 2
-    October 2, 2026. Standalone client script; no UI-library download required.
+    Midnight Spooky Hunter 1.3.0 - Lumber Tycoon 2
+    October 3, 2026. Standalone client script; no UI-library download required.
     Modwood is an experimental reconstruction of the supplied Dark X source.
     Unconfirmed wood is preserved; other available trees can still be attempted.
     Use the companion loader or set Script URL for continuation after a hop.
@@ -26,7 +26,7 @@ local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local FILE = "MidnightSpookyHunter.json"
 local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 15, ScanWait = 12,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true }
-local H = { Alive = true, Running = false, Busy = false, Connections = {}, Logs = {},
+local H = { Version = "1.3.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -503,19 +503,33 @@ function H:LoadSlot(token)
     end)
     return loadedPlot
 end
-function H:FindMill(token)
-    local deadline = os.clock() + 20
+function H:FindMill(token, plot)
+    local deadline=os.clock()+20
+    self:SetStage("Selecting your sawmill",0.46,"Looking for an owned Sawmill4L")
     repeat
-        local models = S.Workspace:FindFirstChild("PlayerModels")
-        for _, model in ipairs(models and models:GetChildren() or {}) do
-            if model:IsA("Model") and owned(model) and (model.Name == "Sawmill4L" or value(model,"ItemName") == "Sawmill4L") then
-                local inlet = model:FindFirstChild("Particles")
-                if inlet and inlet:IsA("BasePart") then return model, inlet end
+        token:Check()
+        local models=S.Workspace:FindFirstChild("PlayerModels")
+        local selected, selectedInlet, distance
+        local center=plot and self:PlotCenter(plot).Position
+        for _,model in ipairs(models and models:GetChildren() or {}) do
+            if model:IsA("Model") and owned(model) and (model.Name=="Sawmill4L" or value(model,"ItemName")=="Sawmill4L") then
+                local inlet=model:FindFirstChild("Particles")
+                local settings=model:FindFirstChild("Settings")
+                local x,z=value(settings,"DimX"),value(settings,"DimZ")
+                if inlet and inlet:IsA("BasePart") and finite(x) and finite(z) and x>0 and z>0 then
+                    local d=center and (inlet.Position-center).Magnitude or 0
+                    if not selected or d<distance then selected,selectedInlet,distance=model,inlet,d end
+                end
             end
         end
+        if selected then
+            self.SelectedMill=selected
+            self:Log("Sawmill selected automatically - "..selected:GetFullName())
+            return selected,selectedInlet
+        end
         token:Sleep(0.3)
-    until os.clock() >= deadline
-    error("No owned Sawmill4L with a Particles inlet in this slot", 0)
+    until os.clock()>=deadline
+    error("No ready owned Sawmill4L - check its Particles inlet and DimX/DimZ settings",0)
 end
 function H:AxeStats(tool, kind)
     local definitions = S.ReplicatedStorage:FindFirstChild("AxeClasses")
@@ -530,24 +544,23 @@ function H:AxeStats(tool, kind)
     if finite(stats.Damage) and stats.Damage > 0 and finite(stats.SwingCooldown) and stats.SwingCooldown > 0 then return stats end
 end
 function H:FindAxe(kind)
-    local character = Player.Character
-    for _, tool in ipairs(character and character:GetChildren() or {}) do
-        if tool:IsA("Tool") then
-            local stats = self:AxeStats(tool, kind)
-            if stats then return tool, stats end
-        end
-    end
-    local best, bestStats, score = nil, nil, -1
-    local backpack = Player:FindFirstChildOfClass("Backpack")
-    for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
-        if tool:IsA("Tool") then
-            local stats = self:AxeStats(tool, kind)
-            if stats and stats.Damage / stats.SwingCooldown > score then
-                best, bestStats, score = tool, stats, stats.Damage / stats.SwingCooldown
+    local character=Player.Character
+    local backpack=Player:FindFirstChildOfClass("Backpack")
+    local best,bestStats,score=nil,nil,-1
+    for _,container in pairs({character,backpack}) do
+        for _,tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") then
+                local stats=self:AxeStats(tool,kind)
+                if stats then
+                    local rate=stats.Damage/stats.SwingCooldown
+                    if rate>score or (rate==score and tool.Parent==character) then
+                        best,bestStats,score=tool,stats,rate
+                    end
+                end
             end
         end
     end
-    return best, bestStats
+    return best,bestStats
 end
 function H:EnsureAxe(kind, token)
     token:Check()
@@ -563,8 +576,15 @@ function H:EnsureAxe(kind, token)
     end
     return tool, stats
 end
+function H:WoodVolume(model)
+    local volume=0
+    for _,part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") and part.Name=="WoodSection" then volume=volume+part.Size.X*part.Size.Y*part.Size.Z end
+    end
+    return volume
+end
 function H:Scan(token)
-    local matches, counts = {}, { Spooky = 0, SpookyNeon = 0, SpookyVolume = 0, SpookyNeonVolume = 0 }
+    local matches, counts = {}, { Spooky = 0, SpookyNeon = 0, SpookyVolume = 0, SpookyNeonVolume = 0, IgnoredSmall = 0 }
     local regions, inspected, ready = 0, 0, 0
     local snapshot, budgetStart = {}, os.clock()
     token:Check()
@@ -578,13 +598,14 @@ function H:Scan(token)
                 if model:IsA("Model") and rare(kind) and ownerField and ownerField:IsA("ObjectValue") and ownerField.Value == nil
                     and model:FindFirstChild("CutEvent") and not model:FindFirstChild("RootCut") then
                     local trunk, volume = nil, 0
-                    for _, section in ipairs(model:GetChildren()) do
+                    for _, section in ipairs(model:GetDescendants()) do
                         if section:IsA("BasePart") and section.Name == "WoodSection" then
                             volume = volume + section.Size.X * section.Size.Y * section.Size.Z
-                            if value(section,"ID") == 1 then trunk = section end
+                            if tonumber(value(section,"ID")) == 1 then trunk = section end
                         end
                     end
-                    if trunk then
+                    if volume<4 then counts.IgnoredSmall=counts.IgnoredSmall+1 end
+                    if trunk and volume>=4 then
                         table.insert(matches, { Model = model, Trunk = trunk, Kind = kind, Volume = volume })
                         counts[kind] = counts[kind] + 1 counts[kind .. "Volume"] = counts[kind .. "Volume"] + volume
                     end
@@ -629,6 +650,7 @@ function H:ScanReady(token)
             if regions > 0 and ready > 0 and os.clock() - stableSince >= (#matches > 0 and 0.6 or 2)
                 and (#matches > 0 or os.clock() - started >= 4) then
                 self:Log(string.format("Scan complete - %.2fs / %d trees checked", os.clock()-started, ready))
+                if self.Counts.IgnoredSmall>0 then self:Log("Trees below 4 studs3 ignored - "..self.Counts.IgnoredSmall) end
                 return matches
             end
         else stableSince = os.clock() end
@@ -636,35 +658,102 @@ function H:ScanReady(token)
         token:Sleep(0.25)
     until false
 end
-function H:Chop(entry, tool, stats, token)
-    local tree, trunk = entry.Model, entry.Trunk
-    assert(tree.Parent and trunk.Parent and value(tree,"Owner") == nil, "The selected tree is no longer available")
-    local logs = S.Workspace:FindFirstChild("LogModels") assert(logs, "LogModels missing")
-    local previous = {} for _, log in ipairs(logs:GetChildren()) do previous[log] = true end
-    local event = tree:FindFirstChild("CutEvent")
-    local proxy = self:Remote("Interaction", "RemoteProxy")
-    local origin = trunk.Position
-    self:Teleport(trunk.CFrame * CFrame.new(trunk.Size.X/2 + 4, -trunk.Size.Y/2 + 4, 0))
-    token:Sleep(0.4)
-    local deadline = os.clock() + self.Config.ChopTimeout
-    repeat
-        token:Check()
-        local found, distance = nil, math.max(80, trunk.Size.Y)
-        for _, log in ipairs(logs:GetChildren()) do
-            if not previous[log] and owned(log) and value(log,"TreeClass") == entry.Kind and partOf(log) then
-                local delta = (partOf(log).Position - origin).Magnitude
-                if delta < distance then found, distance = log, delta end
+function H:FindFelledLog(cut)
+    local logs=S.Workspace:FindFirstChild("LogModels")
+    local matches, identities={},{}
+    local candidates=logs and logs:GetChildren() or {}
+    if cut.Tree.Parent and not table.find(candidates,cut.Tree) then table.insert(candidates,cut.Tree) end
+    local ancestor=cut.Trunk.Parent and cut.Trunk:FindFirstAncestorOfClass("Model")
+    if ancestor and not table.find(candidates,ancestor) then table.insert(candidates,ancestor) end
+    for _, model in ipairs(candidates) do
+        if model:IsA("Model") and owned(model) and value(model,"TreeClass")==cut.Kind then
+            local distance, sameSection=math.huge,false
+            for _, section in ipairs(model:GetDescendants()) do
+                if section:IsA("BasePart") and section.Name=="WoodSection" then
+                    distance=math.min(distance,(section.Position-cut.Origin).Magnitude)
+                    if section==cut.Trunk then sameSection=true end
+                end
+            end
+            local inLogs=model.Parent==logs
+            local detached=inLogs and not model:FindFirstChild("RootCut")
+            if detached and distance<math.huge then
+                if sameSection then table.insert(identities,model)
+                elseif not cut.Previous[model] and distance<cut.Radius then table.insert(matches,model) end
             end
         end
-        if found then return found end
-        if tree.Parent and trunk.Parent and event.Parent and not tree:FindFirstChild("RootCut") then
-            assert(tool.Parent == Player.Character, "The equipped axe changed")
-            proxy:FireServer(event, {tool = tool, sectionId = 1, height = 0.3, faceVector = Vector3.new(1,0,0),
-                hitPoints = stats.Damage, cooldown = stats.SwingCooldown, cuttingClass = "Axe"})
+    end
+    cut.Candidates=#matches cut.IdentityMatches=#identities
+    if #identities==1 then return identities[1] end
+    if #identities==0 and #matches==1 then return matches[1] end
+    return nil
+end
+function H:FireAxe(proxy,event,payload)
+    -- Pasted text(7).txt and the public implementations use two explicit
+    -- arguments. The remote receiver is supplied only once here.
+    local ok,err=pcall(proxy.FireServer,proxy,event,payload)
+    if not ok then error("Axe request could not be sent - "..tostring(err),0) end
+end
+function H:Chop(entry, tool, stats, token, checkpoint)
+    local tree, trunk=entry.Model,entry.Trunk
+    assert(tree and trunk,"The selected tree has no recorded trunk")
+    local logs=S.Workspace:FindFirstChild("LogModels") assert(logs,"LogModels missing")
+    local cut=checkpoint and checkpoint.Cut
+    if not cut then
+        assert(tree.Parent and trunk.Parent and value(tree,"Owner")==nil,"The selected tree is no longer available")
+        cut={Tree=tree,Trunk=trunk,Kind=entry.Kind,Origin=trunk.Position,Radius=math.max(80,trunk.Size.Y),
+            Previous={},Strikes=0,Started=os.clock()}
+        for _, model in ipairs(logs:GetChildren()) do cut.Previous[model]=true end
+        if checkpoint then checkpoint.Cut=cut end
+    end
+    self.LastCut=cut
+    local proxy=self:Remote("Interaction","RemoteProxy")
+    local deadline=os.clock()+self.Config.ChopTimeout
+    local nextStrike, nextPosition, nextStatus=0,0,os.clock()+5
+    local detachedAt
+    repeat
+        token:Check()
+        local found=self:FindFelledLog(cut)
+        if found then
+            self:Log(string.format("Felled wood confirmed - %d strikes / %.1fs",cut.Strikes,os.clock()-cut.Started))
+            cut.Result=found
+            return found
         end
-        token:Sleep(math.clamp(stats.SwingCooldown, 0.1, 5))
-    until os.clock() >= deadline
-    error("Tree cut timed out - no matching owned log", 0)
+        local rootCut=tree:FindFirstChild("RootCut")~=nil
+        local detached=rootCut or not tree.Parent or not trunk.Parent
+        if detached and not detachedAt then detachedAt=os.clock() end
+        local owner=value(tree,"Owner")
+        assert(owner==nil or owner==Player,"Another player now owns the selected tree")
+        if not detached and owner==nil then
+            local event=tree:FindFirstChild("CutEvent")
+            assert(event,"The selected tree has no CutEvent")
+            assert(tool.Parent==Player.Character,"The equipped axe changed")
+            -- Keep the avatar at the lower trunk instead of letting gravity or
+            -- character motion leave it out of range during a long cut.
+            if os.clock()>=nextPosition then
+                self:Teleport(trunk.CFrame*CFrame.new(trunk.Size.X/2+4,-trunk.Size.Y/2+4,0))
+                if cut.Strikes==0 then token:Sleep(0.25) end
+                nextPosition=os.clock()+0.25
+            end
+            if os.clock()>=nextStrike then
+                token:Check()
+                cut.Strikes=cut.Strikes+1
+                self:FireAxe(proxy,event,{tool=tool,sectionId=1,height=0.3,faceVector=Vector3.new(-1,0,0),
+                    hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
+                nextStrike=os.clock()+math.clamp(stats.SwingCooldown,0.1,5)
+            end
+        end
+        cut.Status=string.format("strikes=%d; tree=%s; trunk=%s; RootCut=%s; owner=%s; candidates=%d",
+            cut.Strikes,tostring(tree.Parent~=nil),tostring(trunk.Parent~=nil),tostring(rootCut),
+            owner==Player and "LocalPlayer" or "Unowned",cut.Candidates or 0)
+        self.CutDiagnostic="Cut diagnostic - "..cut.Kind.."\n"..cut.Status
+        if os.clock()>=nextStatus then self:Log("Cut progress - "..cut.Status) nextStatus=os.clock()+10 end
+        -- Poll independently from the axe cooldown so delayed ownership fields
+        -- and model reparenting are observed before another strike is sent.
+        token:Sleep(0.1)
+    until os.clock()>=deadline and (not detachedAt or os.clock()-detachedAt>=8)
+    local found=self:FindFelledLog(cut)
+    if found then cut.Result=found return found end
+    error("Cut not confirmed - "..(cut.Status or "No matching owned log").." - copy Activity",0)
 end
 function H:Move(model, destination, token)
     assert(model.Parent and owned(model) and partOf(model), "Owned wood is no longer available")
@@ -814,11 +903,34 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
         self:Log(string.format("Modwood selected - leaf %s / parent %s / %s",
             tostring(value(leaf,"ID")),tostring(value(parent,"ID")),mill.Name))
     end
+    if state.SourceRevision~=2 then
+        state.SourceRevision=2
+        if state.Phase=="Ignited" then state.FreezeFrames=0 end
+    end
     assert(state.Mill==mill and state.Inlet==inlet, "Keep the original sawmill selected when retrying Modwood")
     self.ModwoodSelection = {Wood=state.Log, Sawmill=mill, Leaf=state.Leaf, Parent=state.Parent}
     log = state.Log
     local root, leaf, parent = state.Root, state.Leaf, state.Parent
     local drag = self:Remote("Interaction", "ClientIsDragging")
+    -- These three frames are explicitly present in Pasted text(7).txt.
+    local burnFrame=CFrame.new(-1665.86548,355.800415,1478.47742)
+    local stageFrame=CFrame.new(-904,150,-3396)
+    local disposalFrame=CFrame.new(315,5,85.4999924)
+    local character,_,avatar=self:Character()
+    local avatarFrame,avatarAnchored=avatar.CFrame,avatar.Anchored==true
+    local hovering=false
+    local function releaseHover()
+        if avatar.Parent then avatar.Anchored=avatarAnchored end
+        hovering=false
+    end
+    local function moveAvatar(frame)
+        self:Teleport(frame)
+        avatar.Anchored=true hovering=true
+    end
+    token:Finally(function()
+        releaseHover()
+        if Player.Character==character and avatar.Parent then pcall(self.Teleport,self,avatarFrame) end
+    end)
     local function checkMill()
         token:Check()
         assert(mill.Parent and owned(mill) and inlet.Parent, "The selected sawmill disappeared or changed owner")
@@ -830,11 +942,13 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
             part.AssemblyAngularVelocity=Vector3.zero
         end
     end
-    local function holdTree()
+    local function holdTree(frame)
         assert(log.Parent and owned(log), "The selected log disappeared or changed owner")
         drag:FireServer(log)
-        log:PivotTo(state.Pivot)
-        if root.Parent then root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero end
+        log:PivotTo(frame)
+        for _,part in ipairs(log:GetDescendants()) do
+            if part:IsA("BasePart") then part.AssemblyLinearVelocity=Vector3.zero part.AssemblyAngularVelocity=Vector3.zero end
+        end
     end
     local tool, stats
     if state.Phase~="Output" then tool,stats=self:EnsureAxe(state.Kind,token) end
@@ -843,18 +957,23 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
         local lavaFrame, lavaSize, restored = lava.CFrame, lava.Size, false
         local function restoreLava()
             if not restored then
+                if state.Phase=="Prepared" and parent.Parent and parent:FindFirstChild("LavaFire") then state.Phase="Ignited" end
                 if lava.Parent then lava.CFrame=lavaFrame lava.Size=lavaSize end
                 restored=true
             end
         end
         token:Finally(restoreLava)
         self:SetStage("Modwood - igniting parent section",0.52,"Waiting for LavaFire")
-        self:Teleport(CFrame.new(parent.Position + Vector3.new(0,8,12)))
-        local deadline=os.clock()+6
+        self:Teleport(root.CFrame+Vector3.new(5,3,0))
+        drag:FireServer(log)
+        token:Sleep(0.15)
+        checkpoint.AtBase=false
+        local deadline=os.clock()+math.min(15,self.Config.BurnTimeout)
         repeat
             checkMill()
             assert(parent.Parent and leaf.Parent and lava.Parent,"Modwood geometry changed before ignition")
-            holdTree()
+            holdTree(burnFrame)
+            moveAvatar(root.CFrame+Vector3.new(5,3,0))
             -- The source requests a zero-sized contact part. Roblox clamps its minimum size.
             lava.Size=Vector3.zero lava.CFrame=parent.CFrame
             token:Sleep(0.03)
@@ -866,50 +985,70 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
         state.Phase="Ignited"
     end
     if state.Phase=="Ignited" then
-        -- This local effect removal is present in the supplied routine. It is
-        -- not treated as proof that the server has removed the parent section.
+        -- Observe before the 30 transfer frames: separation can happen there.
+        state.ParentSeparated=state.ParentSeparated or parent.Parent~=state.ParentContainer
+        local ancestry=parent.AncestryChanged:Connect(function() state.ParentSeparated=true end)
+        token:Finally(function() ancestry:Disconnect() end)
         local fire=parent:FindFirstChild("LavaFire")
         if fire then fire:Destroy() end
-        self:SetStage("Modwood - stabilizing selected tree",0.57)
+        self:SetStage("Modwood - stabilizing selected tree",0.57,"Moving to the source staging position")
         while state.FreezeFrames<30 do
             checkMill()
-            if log.Parent and owned(log) then holdTree() end
+            holdTree(stageFrame)
+            moveAvatar(root.CFrame+Vector3.new(5,3,0))
             state.FreezeFrames=state.FreezeFrames+1
             token:Sleep(0.03)
         end
-        self:SetStage("Modwood - waiting for parent separation",0.6)
-        self:Teleport(state.ParentFrame+Vector3.new(0,4,6))
+        self:SetStage("Modwood - waiting for parent separation",0.6,"Removing the burned parent section")
+        if parent.Parent then moveAvatar(parent.CFrame+Vector3.new(0,4,6)) end
         local deadline=os.clock()+self.Config.BurnTimeout
-        while parent.Parent==state.ParentContainer do
+        while not state.ParentSeparated and parent.Parent==state.ParentContainer do
             checkMill()
             assert(leaf.Parent,"Modwood - retained branch was consumed")
             assert(os.clock()<deadline,"Modwood - parent did not separate before timeout")
-            holdTree() freeze(parent,state.ParentFrame) freeze(leaf,state.LeafFrame)
+            assert(log.Parent and owned(log),"Modwood - selected wood ownership changed")
+            drag:FireServer(log)
+            freeze(parent,disposalFrame)
+            drag:FireServer(log)
             token:Sleep(0.03)
         end
+        ancestry:Disconnect()
+        state.RootFrame=root.CFrame
         state.Phase="Separated"
     end
     if state.Phase=="Separated" then
         state.BeforeLogs={}
         for _, model in ipairs(logs:GetChildren()) do state.BeforeLogs[model]=true end
-        state.Phase="Triggering"
+        state.Phase="Feeding"
     end
-    if state.Phase=="Triggering" then
-        self:SetStage("Modwood - triggering conversion",0.7,"Holding the selected branch at the sawmill")
+    if state.Phase=="Triggering" then state.Phase="Feeding" end
+    if state.Phase=="Feeding" then
+        releaseHover()
+        self:SetStage("Modwood - triggering conversion",0.7,"Cutting the selected wood and feeding its branch")
         local proxy=self:Remote("Interaction","RemoteProxy")
         local deadline=os.clock()+self.Config.ChopTimeout
         local candidate, candidateSince
+        state.ObservedLogs=state.ObservedLogs or {}
+        local observed=logs.ChildAdded:Connect(function(model) state.ObservedLogs[model]=true end)
+        token:Finally(function() observed:Disconnect() end)
         repeat
             checkMill()
             -- Unlike the source's broad Owner-only listener, require a new log
             -- of the selected species close to this tree or this sawmill.
             local matches={}
-            for _, model in ipairs(logs:GetChildren()) do
-                local section=partOf(model)
-                if not state.BeforeLogs[model] and owned(model) and value(model,"TreeClass")==state.Kind and section then
-                    local closeToTree=(section.Position-state.RootFrame.Position).Magnitude<35
-                    local closeToMill=(section.Position-inlet.Position).Magnitude<35
-                    if closeToTree or closeToMill then table.insert(matches,model) end
+            local candidates={}
+            for _,model in ipairs(logs:GetChildren()) do candidates[model]=true end
+            for model in pairs(state.ObservedLogs) do candidates[model]=true end
+            for model in pairs(candidates) do
+                if model.Parent and not state.BeforeLogs[model] and owned(model) and value(model,"TreeClass")==state.Kind then
+                    local near=false
+                    for _,section in ipairs(model:GetDescendants()) do
+                        if section:IsA("BasePart") and section.Name=="WoodSection" then
+                            near=near or (section.Position-(state.LastCutPosition or state.RootFrame.Position)).Magnitude<60
+                                or (section.Position-inlet.Position).Magnitude<60 or section==leaf
+                        end
+                    end
+                    if near then table.insert(matches,model) end
                 end
             end
             assert(#matches<2,"Modwood - several replacement logs appeared; copy Activity before retrying")
@@ -926,32 +1065,42 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
                     break
                 end
             else candidate=nil candidateSince=nil end
-            if not candidate and log.Parent and root.Parent and leaf.Parent then
+            if log.Parent and root.Parent and leaf.Parent then
                 assert(owned(log),"Modwood - selected log ownership changed")
                 local ownerModel=leaf:FindFirstAncestorOfClass("Model")
                 while ownerModel and ownerModel~=log and not owned(ownerModel) do
                     ownerModel=ownerModel:FindFirstAncestorOfClass("Model")
                 end
                 assert(ownerModel and owned(ownerModel),"Modwood - retained branch ownership changed")
-                drag:FireServer(log) drag:FireServer(ownerModel)
+                -- The supplied routine feeds the retained branch while it
+                -- repeatedly cuts the original log. The newly-added LogModels
+                -- object is only the server acknowledgement of this operation.
+                drag:FireServer(log)
+                if ownerModel~=log then drag:FireServer(ownerModel) end
                 freeze(leaf,inlet.CFrame+Vector3.new(0.7,0,0))
                 self:Teleport(root.CFrame+Vector3.new(5,0,0))
+                state.LastCutPosition=root.Position
                 if not state.LastStrike or os.clock()-state.LastStrike>=math.clamp(stats.SwingCooldown,0.1,5) then
                     local event=log:FindFirstChild("CutEvent")
                     assert(event,"Modwood - selected log has no CutEvent")
                     assert(tool.Parent==Player.Character,"The equipped axe changed")
                     state.LastStrike=os.clock()
-                    proxy:FireServer(event,{tool=tool,sectionId=1,height=0.3,faceVector=Vector3.new(1,0,0),
+                    self:FireAxe(proxy,event,{tool=tool,sectionId=1,height=0.3,faceVector=Vector3.new(-1,0,0),
                         hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
                 end
             end
             token:Sleep(0.03)
         until os.clock()>=deadline
+        observed:Disconnect()
         assert(state.Phase=="Output","Modwood - trigger timed out without a matching new owned log")
+    end
+    if state.Phase=="Output" then
+        self:Log("Modwood - branch accepted; waiting for sawmill output")
+        self:Teleport(inlet.CFrame+Vector3.new(0,4,8))
     end
     self:SetStage("Modwood - waiting for sawmill output",0.78,"Waiting for finished planks")
     local deadline=os.clock()+self.Config.MillTimeout
-    local stableSince, outputVolume, outputParts
+    local stableSince, outputVolume, outputParts, outputDimensions
     repeat
         checkMill()
         for _, model in ipairs(playerModels:GetChildren()) do
@@ -976,17 +1125,20 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
         end
         countRemaining(state.OriginalSections)
         countRemaining(state.TransformedSections or {})
-        local volume,parts=0,0
+        local volume,parts,dimensions=0,0,{}
         for _, plank in ipairs(state.Outputs) do
             assert(plank.Parent and owned(plank),"Sawmill output disappeared or changed owner")
             for _, section in ipairs(plank:GetDescendants()) do
                 if section:IsA("BasePart") and section.Name=="WoodSection" then
                     parts=parts+1 volume=volume+section.Size.X*section.Size.Y*section.Size.Z
+                    table.insert(dimensions,string.format("%.5f,%.5f,%.5f",section.Size.X,section.Size.Y,section.Size.Z))
                 end
             end
         end
-        if volume~=outputVolume or parts~=outputParts then stableSince=os.clock() end
-        outputVolume,outputParts=volume,parts
+        table.sort(dimensions)
+        local signature=table.concat(dimensions,";")
+        if volume~=outputVolume or parts~=outputParts or signature~=outputDimensions then stableSince=os.clock() end
+        outputVolume,outputParts,outputDimensions=volume,parts,signature
         if #state.Outputs>0 and remaining==0 and volume>0 and stableSince and os.clock()-stableSince>2 then
             return state.Outputs
         end
@@ -1220,7 +1372,8 @@ function H:Run(token)
         plot=receipt.Plot
         token.Character=self:Character()
         for _,work in ipairs(self.PendingWood) do
-            if not work.Planks and not work.Modwood and (not work.Log or not work.Log.Parent or not owned(work.Log)) then
+            if work.Cut and not work.Log then work.Log=self:FindFelledLog(work.Cut) end
+            if not work.Planks and not work.Modwood and not work.Cut and (not work.Log or not work.Log.Parent or not owned(work.Log)) then
                 self.NeedsAttention=true
                 return "An interrupted cut has no confirmed owned log - inspect this server before continuing"
             end
@@ -1238,29 +1391,35 @@ function H:Run(token)
     end
     self.CanRecover=false
     local batchStarted, initialPlanks = os.clock(), self.Stats.Planks
-    local mill,inlet=self:FindMill(token)
+    local mill,inlet
     local center=self:PlotCenter(plot) self.StackHeight=0
     local processed, skipped = 0, 0
     for index,entry in ipairs(entries) do
         token:Check()
-        if entry.Work or (entry.Model.Parent and value(entry.Model,"Owner")==nil and not entry.Model:FindFirstChild("RootCut")) then
+        if entry.Work or (entry.Model.Parent and value(entry.Model,"Owner")==nil
+            and not entry.Model:FindFirstChild("RootCut") and self:WoodVolume(entry.Model)>=4) then
             local scope=self:Token(token)
             local work=entry.Work
             local log=work and work.Log
             local cutStarted=work~=nil
             local ok,result=pcall(function()
-                if not work then
+                if not work or (not work.Log and work.Cut) then
                     local tool,stats=self:EnsureAxe(entry.Kind,scope)
                     self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
-                    work={Kind=entry.Kind,Reason="Cut started"}
-                    table.insert(self.PendingWood,work)
+                    if not work then
+                        work={Kind=entry.Kind,Reason="Cut started"}
+                        table.insert(self.PendingWood,work)
+                    end
                     cutStarted=true self.Dirty=true
-                    log=self:Chop(entry,tool,stats,scope)
+                    local target=work.Cut and {Model=work.Cut.Tree,Trunk=work.Cut.Trunk,Kind=work.Kind} or entry
+                    log=self:Chop(target,tool,stats,scope,work)
                     work.Log=log self.Stats.Trees=self.Stats.Trees+1
                 end
                 if not work.Planks then
                     if not work.Modwood then
                         self:BringTreeToBase(log,plot,scope)
+                        work.AtBase=true
+                        mill,inlet=self:FindMill(scope,plot)
                         local supported, reason=self:WaitForModwood(log,scope)
                         if not supported then self:CaptureModwood(log,mill,reason) return reason end
                     else
@@ -1294,6 +1453,10 @@ function H:Run(token)
                     self:Log("Inventory or character needs attention before another tree can be cut","WARNING")
                     break
                 end
+                if not work.Log then
+                    self:Log("Cut is unconfirmed - stopping before another tree is targeted","WARNING")
+                    break
+                end
                 self:SetStage("Moving to the next tree",self.Progress,"Previous wood remains in this server")
                 scope=nil
             end
@@ -1305,7 +1468,14 @@ function H:Run(token)
     if self.Dirty then
         self.NeedsAttention=true
         self:TryWebhook("Harvest needs attention","Some wood could not be fully processed. Staying in this server; no completion claimed.",token)
-        return "Wood remains at your base - Retry resumes these tasks without cutting another tree"
+        local atBase, unconfirmed=0,0
+        for _,work in ipairs(self.PendingWood) do
+            if work.AtBase then atBase=atBase+1 end
+            if not work.Log and not work.Planks then unconfirmed=unconfirmed+1 end
+        end
+        if unconfirmed>0 then return "Cut not confirmed - Retry checks the same tree; no delivery confirmed" end
+        if atBase==#self.PendingWood then return "Wood remains at your base - Retry resumes the recorded tasks" end
+        return "Wood remains in this server - Retry resumes the recorded tasks"
     end
     if self.NeedsAttention then return "Equip a compatible inventory axe, then retry" end
     if processed>0 then
@@ -1434,7 +1604,7 @@ round(header,12)
 new("UIGradient","TitleWash",{Color=ColorSequence.new(P.Accent:Lerp(P.Background,0.91),P.Purple:Lerp(P.Background,0.95))},header)
 local title=label(header,"WindowTitle","Spooky Hunter",UDim2.fromOffset(56,11),UDim2.new(1,-195,0,21),15)
 title.Font=Enum.Font.GothamBold
-label(header,"WindowSubtitle","MIDNIGHT 1.2.1",UDim2.fromOffset(56,34),UDim2.new(1,-195,0,12),9,P.Muted)
+label(header,"WindowSubtitle","MIDNIGHT 1.3.0",UDim2.fromOffset(56,34),UDim2.new(1,-195,0,12),9,P.Muted)
 local divider=new("Frame","HeaderDivider",{Position=UDim2.fromOffset(20,58),Size=UDim2.new(1,-40,0,1),
     BorderSizePixel=0,BackgroundColor3=P.Accent,BackgroundTransparency=0.72},shell)
 new("UIGradient","DividerTint",{Color=ColorSequence.new(P.Accent,P.Purple)},divider)
@@ -1478,8 +1648,9 @@ followButton=button(activityPage,"FollowActivity","Follow",UDim2.new(1,-137,0,0)
     followLog=not followLog followButton.Text=followLog and "Follow" or "Paused"
 end)
 button(activityPage,"CopyActivity","Copy",UDim2.new(1,-64,0,0),UDim2.fromOffset(64,27),function()
-    local text=string.format("Spooky Hunter 1.2.1\nServer: %s\nSlot: %d\nRecent servers: %d/50\nPending wood: %d\n\n",
+    local text=string.format("Spooky Hunter 1.3.0\nServer: %s\nSlot: %d\nRecent servers: %d/50\nPending wood: %d\n\n",
         game.JobId,H.Config.Slot,#H.ServerHistory,#H.PendingWood)..table.concat(H.Logs,"\n")
+    if H.CutDiagnostic then text=text.."\n\n"..H.CutDiagnostic end
     if H.ModwoodDiagnostic then text=text.."\n\n"..H.ModwoodDiagnostic end
     for index,work in ipairs(H.PendingWood) do
         if work.Modwood then text=text.."\nTask "..index.." - Modwood phase: "..work.Modwood.Phase end
