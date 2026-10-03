@@ -24,7 +24,7 @@ local Queue = cap("queue_on_teleport", queue_on_teleport) or cap("queueontelepor
     or (type(synAPI) == "table" and synAPI.queue_on_teleport)
 local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local FILE = "MidnightSpookyHunter.json"
-local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 15, ScanWait = 12, LoadTimeout = 180, MetadataTimeout = 30,
+local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 8, ScanWait = 12, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
 local H = { Version = "1.3.6", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
@@ -764,7 +764,7 @@ function H:Scan(token)
                         end
                     end
                     if volume<4 then counts.IgnoredSmall=counts.IgnoredSmall+1 end
-                    if trunk and volume>=4 then
+                    if trunk and volume>=20 then
                         table.insert(matches, { Model = model, Trunk = trunk, Kind = kind, Volume = volume })
                         counts[kind] = counts[kind] + 1 counts[kind .. "Volume"] = counts[kind .. "Volume"] + volume
                     end
