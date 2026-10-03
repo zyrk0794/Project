@@ -1,8 +1,8 @@
 --[[
     Midnight UI Library
-    Version: 2.3.1
+    Version: 2.4.0
     Credits: Original implementation by OpenAI for this project.
-    Date: 2026-09-30
+    Date: 2026-10-03
     License: MIT
 
     Client-side Roblox Luau module with optional host capabilities.
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.3.1",
+    Version = "2.4.0",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -3013,6 +3013,11 @@ function Midnight:CreateWindow(options)
         Minimized = false,
         Destroyed = false,
         Keybind = keyCode(options.Keybind, Enum.KeyCode.RightShift),
+        Compact = options.Compact == true,
+        Resizable = options.Resizable ~= false,
+        SavePosition = options.SavePosition == true,
+        PositionChanged = options.OnPositionChanged,
+        DestroyCallback = options.OnDestroy,
         TabPosition = options.TabPosition == "Top" and "Top" or "Left",
     }, { __index = WindowMethods })
     local scope = window.Scope
@@ -3059,6 +3064,7 @@ function Midnight:CreateWindow(options)
     }, "Text")
     corner(title, 10)
     gradient(scope, title)
+    window.TitleBar = title
     local titleHit = button(scope, title, "", {
         Name = "TitleHit",
         Size = UDim2.new(1, -92, 1, 0),
@@ -3115,7 +3121,7 @@ function Midnight:CreateWindow(options)
         window:SetMinimized(not window.Minimized)
     end)
     scope:Connect(close.Activated, function()
-        window:SetVisible(false)
+        if options.DestroyOnClose then window:Destroy() else window:SetVisible(false) end
     end)
 
     window.Body = frame(scope, window.Shell, {
@@ -3162,6 +3168,7 @@ function Midnight:CreateWindow(options)
         ZIndex = 5,
     })
     icon(scope, window.ResizeHandle, "Resize", UDim2.fromOffset(9, 9), 13, "Muted")
+    window.ResizeHandle.Visible = window.Resizable
     window.Responsive = options.Responsive ~= false
     window.MobileReopen = button(scope, window.Gui, "", {
         Name = "MobileReopen",
@@ -3188,18 +3195,40 @@ function Midnight:CreateWindow(options)
         local y = start.Y.Scale * area.Y + start.Y.Offset + delta.Y
         x = math.clamp(x, half.X - 16, math.max(half.X - 16, area.X - half.X + 16))
         y = math.clamp(y, half.Y - 16, math.max(half.Y - 16, area.Y - half.Y + 16))
-        animate(scope, window.Root, { Position = UDim2.fromOffset(x, y) }, 0.15)
+        window.DragTarget = UDim2.fromOffset(x, y)
+        animate(scope, window.Root, { Position = window.DragTarget }, 0.15)
+    end, function()
+        window:SetPosition(window.DragTarget or window.Root.Position)
+        window.DragTarget = nil
     end)
     drag(scope, window.ResizeHandle, function()
         return window.FullSize
     end, function(_, delta, start)
-        window:SetSize(Vector2.new(start.X + delta.X * 2, start.Y + delta.Y * 2))
+        if window.Resizable then window:SetSize(Vector2.new(start.X + delta.X * 2, start.Y + delta.Y * 2)) end
     end)
     scope:Connect(window.Gui:GetPropertyChangedSignal("AbsoluteSize"), function()
         window:SetSize(window.RequestedSize or options.Size)
-        window.Root.Position = UDim2.fromScale(0.5, 0.5)
+        window:SetPosition(window:GetPosition(), true)
     end)
     window:SetSize(options.Size or UDim2.fromOffset(550, 400))
+    local remembered = window.Catalog.Settings.WindowPositions
+    remembered = type(remembered) == "table" and remembered[window.ConfigBase]
+    window:SetPosition(options.Position or (window.SavePosition and remembered) or UDim2.fromScale(0.5, 0.5), true)
+    if type(options.OnSettings) == "function" then
+        mark.Visible = false
+        titleHit.Position = UDim2.fromOffset(54, 0)
+        titleHit.Size = UDim2.new(1, -146, 1, 0)
+        window.TitleLabel.Position = UDim2.fromOffset(8, 13)
+        window.SubTitleLabel.Position = UDim2.fromOffset(8, 36)
+        window.TitleLabel.Size = UDim2.new(1, -16, 0, 23)
+        window.SubTitleLabel.Size = UDim2.new(1, -16, 0, 18)
+        local gear = button(scope, title, "", { Name = "SettingsGear",
+            Position = UDim2.fromOffset(14, 18), Size = UDim2.fromOffset(32, 32), ZIndex = 5 })
+        corner(gear, 8)
+        icon(scope, gear, "Settings", UDim2.fromOffset(7, 7), 18, "Muted")
+        hover(scope, gear, stroke(scope, gear, "Border", 0.9))
+        scope:Connect(gear.Activated, function() safe(options.OnSettings, window) end)
+    end
     installKeyboard(window)
 
     if options.Stars then
@@ -3254,11 +3283,59 @@ function WindowMethods:SetSize(size)
     end
     local maxWidth = math.max(220, area.X - 32)
     local maxHeight = math.max(180, area.Y - 32)
-    width = math.clamp(width, math.min(420, maxWidth), maxWidth)
-    height = math.clamp(height, math.min(300, maxHeight), maxHeight)
+    width = math.clamp(width, math.min(self.Compact and 280 or 420, maxWidth), maxWidth)
+    height = math.clamp(height, math.min(self.Compact and 220 or 300, maxHeight), maxHeight)
     self.FullSize = Vector2.new(width, height)
     self.Root.Size = UDim2.fromOffset(width + 32, (self.Minimized and 68 or height) + 32)
     self:_UpdateLayout()
+end
+
+-- Compact windows share the main window's theme, glow, controls and lifecycle.
+function Midnight:CreateCompactWindow(options)
+    options = table.clone(option(options))
+    options.Compact = true
+    options.TabPosition = "Top"
+    options.Size = options.Size or UDim2.fromOffset(500, 400)
+    if options.Resizable == nil then options.Resizable = false end
+    return self:CreateWindow(options)
+end
+
+function WindowMethods:GetPosition()
+    local area = self.Gui.AbsoluteSize
+    local position = self.Root.Position
+    return { X = (position.X.Scale * area.X + position.X.Offset) / math.max(area.X, 1),
+        Y = (position.Y.Scale * area.Y + position.Y.Offset) / math.max(area.Y, 1) }
+end
+
+function WindowMethods:SetPosition(position, silent)
+    if self.Destroyed then return self end
+    local area = self.Gui.AbsoluteSize
+    local x, y = area.X * 0.5, area.Y * 0.5
+    if typeof(position) == "UDim2" then
+        x = position.X.Scale * area.X + position.X.Offset
+        y = position.Y.Scale * area.Y + position.Y.Offset
+    elseif type(position) == "table" then
+        x = finite(position.X, 0.5) * area.X
+        y = finite(position.Y, 0.5) * area.Y
+    end
+    local halfX = math.min(self.FullSize.X / 2, area.X / 2)
+    local halfY = math.min((self.Minimized and 68 or self.FullSize.Y) / 2, area.Y / 2)
+    x = math.clamp(x, halfX, math.max(halfX, area.X - halfX))
+    y = math.clamp(y, halfY, math.max(halfY, area.Y - halfY))
+    local channels = self.Scope.Tweens[self.Root]
+    if channels and channels.Position then channels.Position:Cancel() channels.Position = nil end
+    self.Root.Position = UDim2.fromOffset(x, y)
+    if not silent then
+        local saved = { X = x / math.max(area.X, 1), Y = y / math.max(area.Y, 1) }
+        if self.SavePosition then
+            local settings = self.Catalog.Settings
+            settings.WindowPositions = type(settings.WindowPositions) == "table" and settings.WindowPositions or {}
+            settings.WindowPositions[self.ConfigBase] = saved
+            self:_SaveCatalog()
+        end
+        safe(self.PositionChanged, saved)
+    end
+    return self
 end
 
 function WindowMethods:_UpdateLayout()
@@ -3361,6 +3438,7 @@ function WindowMethods:Destroy()
     end
     self:SaveConfig()
     self.Destroyed = true
+    safe(self.DestroyCallback, self)
     releaseBindings(self)
     for flag, control in pairs(self.Controls) do
         if FlagOwners[flag] == control then
@@ -3529,6 +3607,7 @@ function WindowMethods:CreateTab(options)
 end
 
 WindowMethods.Tab = WindowMethods.CreateTab
+WindowMethods.CreatePage = WindowMethods.CreateTab
 
 local function row(container, height)
     assert(container.Scope.Alive, "Cannot add a control to a destroyed container")
@@ -3536,7 +3615,8 @@ local function row(container, height)
     local scope = Scope.new(container.Scope)
     local object = frame(scope, container.Content, {
         Name = "Object",
-        Size = UDim2.new(1, -6, 0, height),
+        Size = container.Columns and UDim2.new(1 / container.Columns, -8 * (container.Columns - 1) / container.Columns, 0, height)
+            or UDim2.new(1, -6, 0, height),
         LayoutOrder = container.Order,
     }, "Panel")
     corner(object, 8)
@@ -3654,6 +3734,46 @@ function ControlMethods:Destroy()
     end
     self.Scope:Destroy()
     self.Root:Destroy()
+end
+
+-- Fixed-height horizontal rows for compact dashboards.
+function ContainerMethods:Row(options)
+    options = option(options)
+    local item, scope, root = control(self, options, finite(options.Height, 48))
+    root.BackgroundTransparency = 1
+    item.Outline.Transparency = 1
+    local flow = layout(root, 8)
+    flow.FillDirection = Enum.FillDirection.Horizontal
+    return setmetatable({ Window = self.Window, Scope = scope, Root = root, Content = root,
+        Order = 0, Columns = math.clamp(math.floor(finite(options.Columns, 2)), 1, 4) }, { __index = ContainerMethods })
+end
+
+-- A custom surface retains scoped theme/connection cleanup and native layout.
+function ContainerMethods:Custom(options)
+    options = option(options)
+    local item, scope, root = control(self, options, math.max(1, finite(options.Height, 80)))
+    safe(options.Build, root, scope, self.Window)
+    return item
+end
+
+function ContainerMethods:Stat(options)
+    options = option(options)
+    local item, scope, root = control(self, options, 66)
+    label(scope, root, options.Title or "Statistic", { Name = "StatTitle",
+        Position = UDim2.fromOffset(12, 9), Size = UDim2.new(1, -74, 0, 20), TextSize = 12 })
+    local amount = label(scope, root, tostring(options.Value or 0), { Name = "StatValue",
+        Position = UDim2.new(1, -70, 0, 8), Size = UDim2.fromOffset(58, 32), TextSize = 24,
+        Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Right }, options.Token or "Accent")
+    local detail = label(scope, root, options.Description or "", { Name = "StatDetail",
+        Position = UDim2.fromOffset(12, 38), Size = UDim2.new(1, -24, 0, 18), TextSize = 11 }, "Muted")
+    function item:Set(value, description)
+        if not scope.Alive then return self end
+        self.Value = value
+        revealText(scope, amount, tostring(value))
+        if description ~= nil then revealText(scope, detail, tostring(description)) end
+        return self
+    end
+    return item
 end
 
 -- Sections -------------------------------------------------------------------
@@ -3886,7 +4006,7 @@ function ContainerMethods:Console(options)
         local lines = {}
         for _, entry in ipairs(self.Entries) do
             local prefix = entry.Time ~= "" and (entry.Time .. "  ") or ""
-            table.insert(lines, prefix .. string.upper(entry.Level) .. "  " .. entry.Text)
+            table.insert(lines, prefix .. (options.Compact and "" or (string.upper(entry.Level) .. "  ")) .. entry.Text)
         end
         return table.concat(lines, "\n")
     end
@@ -3941,7 +4061,7 @@ function ContainerMethods:Console(options)
         local textValue = tostring(text or "")
         local timeValue = tostring(stamp or (options.Timestamps and os.date("%H:%M:%S") or ""))
         local meta = frame(entryScope, entryRoot, { Name = "LogMetadata",
-            Size = UDim2.new(1, 0, 0, 15), BackgroundTransparency = 1 })
+            Size = UDim2.new(1, 0, 0, 15), BackgroundTransparency = 1, Visible = options.Compact ~= true })
         local dot = frame(entryScope, meta, { Name = "LevelIndicator",
             Position = UDim2.fromOffset(0, 5), Size = UDim2.fromOffset(4, 4),
             BackgroundTransparency = 0.2 }, levels[level])
@@ -3955,7 +4075,8 @@ function ContainerMethods:Console(options)
                 TextSize = 10, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Right }, "Muted")
         end
         local line = label(entryScope, entryRoot, textValue, {
-            Name = "LogMessage", Position = UDim2.fromOffset(11, 17), Size = UDim2.new(1, -11, 0, 0),
+            Name = "LogMessage", Position = UDim2.fromOffset(options.Compact and 0 or 11, options.Compact and 0 or 17),
+            Size = UDim2.new(1, options.Compact and -2 or -11, 0, 0),
             AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
             TextTruncate = Enum.TextTruncate.None, TextSize = 12,
             Font = Enum.Font.Code, RichText = false, TextTransparency = 0.16,
