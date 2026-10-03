@@ -78,7 +78,7 @@ local function configFrom(source)
     if type(source) ~= "table" then return result end
     for key in pairs(result) do if type(source[key]) == type(result[key]) then result[key] = source[key] end end
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
-    for key, limits in pairs({LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {12, 180}, ScanWait = {8, 120}, ChopTimeout = {15, 180},
+    for key, limits in pairs({LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {8, 180}, ScanWait = {8, 120}, ChopTimeout = {15, 180},
         BurnTimeout = {10, 120}, MillTimeout = {15, 180}, TaskTimeout = {300, 1800}}) do
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
     end
