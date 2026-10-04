@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.6.1 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.6.2 - Lumber Tycoon 2
     October 4, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -50,13 +50,13 @@ local Queue = cap("queue_on_teleport", queue_on_teleport) or cap("queueontelepor
     or (type(synAPI) == "table" and synAPI.queue_on_teleport)
 local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local FILE = "MidnightSpookyHunter.json"
-local MIN_TREE_VOLUME = 10
+local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
 local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait = 12,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.6.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.6.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -201,7 +201,7 @@ local stageTitles = {
 }
 local function shortError(message)
     message=cleanError(message)
-    if message:find("Modwood unavailable",1,true) then return "Switching to standard milling" end
+    if message:find("Modwood unavailable",1,true) then return "Modwood unavailable - changing server" end
     if message:find("Cut not confirmed",1,true) then return "Waiting for the cut to complete" end
     if message:find("no LavaFire",1,true) then return "Ignition not confirmed - changing server" end
     if message:find("whole-tree conversion",1,true) then return "Waiting for the remaining wood" end
@@ -1277,10 +1277,6 @@ function H:DismemberPlan(log)
     if #jobs==1 then jobs[1].Model=log jobs[1].Direct=true end
     return jobs
 end
-function H:SimpleTreeParts(log)
-    local jobs=self:DismemberPlan(log)
-    if jobs and #jobs==2 and jobs[1].Depth==1 then return jobs[2].Section,jobs[1].Section end
-end
 function H:WaitForModwood(log,token)
     self:SetStage("Checking felled tree",0.48)
     local deadline=os.clock()+self.Config.MetadataTimeout
@@ -1300,7 +1296,7 @@ function H:WaitForModwood(log,token)
                 local root,_,_,message=self:ModwoodParts(log)
                 if root then
                     if cap("firetouchinterest",firetouchinterest) then return true end
-                    return false,"Modwood unavailable - firetouchinterest missing; using standard milling"
+                    return false,"Modwood unavailable - firetouchinterest missing"
                 end
                 self:CaptureModwood(log,nil,message)
                 return false,message
@@ -1417,255 +1413,6 @@ function H:AcquireWood(model, part, token, diagnostic, finished)
     until false
 end
 
-function H:ClassicMill(log,mill,inlet,token,work)
-    assert(work,"Classic milling requires a saved task")
-    local logs=S.Workspace:FindFirstChild("LogModels")
-    local models=S.Workspace:FindFirstChild("PlayerModels")
-    assert(logs and models,"Wood containers are unavailable")
-    local state=work.Classic
-    if not state then
-        local jobs,reason=self:DismemberPlan(log)
-        assert(jobs,reason)
-        state={Phase="Splitting",Log=log,Kind=value(log,"TreeClass"),Mill=mill,Inlet=inlet,Outputs={},SeenOutput={},
-            Jobs=jobs}
-        work.Classic=state
-        self:Log("Using standard milling - "..#jobs.." sections")
-    end
-    assert(state.Mill==mill and state.Inlet==inlet,"Retry with the original sawmill")
-    local function check()
-        token:Check()
-        assert(mill and mill.Parent and owned(mill) and inlet and inlet.Parent,"The selected sawmill is unavailable")
-    end
-    check()
-    if state.Phase=="Splitting" then
-        local tool,stats=self:EnsureAxe(state.Kind,token)
-        for index,job in ipairs(state.Jobs) do
-            -- Small terminal stubs stay on the trunk and enter the mill with it.
-            -- Do not spend the entire cut timeout striking a 0.2-stud remnant.
-            if not job.Model and job.ID~=1 and livePart(job.Section) and job.Section.Size.Y<=0.35 then
-                job.SkippedStub=true job.Done=true
-            end
-            if not job.Model and not job.SkippedStub then
-                self:SetStage("Separating wood",0.5+0.1*index/#state.Jobs,"Piece "..index.." / "..#state.Jobs)
-                job.Height=job.Height or math.min(0.3,job.Section.Size.Y/2)
-                if not job.Before then
-                    job.Before={}
-                    for _,model in ipairs(logs:GetChildren()) do job.Before[model]=true end
-                    job.Origin=job.Section.Position job.Strikes=0
-                    job.OriginalSize=job.Section.Size
-                end
-                local deadline=os.clock()+self.Config.ChopTimeout
-                local candidate,since
-                repeat
-                    check()
-                    local matches={}
-                    local originalSize=job.OriginalSize or job.Section.Size
-                    local expectedHeight=math.max(0.02,(job.OriginalHeight or originalSize.Y)-job.Height)
-                    for _,model in ipairs(logs:GetChildren()) do
-                        if model~=state.Log and owned(model) and value(model,"TreeClass")==state.Kind then
-                            for _,part in ipairs(model:GetDescendants()) do
-                                if part:IsA("BasePart") and part.Name=="WoodSection" then
-                                    local same=part==job.Section
-                                    local shape=math.abs(part.Size.X-originalSize.X)<=math.max(.08,originalSize.X*.12)
-                                        and math.abs(part.Size.Z-originalSize.Z)<=math.max(.08,originalSize.Z*.12)
-                                        and part.Size.Y>=expectedHeight*.65 and part.Size.Y<=expectedHeight*1.35+.1
-                                    local near=(part.Position-job.Origin).Magnitude<math.max(25,originalSize.Y+8)
-                                    if same or (not job.Before[model] and shape and near) then
-                                        table.insert(matches,model) break
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    job.CandidateCount=#matches
-                    if #matches==1 then
-                        if candidate~=matches[1] then candidate=matches[1] since=os.clock() end
-                        if os.clock()-since>=0.35 then job.Model=candidate break end
-                    else candidate=nil since=nil end
-                    local section=job.Section
-                    if livePart(section) and under(section,state.Log) and section.Size.Y>job.Height+0.001 and #matches==0 then
-                        local source=section:FindFirstAncestorOfClass("Model")
-                        while source and not source:FindFirstChild("Owner") do source=source:FindFirstAncestorOfClass("Model") end
-                        assert(source and owned(source),"Selected wood changed owner")
-                        local event=source:FindFirstChild("CutEvent")
-                        assert(event,"The selected wood has no CutEvent")
-                        if tool.Parent~=Player.Character then tool,stats=self:EnsureAxe(state.Kind,token) end
-                        self:AcquireWood(source,section,token,job)
-                        self:Teleport(CFrame.lookAt(section.Position+Vector3.new(5,0,0),section.Position))
-                        if not job.Approached then token:Sleep(0.35) job.Approached=true end
-                        if not job.LastStrike or os.clock()-job.LastStrike>=math.max(0.1,stats.SwingCooldown)+0.05 then
-                            token:Check()
-                            assert(livePart(section) and under(section,source) and event.Parent==source,
-                                "Cut target changed while acquiring control")
-                            if section.Size.Y<=job.Height+0.001 then
-                                token:Sleep(0.1)
-                            else
-                            if tool.Parent~=Player.Character then tool,stats=self:EnsureAxe(state.Kind,token) end
-                            job.Origin=section.Position job.LastStrike=os.clock() job.Strikes=job.Strikes+1
-                            self:AttemptChop(source,tool,stats,token,section,job.Height)
-                            end
-                        end
-                    end
-                    token:Sleep(0.1)
-                until os.clock()>=deadline
-                if not job.Model then
-                    job.FailureSnapshot=string.format("Separation: section=%s; strikes=%d; candidates=%d; live=%s; height=%.3f; network=%s; distance=%s",
-                        tostring(job.ID),job.Strikes or 0,job.CandidateCount or 0,tostring(livePart(job.Section)==true),
-                        job.Section.Size.Y,tostring(job.NetworkStatus or "not requested"),tostring(job.AvatarDistance))
-                    error("Piece separation not confirmed - "..job.FailureSnapshot,0)
-                end
-                self:Log("Piece "..index.." separated")
-            end
-        end
-        state.Phase="Milling"
-    end
-    local drag=self:Remote("Interaction","ClientIsDragging")
-    for index,job in ipairs(state.Jobs) do
-        if not job.Done then
-            check()
-            local piece=job.Model
-            if not job.BeforeOutput then
-                assert(piece and piece.Parent and owned(piece),"A separated piece is missing")
-                job.Sections={}
-                for _,part in ipairs(piece:GetDescendants()) do
-                    if part:IsA("BasePart") and part.Name=="WoodSection" then table.insert(job.Sections,part) end
-                end
-                local mainCount,largest=0,-1
-                for _,part in ipairs(job.Sections) do
-                    if part.Size.Y>0.35 then mainCount=mainCount+1 end
-                    local volume=part.Size.X*part.Size.Y*part.Size.Z
-                    if volume>largest then largest=volume job.FeedSection=part end
-                end
-                assert(mainCount<=1 and job.FeedSection,"The separated piece still has large branches - wood kept for inspection")
-                job.BeforeOutput={} job.Outputs={}
-                for _,model in ipairs(models:GetChildren()) do job.BeforeOutput[model]=true end
-            end
-            self:SetStage("Milling wood",0.64+0.14*index/#state.Jobs,"Piece "..index.." / "..#state.Jobs)
-            local deadline=os.clock()+self.Config.MillTimeout
-            job.MillStarted=os.clock() job.FeedAttempts=0 job.NextFeed=0
-            -- Upgrade paused 1.3.3/1.3.4 tasks without recutting their pieces.
-            if not job.FeedSection then
-                for _,part in ipairs(job.Sections) do if livePart(part) and part.Size.Y>0.35 then job.FeedSection=part break end end
-            end
-            token:Finally(function()
-                if not job.Done then
-                    local ok,report=pcall(self.MillReport,self,state,job,index)
-                    if ok then job.FailureSnapshot=report end
-                end
-            end)
-            local signature,stableSince
-            local nextReport=0
-            repeat
-                check()
-                job.CandidateNotes={}
-                for _,model in ipairs(models:GetChildren()) do
-                    if not job.BeforeOutput[model] and #job.CandidateNotes<8 then
-                        local part=model:FindFirstChild("WoodSection",true)
-                        if part and part:IsA("BasePart") and (part.Position-inlet.Position).Magnitude<50 then
-                            table.insert(job.CandidateNotes,string.format("%s owner=%s kind=%s distance=%.1f",model.Name,
-                                owned(model) and "LocalPlayer" or tostring(value(model,"Owner")),tostring(value(model,"TreeClass")),(part.Position-inlet.Position).Magnitude))
-                        end
-                    end
-                    if not job.BeforeOutput[model] and not state.SeenOutput[model] and owned(model)
-                        and value(model,"TreeClass")==state.Kind then
-                        local part=model:FindFirstChild("WoodSection",true)
-                        if part and part:IsA("BasePart") and (part.Position-inlet.Position).Magnitude<30 then
-                            state.SeenOutput[model]=true
-                            table.insert(job.Outputs,model) table.insert(state.Outputs,model)
-                        end
-                    end
-                end
-                local remaining=0
-                for _,part in ipairs(job.Sections) do
-                    local ownerModel=part.Parent and part:FindFirstAncestorOfClass("Model")
-                    if livePart(part) and ownerModel and under(ownerModel,logs) and not state.SeenOutput[ownerModel] then remaining=remaining+1 end
-                end
-                job.InputRemaining=remaining
-                local dims={}
-                for _,output in ipairs(job.Outputs) do
-                    assert(output.Parent and owned(output),"Sawmill output is missing or changed owner")
-                    for _,part in ipairs(output:GetDescendants()) do
-                        if part:IsA("BasePart") and part.Name=="WoodSection" then
-                            table.insert(dims,string.format("%.5f,%.5f,%.5f",part.Size.X,part.Size.Y,part.Size.Z))
-                        end
-                    end
-                end
-                table.sort(dims)
-                local current=table.concat(dims,";")
-                if current~=signature then signature=current stableSince=os.clock() end
-                if #job.Outputs>0 and #dims>0 and remaining==0 and os.clock()-stableSince>=2 then
-                    job.Done=true job.FeedState="Complete" self:Log("Piece "..index.." milled") break
-                end
-                if #job.Outputs>0 then
-                    job.FeedState=remaining>0 and "Output started; input not consumed" or "Output stabilizing"
-                elseif remaining==0 then
-                    job.FeedState="Input consumed; waiting for output"
-                else
-                    job.FeedState="Waiting for sawmill acceptance"
-                end
-                if os.clock()>=nextReport then
-                    nextReport=os.clock()+10
-                    self:Log(string.format("Mill piece %d - %s; feeds=%d; input=%d; outputs=%d",index,job.FeedState,
-                        job.FeedAttempts,remaining,#job.Outputs),"DEBUG")
-                end
-                -- Bounded placement bursts, followed by a quiet processing window.
-                -- Never drag an input that already has a corresponding output.
-                if #job.Outputs==0 and remaining>0 and os.clock()>=job.NextFeed and job.FeedAttempts<3 then
-                    assert(under(piece,logs) and owned(piece),"The separated wood changed owner or container")
-                    local part=job.FeedSection
-                    assert(livePart(part) and under(part,piece),"The input section is no longer available")
-                    job.FeedAttempts=job.FeedAttempts+1
-                    self:Teleport(part.CFrame+Vector3.new(0,3,5))
-                    token:Sleep(0.25)
-                    local networkOwner=cap("isnetworkowner",isnetworkowner)
-                    local ready=networkOwner==nil
-                    job.NetworkStatus=ready and "Unavailable" or "False"
-                    for _=1,8 do
-                        check()
-                        if not livePart(part) or not under(piece,logs) then break end
-                        assert(owned(piece),"Input ownership changed during acquisition")
-                        drag:FireServer(piece)
-                        token:Sleep(0.1)
-                        if networkOwner then
-                            local ok,result=pcall(networkOwner,part)
-                            if not ok then job.NetworkStatus="Unavailable" ready=true
-                            else job.NetworkStatus=tostring(result) ready=result==true end
-                        end
-                        if ready then break end
-                    end
-                    if ready and livePart(part) and under(piece,logs) then
-                        work.AtBase=false
-                        local relative=piece:GetPivot():ToObjectSpace(part.CFrame)
-                        -- Standard milling uses the inlet center, without Modwood's offset.
-                        local destination=inlet.CFrame*relative:Inverse()
-                        for _=1,3 do
-                            check()
-                            if not livePart(part) or not under(piece,logs) then break end
-                            assert(owned(piece),"Input ownership changed during placement")
-                            piece:PivotTo(destination)
-                            part.AssemblyLinearVelocity=Vector3.zero part.AssemblyAngularVelocity=Vector3.zero
-                            self:Teleport(inlet.CFrame+Vector3.new(0,3,6))
-                            token:Sleep(0.1)
-                        end
-                    end
-                    job.NextFeed=os.clock()+8
-                end
-                token:Sleep(0.1)
-            until os.clock()>=deadline
-            if not job.Done then
-                job.FailureSnapshot=self:MillReport(state,job,index)
-                local reason
-                if #(job.Outputs or {})==0 then
-                    reason=(job.InputRemaining or 0)>0 and "input not accepted by the sawmill" or "input consumed but no matching plank found"
-                elseif (job.InputRemaining or 0)>0 then reason="plank detected but input remains"
-                else reason="plank dimensions did not stabilize" end
-                error("Piece "..index.." - "..reason.."; retry resumes this piece",0)
-            end
-        end
-    end
-    state.Phase="Complete"
-    return state.Outputs
-end
 function H:FindLava()
     local region = S.Workspace:FindFirstChild("Region_Volcano")
     assert(region, "Modwood - Region_Volcano missing")
@@ -2184,6 +1931,11 @@ function H:Hop(token)
 end
 function H:Run(token)
     if self.ServerExitReason then return self:LeaveStalledServer(token,self.ServerExitReason) end
+    for _,work in ipairs(self.PendingWood) do
+        if work.Classic then
+            return self:LeaveStalledServer(token,"Legacy milling task discarded - Modwood only")
+        end
+    end
     assert(game.PlaceId==13822889,"This script targets Lumber Tycoon 2 (13822889)")
     assert(not S.Workspace.StreamingEnabled,"Streaming is enabled - a complete tree scan cannot be confirmed")
     self:WaitForGame(token)
@@ -2261,20 +2013,16 @@ function H:Run(token)
                     work.Log=log self.Stats.Trees=self.Stats.Trees+1
                 end
                 if not work.Planks then
-                    if not work.Modwood and not work.Classic then
+                    if not work.Modwood then
                         self:BringTreeToBase(log,plot,scope)
                         work.AtBase=true
                         mill,inlet=self:FindMill(scope,plot)
                         local supported, reason=self:WaitForModwood(log,scope)
                         if not supported then
                             self:CaptureModwood(log,mill,reason)
-                            if self:DismemberPlan(log) then
-                                work.Planks=self:ClassicMill(log,mill,inlet,scope,work)
-                            else return reason end
+                            self.ServerExitReason=reason or "Modwood unavailable - incompatible tree"
+                            return self.ServerExitReason
                         end
-                    elseif work.Classic then
-                        mill,inlet=work.Classic.Mill,work.Classic.Inlet
-                        work.Planks=self:ClassicMill(log,mill,inlet,scope,work)
                     else
                         mill,inlet=work.Modwood.Mill,work.Modwood.Inlet
                         self.ServerExitReason="An unfinished Modwood attempt cannot be restarted"
@@ -2465,7 +2213,7 @@ H.Window=Window H.Gui=Window.Gui
 home=Window:CreatePage({Title="Hunt",Icon="Moon"})
 local activityPage=Window:CreatePage({Title="Activity",Icon="Terminal"})
 settings=Window:CreatePage({Title="Settings",Icon="Settings"})
-local progress=home:ProgressBar({Title="Ready",Description="Spooky and Sinister - 10 studs3 minimum",Default=0})
+local progress=home:ProgressBar({Title="Ready",Description="Spooky and Sinister - 40 studs3 minimum - Modwood only",Default=0})
 local cards=home:Row({Title="Rare trees",Height=66,Columns=2})
 local spooky=cards:Stat({Title="Spooky",Value=0,Description="0 studs3"})
 local sinister=cards:Stat({Title="Sinister",Value=0,Description="0 studs3",Token="Secondary"})
