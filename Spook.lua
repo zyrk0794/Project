@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.6.0 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.6.1 - Lumber Tycoon 2
     October 4, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -52,9 +52,11 @@ local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local FILE = "MidnightSpookyHunter.json"
 local MIN_TREE_VOLUME = 10
 local STALL_TIMEOUT = 180
-local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 8, ScanWait = 12, LoadTimeout = 180, MetadataTimeout = 30,
+local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait = 12,
+    ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
+    ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.6.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.6.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -112,10 +114,13 @@ local function configFrom(source)
     if type(source) ~= "table" then return result end
     for key in pairs(result) do if type(source[key]) == type(result[key]) then result[key] = source[key] end end
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
-    for key, limits in pairs({LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {8, 180}, ScanWait = {8, 120}, ChopTimeout = {15, 180},
+    for key, limits in pairs({LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {1, 180}, ScanWait = {2, 120},
+        ScanInterval = {0.05, 1}, ScanSettle = {0.1, 5}, EmptyScanDelay = {0.5, 15}, GameSettle = {0.5, 5},
+        ServerSearchTimeout = {3, 30}, ServerRetryDelay = {1, 60}, ChopTimeout = {15, 180},
         BurnTimeout = {10, 120}, MillTimeout = {15, 180}, TaskTimeout = {300, 1800}}) do
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
     end
+    result.ScanWait=math.max(result.ScanWait,math.max(result.ScanSettle,result.EmptyScanDelay)+result.ScanInterval)
     result.Webhook = cleanURL(result.Webhook):sub(1, 400)
     result.ScriptURL = cleanURL(result.ScriptURL):sub(1, 1000)
     return result
@@ -149,7 +154,8 @@ if restored then
     if type(restored.Departure)=="table" and restored.Departure.JobId==game.JobId then
         H.ServerExitReason=tostring(restored.Departure.Reason or "Modwood was interrupted")
     end
-    if restored.Version ~= H.Version and H.Config.HopDelay == 15 then H.Config.HopDelay = 8 end
+    -- Apply the requested one-second hop once, then retain future user edits.
+    if restored.TimingRevision~=1 then H.Config.HopDelay=1 end
     if type(restored.WindowPosition) == "table" and finite(restored.WindowPosition.X) and finite(restored.WindowPosition.Y) then
         H.WindowPosition = {X=math.clamp(restored.WindowPosition.X,0,1),Y=math.clamp(restored.WindowPosition.Y,0,1)}
     end
@@ -308,7 +314,7 @@ function H:Persist(resume, target)
     for id, untilTime in pairs(self.FailedServers) do
         if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
     end
-    local data = { Schema = 2, Version = self.Version, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
+    local data = { Schema = 2, Version = self.Version, TimingRevision = 1, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
         FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
         StartedAt = self.StartedAt, Resume = resume == true, Target = target, TicketTime = os.time(),
         Departure = self.ServerExitReason and {JobId=game.JobId,Reason=self.ServerExitReason} or nil }
@@ -441,8 +447,8 @@ function H:WaitForGame(token)
         if not changed then for i,object in ipairs(signature) do if lastSignature[i]~=object then changed=true break end end end
         if #missing==0 then
             if changed or not stableSince then stableSince=os.clock() end
-            if os.clock()-stableSince>=2 then
-                self.LoadDiagnostic="Game ready - required objects stable for 2 seconds"
+            if os.clock()-stableSince>=self.Config.GameSettle then
+                self.LoadDiagnostic=string.format("Game ready - required objects stable for %.2f seconds",self.Config.GameSettle)
                 self:Log(self.LoadDiagnostic,"DEBUG") return
             end
         else stableSince=nil end
@@ -451,7 +457,7 @@ function H:WaitForGame(token)
         self.LoadDiagnostic="Game loading - "..reason
         if reason~=lastReason then self:Log(self.LoadDiagnostic,"DEBUG") lastReason=reason end
         assert(os.clock()<deadline,"Game data is still loading - "..reason)
-        token:Sleep(0.25)
+        token:Sleep(math.min(0.25,self.Config.ScanInterval))
     until false
 end
 function H:Remote(folder, name, class)
@@ -925,15 +931,14 @@ function H:ScanReady(token)
             previous, previousRegions, previousCount, previousVolume = snapshot, regions, #matches, volume
             -- Positive results settle briefly; an empty result needs a longer
             -- quiet window. ScanWait is a deadline, never an unconditional sleep.
-            if regions > 0 and ready > 0 and os.clock() - stableSince >= (#matches > 0 and 0.6 or 2)
-                and (#matches > 0 or os.clock() - started >= 4) then
+            if regions > 0 and ready > 0 and os.clock() - stableSince >= (#matches > 0 and self.Config.ScanSettle or self.Config.EmptyScanDelay) then
                 self:Log(string.format("Scan complete - %.2fs / %d trees checked", os.clock()-started, ready),"DEBUG")
-                if self.Counts.IgnoredSmall>0 then self:Log("Trees below 4 studs3 ignored - "..self.Counts.IgnoredSmall) end
+                if self.Counts.IgnoredSmall>0 then self:Log("Trees below "..MIN_TREE_VOLUME.." studs3 ignored - "..self.Counts.IgnoredSmall,"DEBUG") end
                 return matches
             end
         else stableSince = os.clock() end
         assert(os.clock()-started < self.Config.ScanWait, "World scan did not stabilize - staying in this server")
-        token:Sleep(0.25)
+        token:Sleep(self.Config.ScanInterval)
     until false
 end
 function H:FindFelledLog(cut)
@@ -1351,7 +1356,7 @@ function H:BuildReport()
     if self.LastFailure then
         table.insert(lines,"Last failure (UTC): "..self.LastFailure.Time.."\nFailed stage: "..self.LastFailure.Stage.."\nReason: "..self.LastFailure.Reason)
     end
-    table.insert(lines,string.format("Minimum volume: %d studs3\nHop delay: %ds\nAutomatic recovery: %ss without confirmed progress\nAbandoned tasks: %d\nUI version: %s",
+    table.insert(lines,string.format("Minimum volume: %d studs3\nHop delay: %.2fs\nAutomatic recovery: %ss without confirmed progress\nAbandoned tasks: %d\nUI version: %s",
         MIN_TREE_VOLUME,self.Config.HopDelay,STALL_TIMEOUT,self.AbandonedTasks or 0,self.Midnight and self.Midnight.Version or "unavailable"))
     table.insert(lines,"Gameplay reference: supplied Ancestor script\nModwood policy: one attempt; leave on failure")
     if self.ServerExitReason then table.insert(lines,"Pending server departure: "..self.ServerExitReason) end
@@ -2087,7 +2092,7 @@ function H:Servers(token)
                 return token:Await(function()
                     local sent, r = pcall(Request,{Url=url,Method="GET"})
                     assert(sent and type(r)=="table","Server-list transport failed") return r
-                end,15)
+                end,self.Config.ServerSearchTimeout)
             end)
             if not ok and result == CANCEL then error(CANCEL, 0) end
             token:Check()
@@ -2108,7 +2113,7 @@ function H:Servers(token)
                 ids[server.id]=true table.insert(servers,server.id)
             end
         end
-        if #servers >= 15 or type(data.nextPageCursor)~="string" or data.nextPageCursor==""
+        if #servers > 0 or type(data.nextPageCursor)~="string" or data.nextPageCursor==""
             or cursors[data.nextPageCursor] then break end
         cursor=data.nextPageCursor cursors[cursor]=true token:Sleep(0.2)
     end
@@ -2151,8 +2156,8 @@ function H:Hop(token)
         servers=self:Servers(token)
         if #servers>0 then break end
         if round<3 then
-            self:SetStage("Waiting for available servers",0.98,"Refreshing in "..(round*10).."s")
-            token:Sleep(round*10)
+            self:SetStage("Waiting for available servers",0.98,"Refreshing in "..self.Config.ServerRetryDelay.."s")
+            token:Sleep(self.Config.ServerRetryDelay)
         end
     end
     assert(#servers>0,"No eligible server available - recent-server history was preserved")
@@ -2173,7 +2178,7 @@ function H:Hop(token)
         while not attempt.Error and os.clock()<deadline do token:Sleep(0.2) end
         self.HopAttempt=nil
         if not attempt.Error then self.HopUncertain=true error("Teleport outcome unknown - no second request sent",0) end
-        self:Log(attempt.Error,"WARNING") token:Sleep(4)
+        self:Log(attempt.Error,"WARNING") token:Sleep(self.Config.HopDelay)
     end
     error("No server could be joined",0)
 end
@@ -2487,6 +2492,7 @@ local function apply(key,newValue,control)
         H:Log("Invalid Discord webhook URL","WARNING") return
     end
     H.Config=candidate
+    if controls.ScanWait then controls.ScanWait:Set(tostring(candidate.ScanWait),true) end
     if key=="AntiAfk" then H:SetAntiAfk(candidate.AntiAfk) end
     local target=H.PendingTeleportTarget
     local saved,err=H:Persist(target~=nil,target)
@@ -2519,9 +2525,13 @@ for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"}}) do
 end
 local advanced=settings:Section({Title="Advanced",Collapsible=true,Collapsed=true})
 textSetting(advanced,"Script URL","ScriptURL",false)
-for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},{"Game loading timeout","LoadTimeout"},
-    {"Wood data timeout","MetadataTimeout"},{"Scan timeout","ScanWait"},{"Chop timeout","ChopTimeout"},
-    {"Burn timeout","BurnTimeout"},{"Sawmill timeout","MillTimeout"}}) do
+for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},
+    {"Scan interval (seconds)","ScanInterval"},{"Tree confirmation (seconds)","ScanSettle"},
+    {"Empty scan confirmation (seconds)","EmptyScanDelay"},{"Game stabilization (seconds)","GameSettle"},
+    {"Scan timeout (seconds)","ScanWait"},{"Server search timeout (seconds)","ServerSearchTimeout"},
+    {"Server search retry (seconds)","ServerRetryDelay"},{"Game loading timeout (seconds)","LoadTimeout"},
+    {"Wood data timeout (seconds)","MetadataTimeout"},{"Chop timeout (seconds)","ChopTimeout"},
+    {"Burn timeout (seconds)","BurnTimeout"},{"Sawmill timeout (seconds)","MillTimeout"}}) do
     textSetting(advanced,entry[1],entry[2],true)
 end
 settings:Button({Title="Reset window position",Callback=function() Window:SetPosition({X=0.5,Y=0.5}) end})
