@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.7.2 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.8.0 - Lumber Tycoon 2
     October 7, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -53,14 +53,16 @@ local FILE = "MidnightSpookyHunter.json"
 local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
 local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait = 12,
+    VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
     TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.7.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
-    Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
-    Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
+local H = { Version = "1.8.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+    Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
+    Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
+        FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
 H.JobId=game.JobId
 H.ModwoodAttempts={}
@@ -126,7 +128,7 @@ local function configFrom(source)
     if type(source) ~= "table" then return result end
     for key in pairs(result) do if type(source[key]) == type(result[key]) then result[key] = source[key] end end
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
-    for key, limits in pairs({LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {1, 180}, ScanWait = {2, 120},
+    for key, limits in pairs({VisitCooldownHours={0.1,168}, HarvestCooldownHours={0.1,336}, LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {1, 180}, ScanWait = {2, 120},
         ScanInterval = {0.05, 1}, ScanSettle = {0.1, 5}, EmptyScanDelay = {0.5, 15}, GameSettle = {0.5, 5},
         TrackerTimeout = {2, 10}, TrackerFreshness = {5, 60}, TrackerMinAge = {0, 10080}, TrackerBackoff = {30, 900},
         ServerSearchTimeout = {3, 30}, ServerRetryDelay = {1, 60}, ChopTimeout = {15, 180},
@@ -140,15 +142,96 @@ local function configFrom(source)
     result.TrackerToken = cleanURL(result.TrackerToken):sub(1, 128)
     return result
 end
-function H:RememberServer(id)
-    if type(id) ~= "string" or id == "" then return end
-    for i = #self.ServerHistory, 1, -1 do
-        if self.ServerHistory[i] == id then table.remove(self.ServerHistory, i) end
+function H:IsServerExcluded(id)
+    if id==game.JobId then return true end
+    local record=self.VisitRecords[id]
+    if not record then return false end
+    local untilTime=math.max((record.LastVisit or 0)+self.Config.VisitCooldownHours*3600,
+        record.HarvestedAt and record.HarvestedAt+self.Config.HarvestCooldownHours*3600 or 0)
+    return untilTime>os.time()
+end
+function H:RememberServer(id,restoring)
+    if type(id)~="string" or id=="" then return end
+    for i=#self.ServerHistory,1,-1 do
+        if self.ServerHistory[i]==id then table.remove(self.ServerHistory,i) end
     end
-    table.insert(self.ServerHistory, id)
-    while #self.ServerHistory > 50 do table.remove(self.ServerHistory, 1) end
-    table.clear(self.Visited)
-    for _, serverId in ipairs(self.ServerHistory) do self.Visited[serverId] = true end
+    table.insert(self.ServerHistory,id)
+    local record=self.VisitRecords[id] or {}
+    if not record.LastVisit then record.LastVisit=os.time() end
+    if not restoring and self.ArrivalRecorded~=id then
+        record.LastVisit=os.time() self.ArrivalRecorded=id
+    end
+    self.VisitRecords[id]=record
+    while #self.ServerHistory>1000 do
+        local removed=table.remove(self.ServerHistory,1)
+        self.VisitRecords[removed]=nil self.Visited[removed]=nil
+    end
+    self.Visited[id]=true
+end
+function H:RefreshMetrics()
+    if not self.UI or not self.UI.Results then return end
+    local stats=self.Stats
+    local average=stats.FoundServers>0 and string.format("%.1f servers per find",stats.Scanned/stats.FoundServers)
+        or "Waiting for the first discovery"
+    self.UI.Results:Set(string.format("Scanned %d - Found %d - Harvested %d",stats.Scanned,stats.FoundTrees,stats.Harvested),average)
+end
+function H:RecordScan(count)
+    if self.ScanCounted then return end
+    self.ScanCounted=true self.LastScannedServer=game.JobId
+    self:RememberServer(game.JobId)
+    local record=self.VisitRecords[game.JobId]
+    record.ScannedAt=os.time() record.Found=count
+    self.Stats.Scanned=self.Stats.Scanned+1
+    self.Stats.FoundTrees=self.Stats.FoundTrees+count
+    if count>0 then self.Stats.FoundServers=self.Stats.FoundServers+1 end
+    local source=self.ArrivalSource=="Oldest observed" and "Tracker" or "Standard"
+    self.Stats[source.."Scans"]=self.Stats[source.."Scans"]+1
+    if count>0 then self.Stats[source.."Finds"]=self.Stats[source.."Finds"]+1 end
+    self:RefreshMetrics()
+    local ok,err=self:Persist(false) if not ok then self:Log(err,"WARNING") end
+end
+function H:RecordHarvest(work)
+    if work.FinderCounted then return end
+    work.FinderCounted=true
+    self:RememberServer(game.JobId)
+    self.VisitRecords[game.JobId].HarvestedAt=os.time()
+    self.Stats.Harvested=self.Stats.Harvested+1
+    self:RefreshMetrics()
+    local ok,err=self:Persist(false) if not ok then self:Log(err,"WARNING") end
+end
+function H:ObserveLatency(seconds)
+    if not finite(seconds) or seconds<0 or seconds>15 then return end
+    self.ServerRTT=self.ServerRTT and self.ServerRTT*0.7+seconds*0.3 or seconds
+end
+function H:AdaptiveWait(base,maximum)
+    if not self.Config.AdaptiveTiming or not self.ServerRTT then return base end
+    return math.min(maximum,base+math.max(0,self.ServerRTT-0.12)*2)
+end
+function H:SampleLatency(token)
+    if self.NetworkSampled or not self.Config.AdaptiveTiming then return end
+    self.NetworkSampled=true
+    local ping=S.ReplicatedStorage:FindFirstChild("TestPing")
+    if not ping or not ping:IsA("RemoteFunction") then return end
+    local started=os.clock()
+    local ok=pcall(function() token:Await(function() return ping:InvokeServer() end,3) end)
+    token:Check()
+    if ok then self:ObserveLatency(os.clock()-started) end
+end
+function H:RecordFailure(stage,reason)
+    reason=tostring(reason)
+    local lower=reason:lower()
+    local code,waiting="TASK_INTERRUPTED","Completion of the current stage"
+    if lower:find("lavafire",1,true) then code,waiting="IGNITION_MISSING","LavaFire on the selected parent"
+    elseif lower:find("parent did not separate",1,true) then code,waiting="SEPARATION_MISSING","Burn parent leaving its original container"
+    elseif lower:find("trigger",1,true) then code,waiting="CONVERSION_MISSING","Matching owned replacement log"
+    elseif lower:find("output",1,true) or lower:find("whole-tree",1,true) then code,waiting="OUTPUT_UNCONFIRMED","Consumed input and stable owned planks"
+    elseif lower:find("save",1,true) then code,waiting="SAVE_UNCONFIRMED","Positive slot save response and idle save state"
+    elseif lower:find("cut",1,true) then code,waiting="CUT_UNCONFIRMED","Matching owned felled log"
+    elseif lower:find("unstable",1,true) or lower:find("shifted",1,true) then code,waiting="WOOD_MOVED","Wood remaining at its destination"
+    elseif lower:find("timed out",1,true) then code,waiting="REQUEST_TIMEOUT","Server response"
+    end
+    self.LastFailure={Time=os.date("!%Y-%m-%d %H:%M:%S"),Stage=stage,Reason=reason,Code=code,WaitingFor=waiting,
+        LastConfirmed=self.LastConfirmedMilestone or "No harvest milestone confirmed"}
 end
 local restored
 if Read then
@@ -174,15 +257,27 @@ if restored then
     if type(restored.WindowPosition) == "table" and finite(restored.WindowPosition.X) and finite(restored.WindowPosition.Y) then
         H.WindowPosition = {X=math.clamp(restored.WindowPosition.X,0,1),Y=math.clamp(restored.WindowPosition.Y,0,1)}
     end
+    if type(restored.VisitRecords)=="table" then
+        local restoredCount=0
+        for id,record in pairs(restored.VisitRecords) do
+            if restoredCount>=1000 then break end
+            if serverID(id) and type(record)=="table" and finite(record.LastVisit) then
+                H.VisitRecords[id]={LastVisit=math.min(os.time(),record.LastVisit),
+                    HarvestedAt=finite(record.HarvestedAt) and math.min(os.time(),record.HarvestedAt) or nil}
+                restoredCount=restoredCount+1
+            end
+        end
+    end
+    if restored.Resume==true and restored.Target==game.JobId then H.ArrivalSource=restored.TargetSource end
     if type(restored.ServerHistory) == "table" then
-        for _, id in ipairs(restored.ServerHistory) do H:RememberServer(id) end
+        for _, id in ipairs(restored.ServerHistory) do H:RememberServer(id,true) end
     elseif type(restored.Visited) == "table" then
         local legacy = {}
         for id, stamp in pairs(restored.Visited) do
             if type(id) == "string" and finite(stamp) then table.insert(legacy, {Id=id, Stamp=stamp}) end
         end
         table.sort(legacy, function(a,b) if a.Stamp == b.Stamp then return a.Id < b.Id end return a.Stamp < b.Stamp end)
-        for _, entry in ipairs(legacy) do H:RememberServer(entry.Id) end
+        for _, entry in ipairs(legacy) do H:RememberServer(entry.Id,true) end
     end
     if type(restored.FailedServers) == "table" then
         for id, untilTime in pairs(restored.FailedServers) do
@@ -196,6 +291,9 @@ if restored then
     end
     if finite(restored.StartedAt) then H.StartedAt = math.min(os.time(), restored.StartedAt) end
     H.LastCountedServer = restored.LastCountedServer
+    H.LastScannedServer=restored.LastScannedServer
+    H.ScanCounted=restored.LastScannedServer==game.JobId
+    if not H.ArrivalSource and restored.CurrentServer==game.JobId then H.ArrivalSource=restored.ArrivalSource end
 end
 local function uiText(text) return tostring(text):gsub("SpookyNeon", "Sinister") end
 local function cleanError(err)
@@ -253,20 +351,95 @@ function H:Log(message, level, display)
         self.UI.Activity:SetEntries(rows)
     end
 end
+local travelStages={
+    ["Next server"]=true,["Finding another server"]=true,
+    ["Waiting for available servers"]=true,["Joining another server"]=true,
+    ["Changing server"]=true,["Reconnecting"]=true,
+}
+function H:RenderProgress(detail)
+    if not self.UI then return end
+    local batch=self.HarvestProgress
+    local current=batch and batch.Current
+    local caption=detail or ""
+    if current and not travelStages[self.Stage] then
+        caption=string.format("Tree %d / %d",current.Index,#batch.Items)
+        if current.Detail and current.Detail~="" then caption=caption.." - "..current.Detail end
+    end
+    self.UI.Progress:SetText(stageTitles[self.Stage] or uiText(self.Stage),caption)
+    if travelStages[self.Stage] then
+        self.UI.Progress:SetIndeterminate(true)
+    else
+        self.UI.Progress:Set(self.Progress*100,true)
+    end
+end
+function H:BeginHarvestProgress(entries)
+    if self.HarvestProgress and self.HarvestProgress.JobId==game.JobId then return end
+    local batch={JobId=game.JobId,Items={},ByWork={},ByModel={}}
+    for index,entry in ipairs(entries) do
+        local item={Index=index,Fraction=0}
+        table.insert(batch.Items,item)
+        if entry.Model then batch.ByModel[entry.Model]=item end
+        if entry.Work then batch.ByWork[entry.Work]=item end
+    end
+    self.HarvestProgress=batch
+    self.Progress=0.18
+    self:RenderProgress()
+end
+function H:SelectHarvestProgress(entry)
+    local batch=self.HarvestProgress
+    if not batch then return end
+    batch.Current=(entry.Work and batch.ByWork[entry.Work]) or batch.ByModel[entry.Model]
+    self:RenderProgress()
+end
+function H:LinkHarvestProgress(work)
+    local batch=self.HarvestProgress
+    if batch and batch.Current then batch.ByWork[work]=batch.Current end
+end
+function H:UpdateHarvestProgress(fraction,detail)
+    local batch=self.HarvestProgress
+    if not batch or not batch.Current or not finite(fraction) then return end
+    -- These are weighted, completed milestones, never a damage or ETA estimate.
+    local item=batch.Current
+    local updated=math.max(item.Fraction,math.clamp(fraction,0,1))
+    local changed=updated~=item.Fraction or (detail~=nil and detail~=item.Detail)
+    if updated>item.Fraction then
+        local milestone=updated>=1 and "Slot save confirmed" or updated>=0.95 and "All planks delivered"
+            or updated>0.85 and "Plank delivery confirmed" or updated>=0.85 and "Stable planks confirmed"
+            or updated>0.70 and "Sawmill consumption observed" or updated>=0.70 and "Replacement log confirmed"
+            or updated>=0.64 and "Inlet prepared" or updated>=0.60 and "Parent separation confirmed"
+            or updated>=0.50 and "LavaFire confirmed" or updated>=0.40 and "Wood structure validated"
+            or updated>=0.38 and "Owned sawmill found" or updated>=0.35 and "Tree delivered"
+            or updated>=0.25 and "Felled tree confirmed" or "Inventory axe equipped"
+        self.LastConfirmedMilestone=string.format("Tree %d - %s",item.Index,milestone)
+    end
+    item.Fraction=updated
+    if detail~=nil then item.Detail=detail end
+    local sum,complete=0,#batch.Items>0
+    for _,record in ipairs(batch.Items) do
+        sum=sum+record.Fraction
+        complete=complete and record.Fraction==1
+    end
+    batch.Complete=complete
+    -- Reserve 100% for every tree delivered AND its slot save confirmed.
+    self.Progress=complete and 1 or math.min(0.99,0.18+0.81*sum/math.max(1,#batch.Items))
+    if changed then self:RenderProgress() end
+end
 function H:SetStage(text, progress, detail)
     local changed=self.Stage~=text
     if changed then self.StageStarted=os.clock() end
     self.Stage=text
-    if progress then self.Progress=math.clamp(progress,0,1) end
+    if progress and not self.HarvestProgress and not travelStages[text] then
+        self.Progress=math.max(self.Progress,math.clamp(progress,0,0.99))
+    end
+    if self.HarvestProgress and self.HarvestProgress.Current and changed then
+        self.HarvestProgress.Current.Detail=nil
+    end
     local shown=stageTitles[text] or uiText(text)
     local useful=detail and (detail:match("^Tree %d") or detail:match("^Piece %d") or text=="Equipping inventory axe"
         or text=="Rare trees found" or text=="Waiting for available servers" or text=="Needs attention"
         or text=="Task stopped")
     local caption=useful and uiText(shortError(detail)) or ""
-    if self.UI then
-        self.UI.Progress:SetText(shown,caption)
-        self.UI.Progress:Set(self.Progress*100,true)
-    end
+    self:RenderProgress(caption)
     local diagnostic=text..(detail and (" - "..detail) or "")
     if diagnostic~=self.LastStageDiagnostic then
         self.LastStageDiagnostic=diagnostic
@@ -332,7 +505,7 @@ function H:Persist(resume, target)
         if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
     end
     local data = { Schema = 2, Version = self.Version, TimingRevision = 1, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
-        FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
+        VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
         StartedAt = self.StartedAt, Resume = resume == true, Target = target, TicketTime = os.time(),
         Departure = self.ServerExitReason and {JobId=game.JobId,Reason=self.ServerExitReason} or nil }
     local ok = pcall(function()
@@ -465,8 +638,9 @@ function H:WaitForGame(token)
         local changed=not lastSignature or #signature~=#lastSignature
         if not changed then for i,object in ipairs(signature) do if lastSignature[i]~=object then changed=true break end end end
         if #missing==0 then
+            self:SampleLatency(token)
             if changed or not stableSince then stableSince=os.clock() end
-            if os.clock()-stableSince>=self.Config.GameSettle then
+            if os.clock()-stableSince>=self:AdaptiveWait(self.Config.GameSettle,5) then
                 self.LoadDiagnostic=string.format("Game ready - required objects stable for %.2f seconds",self.Config.GameSettle)
                 self:Log(self.LoadDiagnostic,"DEBUG") return
             end
@@ -953,9 +1127,10 @@ function H:ScanReady(token)
             previous, previousRegions, previousCount, previousVolume = snapshot, regions, #matches, volume
             -- Positive results settle briefly; an empty result needs a longer
             -- quiet window. ScanWait is a deadline, never an unconditional sleep.
-            if regions > 0 and ready > 0 and os.clock() - stableSince >= (#matches > 0 and self.Config.ScanSettle or self.Config.EmptyScanDelay) then
+            if regions > 0 and ready > 0 and os.clock() - stableSince >= self:AdaptiveWait(#matches > 0 and self.Config.ScanSettle or self.Config.EmptyScanDelay,5) then
                 self:Log(string.format("Scan complete - %.2fs / %d trees checked", os.clock()-started, ready),"DEBUG")
                 if self.Counts.IgnoredSmall>0 then self:Log("Trees below "..MIN_TREE_VOLUME.." studs3 ignored - "..self.Counts.IgnoredSmall,"DEBUG") end
+                self:RecordScan(#matches)
                 return matches
             end
         else stableSince = os.clock() end
@@ -1013,16 +1188,19 @@ function H:SyncPhysics(token,rounds,diagnostic,refresh)
     diagnostic.SyncFallback=nil
     local ping=S.ReplicatedStorage:FindFirstChild("TestPing")
     if not ping or not ping:IsA("RemoteFunction") then ping=nil end
-    local deadline=os.clock()+12
+    local deadline=os.clock()+self:AdaptiveWait(12,24)
     for _=1,rounds do
         token:Check()
         if refresh then refresh() end
         if ping then
             local remaining=deadline-os.clock()
             assert(remaining>0,"Physics synchronization timed out")
+            local pingStarted=os.clock()
             local ok=token:Await(function() return pcall(ping.InvokeServer,ping) end,
-                math.min(3,remaining),refresh)
-            if ok then diagnostic.SyncReplies=diagnostic.SyncReplies+1
+                math.min(self:AdaptiveWait(3,6),remaining),refresh)
+            if ok then
+                self:ObserveLatency(os.clock()-pingStarted)
+                diagnostic.SyncReplies=diagnostic.SyncReplies+1
             else ping=nil diagnostic.SyncFallback="TestPing rejected" end
         else diagnostic.SyncFallback=diagnostic.SyncFallback or "TestPing unavailable" end
         token:Sleep(0.15)
@@ -1339,7 +1517,7 @@ function H:DismemberPlan(log)
 end
 function H:WaitForModwood(log,token)
     self:SetStage("Checking felled tree",0.48)
-    local deadline=os.clock()+self.Config.MetadataTimeout
+    local deadline=os.clock()+self:AdaptiveWait(self.Config.MetadataTimeout,90)
     local previous,stableSince,reason
     repeat
         token:Check()
@@ -1406,10 +1584,18 @@ function H:MillReport(state,job,index)
     return table.concat(lines,"\n")
 end
 function H:BuildReport()
-    local lines={string.format("Spooky Hunter %s\nCaptured (UTC): %s\nServer: %s\nSlot: %d\nRecent servers: %d/50\nPending wood: %d\nStage: %s\nRunning: %s\nAnti-AFK pulses: %d",
+    local lines={string.format("Spooky Hunter %s\nCaptured (UTC): %s\nServer: %s\nSlot: %d\nHistory records: %d/1000\nPending wood: %d\nStage: %s\nRunning: %s\nAnti-AFK pulses: %d",
         self.Version,os.date("!%Y-%m-%d %H:%M:%S"),game.JobId,self.Config.Slot,#self.ServerHistory,#self.PendingWood,
         self.Stage,tostring(self.Running),self.IdlePulses or 0)}
+    table.insert(lines,string.format("Visit exclusion: %.1fh; harvest exclusion: %.1fh\nScanned: %d; found servers: %d; found trees: %d; harvested: %d\nTracker finds/scans: %d/%d; standard finds/scans: %d/%d\nAdaptive timing: %s; observed RTT: %s",
+        self.Config.VisitCooldownHours,self.Config.HarvestCooldownHours,self.Stats.Scanned,self.Stats.FoundServers,
+        self.Stats.FoundTrees,self.Stats.Harvested,self.Stats.TrackerFinds,self.Stats.TrackerScans,
+        self.Stats.StandardFinds,self.Stats.StandardScans,tostring(self.Config.AdaptiveTiming),
+        self.ServerRTT and string.format("%.3fs",self.ServerRTT) or "Not measured"))
     if self.LastFailure then
+        table.insert(lines,"Failure code: "..(self.LastFailure.Code or "Unavailable")
+            .."\nLast confirmed: "..(self.LastFailure.LastConfirmed or "Unavailable")
+            .."\nWaiting for: "..(self.LastFailure.WaitingFor or self.LastFailure.Stage))
         table.insert(lines,"Last failure (UTC): "..self.LastFailure.Time.."\nFailed stage: "..self.LastFailure.Stage.."\nReason: "..self.LastFailure.Reason)
     end
     table.insert(lines,string.format("Minimum volume: %d studs3\nHop delay: %.2fs\nAutomatic recovery: %ss without confirmed progress\nAbandoned tasks: %d\nUI version: %s",
@@ -1753,7 +1939,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     self:AcquireWood(log,root,token,state,function() return state.IgnitionObserved==true end)
     if livePart(parent) and under(parent,log) then log.PrimaryPart=parent
     else assert(state.IgnitionObserved,"Modwood - burn parent disappeared before ignition") end
-    local deadline=os.clock()+self.Config.BurnTimeout
+    local deadline=os.clock()+self:AdaptiveWait(self.Config.BurnTimeout,120)
     local fire=parent:FindFirstChild("LavaFire")
     if fire then observeFire(fire) end
     while not state.IgnitionObserved do
@@ -1777,11 +1963,12 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     fire=parent:FindFirstChild("LavaFire")
     if fire then fire:Destroy() end -- Ancestor removes the local visual after observing ignition.
     snapshot("Ignition confirmed")
+    self:UpdateHarvestProgress(0.50)
     self:SetStage("Modwood - stabilizing selected tree",0.57)
     if not state.ParentSeparated then transfer(CFrame.new(-1055,291,-458)) end
     state.Phase="Separating"
     self:SetStage("Modwood - waiting for parent separation",0.6)
-    deadline=os.clock()+self.Config.BurnTimeout
+    deadline=os.clock()+self:AdaptiveWait(self.Config.BurnTimeout,120)
     repeat
         checkMill() observeSeparation()
         if state.ParentSeparated then break end
@@ -1794,6 +1981,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         token:Sleep(0.12)
     until os.clock()>=deadline
     assert(state.ParentSeparated,"Modwood - parent did not separate before timeout")
+    self:UpdateHarvestProgress(0.60)
     ancestry:Disconnect()
     requireLive(root,"root") requireLive(leaf,"retained section")
     assert(under(root,log) and owned(log),"Modwood - original cut target changed")
@@ -1823,6 +2011,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         if not feed(0.5) then break end
         token:Sleep(0.06)
     end
+    self:UpdateHarvestProgress(0.64)
     deadline=os.clock()+self.Config.ChopTimeout
     local candidate,candidateSince,nextStrike=nil,nil,0
     repeat
@@ -1869,12 +2058,16 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     until os.clock()>=deadline
     listener:Disconnect()
     assert(state.Phase=="Output","Modwood - trigger timed out without a matching new owned log")
+    self:UpdateHarvestProgress(0.70)
     -- Keep hover active while the sawmill produces its output, even if there
     -- is no floor beside the inlet. Release only after a confirmed result.
     self:Teleport(inlet.CFrame+Vector3.new(0,4,8))
     self:SetStage("Modwood - waiting for sawmill output",0.78,"Waiting for finished planks")
-    local deadline=os.clock()+self.Config.MillTimeout
+    local deadline=os.clock()+self:AdaptiveWait(self.Config.MillTimeout,180)
     local stableSince, outputVolume, outputParts, outputDimensions
+    local expectedSections={}
+    for _,section in ipairs(state.OriginalSections) do if section~=parent then expectedSections[section]=true end end
+    for _,section in ipairs(state.TransformedSections or {}) do if section~=parent then expectedSections[section]=true end end
     repeat
         checkMill()
         for _, model in ipairs(playerModels:GetChildren()) do
@@ -1913,7 +2106,19 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         local signature=table.concat(dimensions,";")
         if volume~=outputVolume or parts~=outputParts or signature~=outputDimensions then stableSince=os.clock() end
         outputVolume,outputParts,outputDimensions=volume,parts,signature
+        local totalSections,consumedSections=0,0
+        for section in pairs(expectedSections) do
+            totalSections=totalSections+1
+            local ownerModel=section.Parent and section:FindFirstAncestorOfClass("Model")
+            if not livePart(section) or (section==root and section.Size.Y<=0.35)
+                or (ownerModel and state.SeenOutput[ownerModel]) then consumedSections=consumedSections+1 end
+        end
+        if #state.Outputs>0 and volume>0 then
+            self:UpdateHarvestProgress(0.70+0.10*consumedSections/math.max(1,totalSections),
+                "Planks: "..#state.Outputs)
+        end
         if #state.Outputs>0 and remaining==0 and volume>0 and stableSince and os.clock()-stableSince>2 then
+            self:UpdateHarvestProgress(0.85)
             hover:Release()
             return state.Outputs
         end
@@ -1927,6 +2132,9 @@ function H:Deliver(planks, center, token, checkpoint)
     for _, plank in ipairs(planks) do
         if not checkpoint or not checkpoint.Delivered[plank] then table.insert(remaining, plank) end
     end
+    local deliveredCount=#planks-#remaining
+    self:UpdateHarvestProgress(0.85+0.10*deliveredCount/math.max(1,#planks),
+        string.format("Planks %d / %d",deliveredCount,#planks))
     for _, plank in ipairs(remaining) do
         local bounds, size = plank:GetBoundingBox()
         local relative = plank:GetPivot():ToObjectSpace(bounds)
@@ -1944,6 +2152,9 @@ function H:Deliver(planks, center, token, checkpoint)
         self.Stats.Planks = self.Stats.Planks + 1
         self.UnsavedDelivery=true
         if checkpoint then checkpoint.Delivered[plank] = true end
+        deliveredCount=deliveredCount+1
+        self:UpdateHarvestProgress(0.85+0.10*deliveredCount/math.max(1,#planks),
+            string.format("Planks %d / %d",deliveredCount,#planks))
     end
 end
 function H:SaveSlot(token)
@@ -2051,7 +2262,7 @@ function H:PublicServers(token)
         for _, server in ipairs(data.data) do
             if type(server)=="table" and type(server.id)=="string" and server.id~="" and server.id~=game.JobId
                 and not ids[server.id] and finite(server.playing) and finite(server.maxPlayers)
-                and server.playing>=0 and server.playing<server.maxPlayers and not self.Visited[server.id]
+                and server.playing>=0 and server.playing<server.maxPlayers and not self:IsServerExcluded(server.id)
                 and (not self.FailedServers[server.id] or self.FailedServers[server.id]<=os.time()) then
                 ids[server.id]=true table.insert(servers,server.id)
             end
@@ -2071,12 +2282,12 @@ function H:TrackerServers(token)
     if not trackerKey(self.Config.TrackerToken) then return nil,"Tracker key missing or invalid" end
     local exclusions,seen={},{}
     local function exclude(id)
-        if #exclusions<250 and serverID(id) and not seen[id] then
+        if #exclusions<1250 and serverID(id) and not seen[id] then
             seen[id]=true table.insert(exclusions,id)
         end
     end
     exclude(game.JobId)
-    for _,id in ipairs(self.ServerHistory) do exclude(id) end
+    for _,id in ipairs(self.ServerHistory) do if self:IsServerExcluded(id) then exclude(id) end end
     for id,untilTime in pairs(self.FailedServers) do if untilTime>os.time() then exclude(id) end end
     local body=S.HttpService:JSONEncode({placeId=game.PlaceId,exclude=exclusions,limit=100,
         maxSeenAgeSeconds=math.floor(self.Config.TrackerFreshness*60),
@@ -2101,7 +2312,7 @@ function H:TrackerServers(token)
     local ordered,accepted={},{}
     for _,entry in ipairs(data.servers) do
         if type(entry)=="table" and serverID(entry.id) and entry.id~=game.JobId
-            and not accepted[entry.id] and not self.Visited[entry.id]
+            and not accepted[entry.id] and not self:IsServerExcluded(entry.id)
             and (not self.FailedServers[entry.id] or self.FailedServers[entry.id]<=os.time())
             and finite(entry.firstSeen) and finite(entry.lastSeen) and entry.firstSeen>0
             and entry.firstSeen<=entry.lastSeen and entry.lastSeen<=data.generatedAt
@@ -2183,7 +2394,7 @@ function H:Hop(token)
     until os.clock()>=leaveAt
     local servers
     for round=1,3 do
-        self:SetStage("Finding another server",0.98,"Recent servers excluded: "..#self.ServerHistory.." / 50")
+        self:SetStage("Finding another server",0.98,"History: "..#self.ServerHistory.." / 1000")
         servers=self:Servers(token)
         if #servers>0 then break end
         if round<3 then
@@ -2269,6 +2480,7 @@ function H:Run(token)
         else plot=self:LoadSlot(token) end
     end
     self.CanRecover=false
+    self:BeginHarvestProgress(entries)
     local batchStarted, initialPlanks = os.clock(), self.Stats.Planks
     local mill,inlet
     assert(plot and owned(plot),"Plot ownership changed before harvesting")
@@ -2278,6 +2490,7 @@ function H:Run(token)
         token:Check()
         if entry.Work or (entry.Model.Parent and value(entry.Model,"Owner")==nil
             and not entry.Model:FindFirstChild("RootCut") and self:WoodVolume(entry.Model)>=MIN_TREE_VOLUME) then
+            self:SelectHarvestProgress(entry)
             local scope=self:Token(token)
             local work=entry.Work
             local log=work and work.Log
@@ -2286,21 +2499,27 @@ function H:Run(token)
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed during harvesting")
                 if not work or (not work.Log and work.Cut) then
                     local tool,stats=self:EnsureAxe(entry.Kind,scope)
+                    self:UpdateHarvestProgress(0.02)
                     self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
                     if not work then
                         work={Kind=entry.Kind,Reason="Cut started"}
                         table.insert(self.PendingWood,work)
                     end
+                    self:LinkHarvestProgress(work)
                     cutStarted=true self.Dirty=true
                     local target=work.Cut and {Model=work.Cut.Tree,Trunk=work.Cut.Trunk,Kind=work.Kind} or entry
                     log=self:Chop(target,tool,stats,scope,work)
                     work.Log=log self.Stats.Trees=self.Stats.Trees+1
                 end
+                self:LinkHarvestProgress(work)
+                self:UpdateHarvestProgress(0.25)
                 if not work.Planks then
                     if not work.Modwood then
                         self:BringTreeToBase(log,plot,scope)
                         work.AtBase=true
+                        self:UpdateHarvestProgress(0.35)
                         mill,inlet=self:FindMill(scope,plot)
+                        self:UpdateHarvestProgress(0.38)
                         local supported, reason=self:WaitForModwood(log,scope)
                         if not supported then
                             self:CaptureModwood(log,mill,reason)
@@ -2313,13 +2532,17 @@ function H:Run(token)
                         error(self.ServerExitReason,0)
                     end
                     if not work.Planks then
+                        self:UpdateHarvestProgress(0.40)
                         work.Planks=self:Modwood(log,mill,inlet,scope,work)
                     end
                 end
+                self:UpdateHarvestProgress(0.85)
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed before delivery")
                 self:SetStage("Delivering planks",0.86,"Center of your plot")
                 self:Deliver(work.Planks,center,scope,work)
                 self:SaveSlot(scope)
+                self:UpdateHarvestProgress(1,"Saved")
+                self:RecordHarvest(work)
                 return true
             end)
             scope:Clean()
@@ -2327,7 +2550,7 @@ function H:Run(token)
             if self.ServerExitReason then
                 local reason=self.ServerExitReason
                 work.Reason=reason
-                self.LastFailure={Time=os.date("!%Y-%m-%d %H:%M:%S"),Stage=self.Stage,Reason=reason}
+                self:RecordFailure(self.Stage,reason)
                 self:Log("Modwood failed - "..reason,"WARNING","Modwood failed - changing server")
                 self.Stats.Skipped=self.Stats.Skipped+1
                 token:Clean() token.Character=nil
@@ -2342,7 +2565,7 @@ function H:Run(token)
             else
                 local reason=cleanError(result or "Tree processing was not confirmed")
                 skipped=skipped+1 self.Stats.Skipped=self.Stats.Skipped+1
-                self.LastFailure={Time=os.date("!%Y-%m-%d %H:%M:%S"),Stage=self.Stage,Reason=reason}
+                self:RecordFailure(self.Stage,reason)
                 self:Log("Tree "..index.." paused - "..reason,"WARNING")
                 if cutStarted then
                     work.Reason=reason
@@ -2434,7 +2657,8 @@ function H:Start()
             token:Clean() token.Character=nil
             if result==CANCEL or not self.Alive or not self.Running then break end
             if ok and not self.NeedsAttention and not self.Config.FullCycle and not self.ServerExitReason then break end
-            self.LastFailure={Time=os.date("!%Y-%m-%d %H:%M:%S"),Stage=self.Stage,Reason=cleanError(result or "Retry pending")}
+            if result and (not self.LastFailure or self.LastFailure.Reason~=cleanError(result)) then self:RecordFailure(self.Stage,cleanError(result)) end
+            if not self.LastFailure then self:RecordFailure(self.Stage,"Retry pending") end
             self:Log("Recovery - "..self.LastFailure.Reason,"DEBUG")
             self:SetStage("Reconnecting",self.Progress)
             -- Preserve the continuation ticket while an uncertain teleport settles.
@@ -2510,9 +2734,11 @@ activityPage:Button({Title="Copy diagnostic report",Icon="Copy",Callback=functio
     local copy=cap("setclipboard",setclipboard) or cap("toclipboard",toclipboard)
     if copy and pcall(copy,H:BuildReport()) then H:Log("Report copied") else H:Log("Clipboard unavailable","WARNING") end
 end})
-H.UI={Progress=progress,Stage=progress.Root:FindFirstChild("ProgressTitle"),
+local results=home:Label({Title="Harvest results",Description="Waiting for the first discovery"})
+H.UI={Results=results,Progress=progress,Stage=progress.Root:FindFirstChild("ProgressTitle"),
     Detail=progress.Root:FindFirstChild("Description"),Spooky=spooky,Neon=sinister,
     Activity=activity,Start=start.Root:FindFirstChild("Title")}
+H:RefreshMetrics()
 local controls={}
 local function apply(key,newValue,control)
     if H.Busy and key~="AntiAfk" then
@@ -2574,6 +2800,11 @@ finder:Button({Title="Clear tracker key",Callback=function()
     H.Config.TrackerToken="" H.TrackerRetryAt=nil H.TrackerFallbackLogged=false
     local saved,err=H:Persist(false) if not saved then H:Log(err,"WARNING") end
 end})
+textSetting(finder,"Revisit after (hours)","VisitCooldownHours",true)
+textSetting(finder,"After harvest (hours)","HarvestCooldownHours",true)
+local adaptiveToggle
+adaptiveToggle=finder:Toggle({Title="Adaptive server timing",Default=H.Config.AdaptiveTiming,
+    Callback=function(v) apply("AdaptiveTiming",v,adaptiveToggle) end})
 local advanced=settings:Section({Title="Advanced",Collapsible=true,Collapsed=true})
 textSetting(advanced,"Script URL","ScriptURL",false)
 for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},
