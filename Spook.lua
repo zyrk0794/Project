@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.7.3 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.7.2 - Lumber Tycoon 2
     October 7, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -58,7 +58,7 @@ local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.7.3", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.7.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -253,82 +253,20 @@ function H:Log(message, level, display)
         self.UI.Activity:SetEntries(rows)
     end
 end
-local travelStages={
-    ["Next server"]=true,["Finding another server"]=true,
-    ["Waiting for available servers"]=true,["Joining another server"]=true,
-    ["Changing server"]=true,["Reconnecting"]=true,
-}
-function H:RenderProgress(detail)
-    if not self.UI then return end
-    local batch=self.HarvestProgress
-    local current=batch and batch.Current
-    local caption=detail or ""
-    if current and not travelStages[self.Stage] then
-        caption=string.format("Tree %d / %d",current.Index,#batch.Items)
-        if current.Detail and current.Detail~="" then caption=caption.." - "..current.Detail end
-    end
-    self.UI.Progress:SetText(stageTitles[self.Stage] or uiText(self.Stage),caption)
-    self.UI.Progress:Set(self.Progress*100,true)
-    self.UI.Progress:SetIndeterminate(travelStages[self.Stage]==true)
-end
-function H:BeginHarvestProgress(entries)
-    if self.HarvestProgress and self.HarvestProgress.JobId==game.JobId then return end
-    local batch={JobId=game.JobId,Items={},ByWork={},ByModel={}}
-    for index,entry in ipairs(entries) do
-        local item={Index=index,Fraction=0}
-        table.insert(batch.Items,item)
-        if entry.Model then batch.ByModel[entry.Model]=item end
-        if entry.Work then batch.ByWork[entry.Work]=item end
-    end
-    self.HarvestProgress=batch
-    self.Progress=0.18
-    self:RenderProgress()
-end
-function H:SelectHarvestProgress(entry)
-    local batch=self.HarvestProgress
-    if not batch then return end
-    batch.Current=(entry.Work and batch.ByWork[entry.Work]) or batch.ByModel[entry.Model]
-    self:RenderProgress()
-end
-function H:LinkHarvestProgress(work)
-    local batch=self.HarvestProgress
-    if batch and batch.Current then batch.ByWork[work]=batch.Current end
-end
-function H:UpdateHarvestProgress(fraction,detail)
-    local batch=self.HarvestProgress
-    if not batch or not batch.Current or not finite(fraction) then return end
-    -- These are weighted, completed milestones, never a damage or ETA estimate.
-    local item=batch.Current
-    local updated=math.max(item.Fraction,math.clamp(fraction,0,1))
-    local changed=updated~=item.Fraction or (detail~=nil and detail~=item.Detail)
-    item.Fraction=updated
-    if detail~=nil then item.Detail=detail end
-    local sum,complete=0,#batch.Items>0
-    for _,record in ipairs(batch.Items) do
-        sum=sum+record.Fraction
-        complete=complete and record.Fraction==1
-    end
-    batch.Complete=complete
-    -- Reserve 100% for every tree delivered AND its slot save confirmed.
-    self.Progress=complete and 1 or math.min(0.99,0.18+0.81*sum/math.max(1,#batch.Items))
-    if changed then self:RenderProgress() end
-end
 function H:SetStage(text, progress, detail)
     local changed=self.Stage~=text
     if changed then self.StageStarted=os.clock() end
     self.Stage=text
-    if progress and not self.HarvestProgress and not travelStages[text] then
-        self.Progress=math.max(self.Progress,math.clamp(progress,0,0.99))
-    end
-    if self.HarvestProgress and self.HarvestProgress.Current and changed then
-        self.HarvestProgress.Current.Detail=nil
-    end
+    if progress then self.Progress=math.clamp(progress,0,1) end
     local shown=stageTitles[text] or uiText(text)
     local useful=detail and (detail:match("^Tree %d") or detail:match("^Piece %d") or text=="Equipping inventory axe"
         or text=="Rare trees found" or text=="Waiting for available servers" or text=="Needs attention"
         or text=="Task stopped")
     local caption=useful and uiText(shortError(detail)) or ""
-    self:RenderProgress(caption)
+    if self.UI then
+        self.UI.Progress:SetText(shown,caption)
+        self.UI.Progress:Set(self.Progress*100,true)
+    end
     local diagnostic=text..(detail and (" - "..detail) or "")
     if diagnostic~=self.LastStageDiagnostic then
         self.LastStageDiagnostic=diagnostic
@@ -1839,7 +1777,6 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     fire=parent:FindFirstChild("LavaFire")
     if fire then fire:Destroy() end -- Ancestor removes the local visual after observing ignition.
     snapshot("Ignition confirmed")
-    self:UpdateHarvestProgress(0.50)
     self:SetStage("Modwood - stabilizing selected tree",0.57)
     if not state.ParentSeparated then transfer(CFrame.new(-1055,291,-458)) end
     state.Phase="Separating"
@@ -1857,7 +1794,6 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         token:Sleep(0.12)
     until os.clock()>=deadline
     assert(state.ParentSeparated,"Modwood - parent did not separate before timeout")
-    self:UpdateHarvestProgress(0.60)
     ancestry:Disconnect()
     requireLive(root,"root") requireLive(leaf,"retained section")
     assert(under(root,log) and owned(log),"Modwood - original cut target changed")
@@ -1887,7 +1823,6 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         if not feed(0.5) then break end
         token:Sleep(0.06)
     end
-    self:UpdateHarvestProgress(0.64)
     deadline=os.clock()+self.Config.ChopTimeout
     local candidate,candidateSince,nextStrike=nil,nil,0
     repeat
@@ -1934,16 +1869,12 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     until os.clock()>=deadline
     listener:Disconnect()
     assert(state.Phase=="Output","Modwood - trigger timed out without a matching new owned log")
-    self:UpdateHarvestProgress(0.70)
     -- Keep hover active while the sawmill produces its output, even if there
     -- is no floor beside the inlet. Release only after a confirmed result.
     self:Teleport(inlet.CFrame+Vector3.new(0,4,8))
     self:SetStage("Modwood - waiting for sawmill output",0.78,"Waiting for finished planks")
     local deadline=os.clock()+self.Config.MillTimeout
     local stableSince, outputVolume, outputParts, outputDimensions
-    local expectedSections={}
-    for _,section in ipairs(state.OriginalSections) do if section~=parent then expectedSections[section]=true end end
-    for _,section in ipairs(state.TransformedSections or {}) do if section~=parent then expectedSections[section]=true end end
     repeat
         checkMill()
         for _, model in ipairs(playerModels:GetChildren()) do
@@ -1982,19 +1913,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         local signature=table.concat(dimensions,";")
         if volume~=outputVolume or parts~=outputParts or signature~=outputDimensions then stableSince=os.clock() end
         outputVolume,outputParts,outputDimensions=volume,parts,signature
-        local totalSections,consumedSections=0,0
-        for section in pairs(expectedSections) do
-            totalSections=totalSections+1
-            local ownerModel=section.Parent and section:FindFirstAncestorOfClass("Model")
-            if not livePart(section) or (section==root and section.Size.Y<=0.35)
-                or (ownerModel and state.SeenOutput[ownerModel]) then consumedSections=consumedSections+1 end
-        end
-        if #state.Outputs>0 and volume>0 then
-            self:UpdateHarvestProgress(0.70+0.10*consumedSections/math.max(1,totalSections),
-                "Planks: "..#state.Outputs)
-        end
         if #state.Outputs>0 and remaining==0 and volume>0 and stableSince and os.clock()-stableSince>2 then
-            self:UpdateHarvestProgress(0.85)
             hover:Release()
             return state.Outputs
         end
@@ -2008,9 +1927,6 @@ function H:Deliver(planks, center, token, checkpoint)
     for _, plank in ipairs(planks) do
         if not checkpoint or not checkpoint.Delivered[plank] then table.insert(remaining, plank) end
     end
-    local deliveredCount=#planks-#remaining
-    self:UpdateHarvestProgress(0.85+0.10*deliveredCount/math.max(1,#planks),
-        string.format("Planks %d / %d",deliveredCount,#planks))
     for _, plank in ipairs(remaining) do
         local bounds, size = plank:GetBoundingBox()
         local relative = plank:GetPivot():ToObjectSpace(bounds)
@@ -2028,9 +1944,6 @@ function H:Deliver(planks, center, token, checkpoint)
         self.Stats.Planks = self.Stats.Planks + 1
         self.UnsavedDelivery=true
         if checkpoint then checkpoint.Delivered[plank] = true end
-        deliveredCount=deliveredCount+1
-        self:UpdateHarvestProgress(0.85+0.10*deliveredCount/math.max(1,#planks),
-            string.format("Planks %d / %d",deliveredCount,#planks))
     end
 end
 function H:SaveSlot(token)
@@ -2356,7 +2269,6 @@ function H:Run(token)
         else plot=self:LoadSlot(token) end
     end
     self.CanRecover=false
-    self:BeginHarvestProgress(entries)
     local batchStarted, initialPlanks = os.clock(), self.Stats.Planks
     local mill,inlet
     assert(plot and owned(plot),"Plot ownership changed before harvesting")
@@ -2366,7 +2278,6 @@ function H:Run(token)
         token:Check()
         if entry.Work or (entry.Model.Parent and value(entry.Model,"Owner")==nil
             and not entry.Model:FindFirstChild("RootCut") and self:WoodVolume(entry.Model)>=MIN_TREE_VOLUME) then
-            self:SelectHarvestProgress(entry)
             local scope=self:Token(token)
             local work=entry.Work
             local log=work and work.Log
@@ -2375,27 +2286,21 @@ function H:Run(token)
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed during harvesting")
                 if not work or (not work.Log and work.Cut) then
                     local tool,stats=self:EnsureAxe(entry.Kind,scope)
-                    self:UpdateHarvestProgress(0.02)
                     self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
                     if not work then
                         work={Kind=entry.Kind,Reason="Cut started"}
                         table.insert(self.PendingWood,work)
                     end
-                    self:LinkHarvestProgress(work)
                     cutStarted=true self.Dirty=true
                     local target=work.Cut and {Model=work.Cut.Tree,Trunk=work.Cut.Trunk,Kind=work.Kind} or entry
                     log=self:Chop(target,tool,stats,scope,work)
                     work.Log=log self.Stats.Trees=self.Stats.Trees+1
                 end
-                self:LinkHarvestProgress(work)
-                self:UpdateHarvestProgress(0.25)
                 if not work.Planks then
                     if not work.Modwood then
                         self:BringTreeToBase(log,plot,scope)
                         work.AtBase=true
-                        self:UpdateHarvestProgress(0.35)
                         mill,inlet=self:FindMill(scope,plot)
-                        self:UpdateHarvestProgress(0.38)
                         local supported, reason=self:WaitForModwood(log,scope)
                         if not supported then
                             self:CaptureModwood(log,mill,reason)
@@ -2408,16 +2313,13 @@ function H:Run(token)
                         error(self.ServerExitReason,0)
                     end
                     if not work.Planks then
-                        self:UpdateHarvestProgress(0.40)
                         work.Planks=self:Modwood(log,mill,inlet,scope,work)
                     end
                 end
-                self:UpdateHarvestProgress(0.85)
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed before delivery")
                 self:SetStage("Delivering planks",0.86,"Center of your plot")
                 self:Deliver(work.Planks,center,scope,work)
                 self:SaveSlot(scope)
-                self:UpdateHarvestProgress(1,"Saved")
                 return true
             end)
             scope:Clean()
