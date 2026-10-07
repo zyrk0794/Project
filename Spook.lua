@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.7.1 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.7.2 - Lumber Tycoon 2
     October 7, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -58,7 +58,7 @@ local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.7.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.7.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -1005,6 +1005,31 @@ function H:LowestSection(model)
     end
     return selected,index
 end
+-- Ancestor waits for TestPing replies after approaching. These replies allow
+-- replication to catch up; they do not prove physics ownership.
+function H:SyncPhysics(token,rounds,diagnostic,refresh)
+    diagnostic=diagnostic or {}
+    diagnostic.SyncReplies=0
+    diagnostic.SyncFallback=nil
+    local ping=S.ReplicatedStorage:FindFirstChild("TestPing")
+    if not ping or not ping:IsA("RemoteFunction") then ping=nil end
+    local deadline=os.clock()+12
+    for _=1,rounds do
+        token:Check()
+        if refresh then refresh() end
+        if ping then
+            local remaining=deadline-os.clock()
+            assert(remaining>0,"Physics synchronization timed out")
+            local ok=token:Await(function() return pcall(ping.InvokeServer,ping) end,
+                math.min(3,remaining),refresh)
+            if ok then diagnostic.SyncReplies=diagnostic.SyncReplies+1
+            else ping=nil diagnostic.SyncFallback="TestPing rejected" end
+        else diagnostic.SyncFallback=diagnostic.SyncFallback or "TestPing unavailable" end
+        token:Sleep(0.15)
+    end
+    if refresh then refresh() end
+    return diagnostic.SyncReplies
+end
 function H:AttemptChop(model,tool,stats,token,section,height)
     token:Check()
     assert(model and under(model,S.Workspace),"The cut target is no longer in the world")
@@ -1021,7 +1046,7 @@ function H:AttemptChop(model,tool,stats,token,section,height)
     assert(tool and tool.Parent==Player.Character,"The selected axe is not equipped")
     local _,_,avatar=self:Character()
     local stand=section.Position+Vector3.new(0,0,5)
-    if (avatar.Position-section.Position).Magnitude>7 or (avatar.Position-section.Position).Magnitude<2 then
+    if (avatar.Position-section.Position).Magnitude>10 then
         self:Teleport(CFrame.lookAt(stand,section.Position))
         token:Sleep(0.25)
     end
@@ -1081,9 +1106,16 @@ function H:Chop(entry, tool, stats, token, checkpoint)
             if os.clock()>=nextPosition then
                 local stand=trunk.Position+Vector3.new(5,0,0)
                 local _,_,avatar=self:Character()
-                if (avatar.Position-stand).Magnitude>2 then self:Teleport(CFrame.lookAt(stand,trunk.Position)) end
-                if cut.Strikes==0 then token:Sleep(0.35) end
-                nextPosition=os.clock()+0.35
+                local moved=(avatar.Position-trunk.Position).Magnitude>10
+                if moved then self:Teleport(CFrame.lookAt(stand,trunk.Position)) end
+                if not cut.Synchronized or moved then
+                    self:SyncPhysics(token,cut.Synchronized and 2 or 8,cut)
+                    cut.Synchronized=true
+                    -- Replication may have produced the felled log during the wait.
+                    found=self:FindFelledLog(cut)
+                    if found then cut.Result=found return found end
+                end
+                nextPosition=os.clock()+0.75
             end
             if os.clock()>=nextStrike then
                 token:Check()
@@ -1150,11 +1182,12 @@ function H:Move(model,destination,token)
         if self.LastMove==record then
             self.MoveDiagnostic=string.format("Last transfer: placements=%d; settled=%s; elapsed=%.2fs",
                 record.Placements,tostring(record.Settled),os.clock()-record.Started)
+                ..string.format("; control=%s; TestPing replies=%d",record.NetworkStatus or "Not checked",record.SyncReplies or 0)
         end
     end)
     local drag=self:Remote("Interaction","ClientIsDragging")
     local part=partOf(model)
-    self:AcquireWood(model,part,token)
+    self:AcquireWood(model,part,token,record)
     local restore=self:QuietWood(model,token)
     local relative=model:GetPivot():ToObjectSpace(part.CFrame)
     local placements,stableSince,nextPlacement=0,nil,0
@@ -1206,7 +1239,8 @@ function H:BringTreeToBase(log, plot, token)
 end
 function H:ModwoodParts(log)
     local sections,root,candidates={},nil,{}
-    for _,part in ipairs(log:GetDescendants()) do
+    local ordered=log:GetDescendants()
+    for _,part in ipairs(ordered) do
         if part:IsA("BasePart") and part.Name=="WoodSection" then
             local id=tonumber(value(part,"ID"))
             if id then
@@ -1218,22 +1252,26 @@ function H:ModwoodParts(log)
     end
     if not root then return nil,nil,nil,"No root section in the felled log" end
     local conifer=value(log,"TreeClass")=="Pine" or value(log,"TreeClass")=="Fir"
-    for id,part in pairs(sections) do
-        local parentID=tonumber(value(part,"ParentID"))
+    for order,part in ipairs(ordered) do
+        local id=part:IsA("BasePart") and part.Name=="WoodSection" and tonumber(value(part,"ID"))
+        local parentID=id and tonumber(value(part,"ParentID"))
         local parent=parentID and sections[parentID]
         -- Ancestor uses a retained section and its same-container parent.
         -- It does not require an empty ChildIDs folder. Never burn the trunk.
-        local eligible=conifer and part.Size.X>=0.5 or not conifer and id>=3
+        local eligible=id and (conifer and part.Size.X>=0.5 or not conifer and id>=3)
         if eligible and part~=root and parent and parent~=root and parent~=part
             and part.Parent==parent.Parent and part.Size.Y>0 and parent.Size.Y>0 then
             local seen,current={},id
             while current and sections[current] and not seen[current] and current~=1 do
                 seen[current]=true current=tonumber(value(sections[current],"ParentID"))
             end
-            if current==1 then table.insert(candidates,{Part=part,Parent=parent,ID=id,Width=part.Size.X}) end
+            if current==1 then table.insert(candidates,{Part=part,Parent=parent,ID=id,Width=part.Size.X,Order=order}) end
         end
     end
-    table.sort(candidates,function(a,b) return a.Width==b.Width and a.ID<b.ID or a.Width<b.Width end)
+    table.sort(candidates,function(a,b)
+        if not conifer then return a.Order>b.Order end
+        return a.Width==b.Width and a.Order>b.Order or a.Width<b.Width
+    end)
     local choice=candidates[1]
     if not choice then return nil,nil,nil,"Modwood unavailable - no retained section with a non-trunk parent" end
     return root,choice.Part,choice.Parent
@@ -1406,36 +1444,44 @@ function H:BuildReport()
     if self.Config.Webhook~="" then text=text:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
     return text
 end
--- Game Owner is distinct from physics ownership. A positive executor check,
--- when available, is required before changing wood transforms.
-function H:AcquireWood(model, part, token, diagnostic, finished)
+-- Executor ownership checks are advisory. Ancestor's supplied implementation
+-- effectively uses four TestPing replies instead. Confirm actual stage results
+-- (ignition, separation, output) rather than treating either signal as proof.
+function H:AcquireWood(model,part,token,diagnostic,finished)
     diagnostic=diagnostic or {}
     local networkOwner=cap("isnetworkowner",isnetworkowner)
     local drag=self:Remote("Interaction","ClientIsDragging")
-    local started=os.clock()
-    repeat
+    local complete,confirmed=false,false
+    local lastDrag=-math.huge
+    local function refresh()
         token:Check()
-        if finished and finished() then return false end
-        assert(livePart(part) and model.Parent and owned(model),"Wood changed while acquiring control")
+        if finished and finished() then complete=true return end
+        assert(livePart(part) and under(part,model) and under(model,S.Workspace) and owned(model),
+            "Wood changed while acquiring control")
+        assert(not part.Anchored,"Selected wood is anchored")
         local _,_,avatar=self:Character()
-        local distance=(avatar.Position-part.Position).Magnitude
-        diagnostic.AvatarDistance=distance
-        if distance>9 then self:Teleport(part.CFrame+Vector3.new(5,3,0)) end
-        if not diagnostic.LastDrag or os.clock()-diagnostic.LastDrag>=0.15 then
-            drag:FireServer(model) diagnostic.LastDrag=os.clock()
+        diagnostic.AvatarDistance=(avatar.Position-part.Position).Magnitude
+        if diagnostic.AvatarDistance>9 then self:Teleport(part.CFrame+Vector3.new(5,3,0)) end
+        if os.clock()-lastDrag>=0.15 then
+            drag:FireServer(model) lastDrag=os.clock() diagnostic.LastDrag=lastDrag
         end
-        if networkOwner then
-            local ok,result=pcall(networkOwner,part)
-            diagnostic.NetworkStatus=ok and tostring(result) or "Unavailable"
-            if ok and result==true then return true end
-            if not ok then networkOwner=nil end
-        else
-            diagnostic.NetworkStatus="Unavailable - proximity only"
+        if networkOwner and not confirmed then
+            for _,candidate in ipairs(model:GetDescendants()) do
+                if candidate:IsA("BasePart") and not candidate.Anchored then
+                    local ok,result=pcall(networkOwner,candidate)
+                    if not ok then networkOwner=nil break end
+                    if result==true then confirmed=true break end
+                end
+            end
         end
-        if not networkOwner and os.clock()-started>=0.3 then return true end
-        assert(os.clock()-started<6,"Physics ownership not acquired - staying near the wood")
-        token:Sleep(0.1)
-    until false
+        diagnostic.NetworkStatus=confirmed and "Executor confirmed" or "Unconfirmed - synchronizing"
+    end
+    refresh()
+    if complete then return false end
+    self:SyncPhysics(token,4,diagnostic,refresh)
+    if complete then return false end
+    diagnostic.NetworkStatus=confirmed and "Executor confirmed" or "Ancestor synchronization - result pending"
+    return true
 end
 
 -- Ancestor keeps flight active for the complete Modwood sequence. This scoped
@@ -1620,7 +1666,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local lava=self:FindLava()
     local originalPrimary=log.PrimaryPart
     local character,_,avatar=self:Character()
-    local state={Phase="Prepared",SourceRevision="Ancestor-20261007",Log=log,Mill=mill,Inlet=inlet,
+    local state={Phase="Prepared",SourceRevision="Ancestor-20261007-180421",Log=log,Mill=mill,Inlet=inlet,
         Root=root,Leaf=leaf,Parent=parent,ParentContainer=parent.Parent,Kind=value(log,"TreeClass"),
         OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
         RootID=value(root,"ID"),LeafID=value(leaf,"ID"),ParentID=value(parent,"ID")}
@@ -1634,6 +1680,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         local lines={"Modwood runtime - "..reasonText,"Protocol: "..state.SourceRevision,"Phase: "..state.Phase,
             string.format("Touch pairs: %d; ignition: %s; separation: %s; feed frames: %d",state.TouchPairs,
                 tostring(state.IgnitionObserved==true),tostring(state.ParentSeparated==true),state.FeedFrames),
+            string.format("Control: %s; TestPing replies: %d; fallback: %s",state.NetworkStatus or "Not checked",
+                state.SyncReplies or 0,state.SyncFallback or "None"),
             string.format("Hover active: %s; position corrections: %d; avatar Y: %.2f; root Y: %.2f",
                 tostring(state.HoverActive==true),state.HoverRescues or 0,avatar.Position.Y,root.Position.Y)}
         for _,item in ipairs({{"Root",root,state.RootID},{"Retained branch",leaf,state.LeafID},{"Burn parent",parent,state.ParentID}}) do
@@ -1693,7 +1741,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
                 self:Teleport(frame+Vector3.new(0,5,4))
                 log:PivotTo(frame)
             else standBy(parent) end
-            if index%3==1 then drag:FireServer(log) end
+            drag:FireServer(log)
             self:DampWood(log)
             token:Sleep(0.06)
             if state.IgnitionObserved and state.Phase=="Ignited" and state.ParentSeparated then break end
@@ -1702,7 +1750,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         restoreCollision()
     end
     self:SetStage("Modwood - igniting parent section",0.52)
-    self:AcquireWood(log,parent,token,state,function() return state.IgnitionObserved==true end)
+    self:AcquireWood(log,root,token,state,function() return state.IgnitionObserved==true end)
     if livePart(parent) and under(parent,log) then log.PrimaryPart=parent
     else assert(state.IgnitionObserved,"Modwood - burn parent disappeared before ignition") end
     local deadline=os.clock()+self.Config.BurnTimeout
@@ -1715,8 +1763,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         if not state.IgnitionObserved then
             checkMill() requireLive(lava,"lava contact") requireLive(parent,"burn parent")
             -- Paired calls are synchronous and always release a begun contact.
-            local pressed,pressError=pcall(touch,parent,lava,0)
-            local released,releaseError=pcall(touch,parent,lava,1)
+            local pressed,pressError=pcall(touch,lava,parent,0)
+            local released,releaseError=pcall(touch,lava,parent,1)
             assert(pressed and released,"Modwood touch failed - "..tostring(pressError or releaseError))
             state.TouchPairs=state.TouchPairs+1
             token:Sleep(0.15)
@@ -1751,7 +1799,6 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     assert(under(root,log) and owned(log),"Modwood - original cut target changed")
     log.PrimaryPart=root
     state.RootFrame=root.CFrame
-    self:AcquireWood(log,root,token,state)
     self:AcquireWood(log,leaf,token,state)
     for _,model in ipairs(logs:GetChildren()) do state.BeforeLogs[model]=true end
     state.Phase="Feeding"
