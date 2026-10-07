@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.7.0 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.7.1 - Lumber Tycoon 2
     October 7, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -58,7 +58,7 @@ local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.7.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.7.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -381,6 +381,8 @@ function H:Token(parent)
 
     function token:Check()
         if not H.Alive or not H.Running or H.Generation ~= self.Generation then error(CANCEL, 0) end
+        assert(not self.ModwoodFailure,self.ModwoodFailure)
+        if H.ModwoodGuard and H.ModwoodGuard.Generation==self.Generation then H.ModwoodGuard:Check() end
         if H.Watchdog then
             H:ObserveProgress()
             assert(os.clock()-(H.LastProgressAt or os.clock())<STALL_TIMEOUT,"No confirmed progress for three minutes")
@@ -492,7 +494,10 @@ function H:Character()
 end
 function H:Teleport(cf)
     local character, humanoid, root = self:Character()
+    local guard=self.ModwoodGuard
+    if guard and guard.Character==character then guard:BeforeMove(cf) end
     humanoid.Sit = false character:PivotTo(cf)
+    if guard and guard.Character==character then guard:Hold(root.CFrame) end
     root.AssemblyLinearVelocity = Vector3.zero root.AssemblyAngularVelocity = Vector3.zero
 end
 function H:PlotTiles(plot)
@@ -1433,6 +1438,125 @@ function H:AcquireWood(model, part, token, diagnostic, finished)
     until false
 end
 
+-- Ancestor keeps flight active for the complete Modwood sequence. This scoped
+-- equivalent holds an unanchored avatar and is removed on every exit path.
+function H:ModwoodHover(token,diagnostic)
+    token:Check()
+    assert(not self.ModwoodGuard,"A Modwood movement guard is already active")
+    local character,humanoid,avatar=self:Character()
+    local original={Frame=character:GetPivot(),Anchored=avatar.Anchored==true,
+        PlatformStand=humanoid.PlatformStand,AutoRotate=humanoid.AutoRotate}
+    local guard={Character=character,Avatar=avatar,Generation=token.Generation,Active=true,
+        Target=avatar.CFrame,ReturnFrame=original.Frame,Rescues=0}
+    local saved,objects,connection,added={},{},nil,nil
+    local floor=S.Workspace.FallenPartsDestroyHeight
+    guard.MinimumY=finite(floor) and floor+100 or -400
+    local position,orientation
+    local function zeroVelocity()
+        avatar.AssemblyLinearVelocity=Vector3.zero
+        avatar.AssemblyAngularVelocity=Vector3.zero
+    end
+    local function validate(frame)
+        local p=frame.Position
+        assert(finite(p.X) and finite(p.Y) and finite(p.Z) and math.abs(p.X)<1000000 and math.abs(p.Z)<1000000,
+            "Modwood - invalid movement target")
+        assert(p.Y>guard.MinimumY,"Modwood - movement toward the void blocked")
+    end
+    function guard:Release()
+        if not self.Active then return end
+        self.Active=false
+        if self.Failure then token.ModwoodFailure=self.Failure end
+        if connection then connection:Disconnect() end
+        if added then added:Disconnect() end
+        if H.ModwoodGuard==self then H.ModwoodGuard=nil end
+        -- Return while support still exists; never release above the remote work area.
+        if Player.Character==character and character.Parent and avatar.Parent and humanoid.Health>0 then
+            pcall(function()
+                validate(self.ReturnFrame)
+                character:PivotTo(self.ReturnFrame)
+                zeroVelocity()
+            end)
+        end
+        for i=#objects,1,-1 do pcall(function() objects[i]:Destroy() end) end
+        for part,collision in pairs(saved) do
+            if part.Parent then pcall(function() part.CanCollide=collision end) end
+        end
+        if humanoid.Parent then
+            humanoid.PlatformStand=original.PlatformStand
+            humanoid.AutoRotate=original.AutoRotate
+        end
+        if avatar.Parent then avatar.Anchored=original.Anchored end
+        diagnostic.HoverActive=false
+    end
+    token:Finally(function() guard:Release() end)
+    function guard:Check()
+        assert(self.Active and not self.Failure,self.Failure or "Modwood movement support stopped")
+        assert(Player.Character==character and avatar.Parent and humanoid.Health>0,"Modwood character changed")
+    end
+    function guard:BeforeMove(frame)
+        self:Check() validate(frame)
+        if position then position.Position=frame.Position end
+    end
+    function guard:Hold(frame)
+        self:Check() validate(frame)
+        self.Target=frame
+        if position then position.Position=frame.Position end
+        if orientation then orientation.CFrame=frame.Rotation end
+        zeroVelocity()
+    end
+    local function suppress(part)
+        if part:IsA("BasePart") and saved[part]==nil then
+            saved[part]=part.CanCollide part.CanCollide=false
+        end
+    end
+    validate(avatar.CFrame)
+    for _,part in ipairs(character:GetDescendants()) do suppress(part) end
+    added=character.DescendantAdded:Connect(suppress)
+    local attachment=Instance.new("Attachment")
+    table.insert(objects,attachment)
+    attachment.Name="MidnightModwoodHoverAttachment" attachment.Parent=avatar
+    position=Instance.new("AlignPosition") table.insert(objects,position)
+    position.Name="MidnightModwoodHoverPosition"
+    position.Mode=Enum.PositionAlignmentMode.OneAttachment position.Attachment0=attachment
+    position.ApplyAtCenterOfMass=true position.RigidityEnabled=true position.Position=avatar.Position
+    position.Parent=avatar
+    orientation=Instance.new("AlignOrientation") table.insert(objects,orientation)
+    orientation.Name="MidnightModwoodHoverOrientation"
+    orientation.Mode=Enum.OrientationAlignmentMode.OneAttachment orientation.Attachment0=attachment
+    orientation.RigidityEnabled=true orientation.CFrame=avatar.CFrame.Rotation orientation.Parent=avatar
+    humanoid.Sit=false humanoid.PlatformStand=true humanoid.AutoRotate=false
+    avatar.Anchored=false
+    self.ModwoodGuard=guard
+    diagnostic.HoverActive=true diagnostic.HoverRescues=0
+    guard:Hold(avatar.CFrame)
+    connection=(S.RunService.PreSimulation or S.RunService.Heartbeat):Connect(function()
+        if not guard.Active then return end
+        if not H.Alive or not H.Running or H.Generation~=guard.Generation then guard:Release() return end
+        if Player.Character~=character or not avatar.Parent or humanoid.Health<=0 then
+            guard.Failure="Modwood character changed" guard:Release() return
+        end
+        local ok=pcall(function()
+            assert(position.Parent==avatar and orientation.Parent==avatar and attachment.Parent==avatar)
+            local p=avatar.Position
+            assert(finite(p.X) and finite(p.Y) and finite(p.Z))
+            if p.Y<guard.MinimumY or (p-guard.Target.Position).Magnitude>16 then
+                guard.Rescues=guard.Rescues+1 diagnostic.HoverRescues=guard.Rescues
+                if guard.Rescues>3 then
+                    guard.Failure="Modwood - repeated character displacement; changing server"
+                    guard:Release() return
+                end
+                -- Move the model so its root returns to the recorded root frame.
+                character:PivotTo(guard.Target*avatar.CFrame:Inverse()*character:GetPivot())
+            end
+            humanoid.PlatformStand=true humanoid.AutoRotate=false
+            position.Position=guard.Target.Position
+            zeroVelocity()
+        end)
+        if not ok then guard.Failure="Modwood movement support unavailable" guard:Release() end
+    end)
+    return guard
+end
+
 function H:FindLava()
     local region = S.Workspace:FindFirstChild("Region_Volcano")
     assert(region, "Modwood - Region_Volcano missing")
@@ -1496,8 +1620,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local lava=self:FindLava()
     local originalPrimary=log.PrimaryPart
     local character,_,avatar=self:Character()
-    local oldAvatar,oldAnchored=avatar.CFrame,avatar.Anchored==true
-    local state={Phase="Prepared",SourceRevision="Ancestor-20261004",Log=log,Mill=mill,Inlet=inlet,
+    local state={Phase="Prepared",SourceRevision="Ancestor-20261007",Log=log,Mill=mill,Inlet=inlet,
         Root=root,Leaf=leaf,Parent=parent,ParentContainer=parent.Parent,Kind=value(log,"TreeClass"),
         OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
         RootID=value(root,"ID"),LeafID=value(leaf,"ID"),ParentID=value(parent,"ID")}
@@ -1510,7 +1633,9 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local function snapshot(reasonText)
         local lines={"Modwood runtime - "..reasonText,"Protocol: "..state.SourceRevision,"Phase: "..state.Phase,
             string.format("Touch pairs: %d; ignition: %s; separation: %s; feed frames: %d",state.TouchPairs,
-                tostring(state.IgnitionObserved==true),tostring(state.ParentSeparated==true),state.FeedFrames)}
+                tostring(state.IgnitionObserved==true),tostring(state.ParentSeparated==true),state.FeedFrames),
+            string.format("Hover active: %s; position corrections: %d; avatar Y: %.2f; root Y: %.2f",
+                tostring(state.HoverActive==true),state.HoverRescues or 0,avatar.Position.Y,root.Position.Y)}
         for _,item in ipairs({{"Root",root,state.RootID},{"Retained branch",leaf,state.LeafID},{"Burn parent",parent,state.ParentID}}) do
             local part=item[2]
             table.insert(lines,string.format("%s: ID=%s; live=%s; parent=%s; size=%.3f,%.3f,%.3f",item[1],
@@ -1520,21 +1645,22 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         self.ModwoodRuntimeDiagnostic=table.concat(lines,"\n")
     end
     token:Finally(function() snapshot("Task cleanup") end)
+    local hover=self:ModwoodHover(token,state)
     token:Finally(function()
         if log.Parent then
             log.PrimaryPart=originalPrimary and under(originalPrimary,log) and originalPrimary or nil
         end
-        if avatar.Parent then avatar.Anchored=oldAnchored end
-        if Player.Character==character and avatar.Parent then pcall(self.Teleport,self,oldAvatar) end
     end)
-    local restoreCollision=self:QuietWood(log,token)
     local drag=self:Remote("Interaction","ClientIsDragging")
     local function checkMill()
         token:Check()
+        hover:Check()
         assert(under(mill,playerModels) and owned(mill) and livePart(inlet) and under(inlet,mill),"The selected sawmill disappeared or changed owner")
     end
     local function requireLive(part,name)
         assert(livePart(part),"Modwood - "..name.." disappeared")
+        assert(finite(part.Position.Y) and part.Position.Y>hover.MinimumY,
+            "Modwood - "..name.." fell below the safe work area")
     end
     local function observeSeparation()
         if not livePart(parent) or parent.Parent~=state.ParentContainer then state.ParentSeparated=true end
@@ -1553,18 +1679,18 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local function standBy(part)
         local target=part.CFrame+Vector3.new(0,5,4)
         if (avatar.Position-target.Position).Magnitude>1.5 then self:Teleport(target) end
-        avatar.Anchored=true
     end
     local function transfer(frame)
         -- Changing PrimaryPart is essential: Ancestor pivots around the burn
         -- parent, not the original trunk. Keep the avatar beside that pivot.
+        local restoreCollision=self:QuietWood(log,token)
         for index=1,25 do
             checkMill() requireLive(root,"root") requireLive(leaf,"retained section")
             requireLive(parent,"burn parent")
             assert(owned(log) and under(parent,log),"Modwood - selected wood changed owner or structure")
             self:DampWood(log)
             if index==1 or (parent.Position-frame.Position).Magnitude>0.5 then
-                self:Teleport(frame+Vector3.new(0,5,4)) avatar.Anchored=true
+                self:Teleport(frame+Vector3.new(0,5,4))
                 log:PivotTo(frame)
             else standBy(parent) end
             if index%3==1 then drag:FireServer(log) end
@@ -1572,6 +1698,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             token:Sleep(0.06)
             if state.IgnitionObserved and state.Phase=="Ignited" and state.ParentSeparated then break end
         end
+        -- Ancestor leaves wood collisions enabled outside the transfer itself.
+        restoreCollision()
     end
     self:SetStage("Modwood - igniting parent section",0.52)
     self:AcquireWood(log,parent,token,state,function() return state.IgnitionObserved==true end)
@@ -1587,8 +1715,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         if not state.IgnitionObserved then
             checkMill() requireLive(lava,"lava contact") requireLive(parent,"burn parent")
             -- Paired calls are synchronous and always release a begun contact.
-            local pressed,pressError=pcall(touch,lava,parent,0)
-            local released,releaseError=pcall(touch,lava,parent,1)
+            local pressed,pressError=pcall(touch,parent,lava,0)
+            local released,releaseError=pcall(touch,parent,lava,1)
             assert(pressed and released,"Modwood touch failed - "..tostring(pressError or releaseError))
             state.TouchPairs=state.TouchPairs+1
             token:Sleep(0.15)
@@ -1694,8 +1822,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     until os.clock()>=deadline
     listener:Disconnect()
     assert(state.Phase=="Output","Modwood - trigger timed out without a matching new owned log")
-    restoreCollision()
-    avatar.Anchored=oldAnchored
+    -- Keep hover active while the sawmill produces its output, even if there
+    -- is no floor beside the inlet. Release only after a confirmed result.
     self:Teleport(inlet.CFrame+Vector3.new(0,4,8))
     self:SetStage("Modwood - waiting for sawmill output",0.78,"Waiting for finished planks")
     local deadline=os.clock()+self.Config.MillTimeout
@@ -1739,6 +1867,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         if volume~=outputVolume or parts~=outputParts or signature~=outputDimensions then stableSince=os.clock() end
         outputVolume,outputParts,outputDimensions=volume,parts,signature
         if #state.Outputs>0 and remaining==0 and volume>0 and stableSince and os.clock()-stableSince>2 then
+            hover:Release()
             return state.Outputs
         end
         token:Sleep(0.06)
@@ -2285,6 +2414,7 @@ function H:Stop()
     self.HopUncertain=false self.PendingTeleportTarget=nil
     self:Persist(false)
     if self.ActiveToken then self.ActiveToken:Clean() end
+    if self.ModwoodGuard then self.ModwoodGuard:Release() end
     if self.Alive then self:SetStage("Stopping",self.Progress,self.HopAttempt and "A teleport already sent cannot be recalled" or "Cleaning up the current task") end
 end
 function H:Destroy()
