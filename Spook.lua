@@ -1,6 +1,6 @@
 --[[
-    Midnight Spooky Hunter 1.6.2 - Lumber Tycoon 2
-    October 4, 2026. Client script using Midnight UI Library 2.4.0 or newer.
+    Midnight Spooky Hunter 1.7.0 - Lumber Tycoon 2
+    October 7, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
@@ -54,9 +54,11 @@ local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
 local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait = 12,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
+    TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
+    TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.6.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.7.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
@@ -109,6 +111,16 @@ local function webhookURL(url)
     return url:match("^https://discord%.com/api/webhooks/%d+/[%w_-]+$")
         or url:match("^https://discordapp%.com/api/webhooks/%d+/[%w_-]+$")
 end
+local function trackerURL(url)
+    return type(url)=="string" and url:match("^https://[%w%-]+%.[%w%-]+%.workers%.dev$")~=nil
+end
+local function trackerKey(key)
+    return type(key)=="string" and #key>=32 and #key<=128 and key:match("^[%w_-]+$")~=nil
+end
+local function serverID(id)
+    return type(id)=="string" and #id==36
+        and id:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$")~=nil
+end
 local function configFrom(source)
     local result = table.clone(DEFAULT)
     if type(source) ~= "table" then return result end
@@ -116,6 +128,7 @@ local function configFrom(source)
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
     for key, limits in pairs({LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {1, 180}, ScanWait = {2, 120},
         ScanInterval = {0.05, 1}, ScanSettle = {0.1, 5}, EmptyScanDelay = {0.5, 15}, GameSettle = {0.5, 5},
+        TrackerTimeout = {2, 10}, TrackerFreshness = {5, 60}, TrackerMinAge = {0, 10080}, TrackerBackoff = {30, 900},
         ServerSearchTimeout = {3, 30}, ServerRetryDelay = {1, 60}, ChopTimeout = {15, 180},
         BurnTimeout = {10, 120}, MillTimeout = {15, 180}, TaskTimeout = {300, 1800}}) do
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
@@ -123,6 +136,8 @@ local function configFrom(source)
     result.ScanWait=math.max(result.ScanWait,math.max(result.ScanSettle,result.EmptyScanDelay)+result.ScanInterval)
     result.Webhook = cleanURL(result.Webhook):sub(1, 400)
     result.ScriptURL = cleanURL(result.ScriptURL):sub(1, 1000)
+    result.TrackerURL = cleanURL(result.TrackerURL):gsub("/+$", ""):lower():sub(1, 200)
+    result.TrackerToken = cleanURL(result.TrackerToken):sub(1, 128)
     return result
 end
 function H:RememberServer(id)
@@ -212,12 +227,14 @@ end
 function H:Log(message, level, display)
     message=tostring(message) level=level or "INFO"
     if self.Config.Webhook~="" then message=message:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
+    if self.Config.TrackerToken~="" then message=message:gsub(self.Config.TrackerToken:gsub("([^%w])","%%%1"),"[tracker key]") end
     -- Keep technical timings in the copied report, never in the visible feed.
     table.insert(self.Logs,os.date("!%H:%M:%S").."  "..level.."  "..message)
     while #self.Logs>160 do table.remove(self.Logs,1) end
     if level=="DEBUG" or display==false then return end
     local visible=type(display)=="string" and display or shortError(message)
     if self.Config.Webhook~="" then visible=visible:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
+    if self.Config.TrackerToken~="" then visible=visible:gsub(self.Config.TrackerToken:gsub("([^%w])","%%%1"),"[tracker key]") end
     visible=uiText(visible)
     local entries=self.ActivityEntries
     local last=entries[#entries]
@@ -1354,6 +1371,9 @@ function H:BuildReport()
     end
     table.insert(lines,string.format("Minimum volume: %d studs3\nHop delay: %.2fs\nAutomatic recovery: %ss without confirmed progress\nAbandoned tasks: %d\nUI version: %s",
         MIN_TREE_VOLUME,self.Config.HopDelay,STALL_TIMEOUT,self.AbandonedTasks or 0,self.Midnight and self.Midnight.Version or "unavailable"))
+    table.insert(lines,"Server finder: "..(self.Config.TrackerEnabled and "Oldest observed" or "Standard")
+        .."\nTracker: "..tostring(self.TrackerStatus or "Not queried")
+        .."\nServer source: "..tostring(self.ServerSource or "Not selected"))
     table.insert(lines,"Gameplay reference: supplied Ancestor script\nModwood policy: one attempt; leave on failure")
     if self.ServerExitReason then table.insert(lines,"Pending server departure: "..self.ServerExitReason) end
     if self.MoveDiagnostic then table.insert(lines,self.MoveDiagnostic) end
@@ -1827,7 +1847,7 @@ function H:TryWebhook(title, description, token, receipt)
     end
     return ok
 end
-function H:Servers(token)
+function H:PublicServers(token)
     assert(type(Request) == "function", "An HTTP request function is required for server search")
     local cursor, servers, ids, cursors = nil, {}, {}, {}
     for _ = 1, 10 do
@@ -1866,6 +1886,94 @@ function H:Servers(token)
     end
     for i=#servers,2,-1 do local j=math.random(i) servers[i],servers[j]=servers[j],servers[i] end
     return servers
+end
+-- The tracker supplies observation history, never a claimed server creation date.
+-- A failed read cannot block harvesting or disable the ordinary Roblox search.
+function H:TrackerServers(token)
+    token:Check()
+    if not trackerURL(self.Config.TrackerURL) then return nil,"Invalid Worker URL" end
+    if not trackerKey(self.Config.TrackerToken) then return nil,"Tracker key missing or invalid" end
+    local exclusions,seen={},{}
+    local function exclude(id)
+        if #exclusions<250 and serverID(id) and not seen[id] then
+            seen[id]=true table.insert(exclusions,id)
+        end
+    end
+    exclude(game.JobId)
+    for _,id in ipairs(self.ServerHistory) do exclude(id) end
+    for id,untilTime in pairs(self.FailedServers) do if untilTime>os.time() then exclude(id) end end
+    local body=S.HttpService:JSONEncode({placeId=game.PlaceId,exclude=exclusions,limit=100,
+        maxSeenAgeSeconds=math.floor(self.Config.TrackerFreshness*60),
+        minObservedAgeSeconds=math.floor(self.Config.TrackerMinAge*60)})
+    local response=token:Await(function()
+        local sent,result=pcall(Request,{Url=self.Config.TrackerURL.."/v1/servers",Method="POST",
+            Headers={["Content-Type"]="application/json",["Authorization"]="Bearer "..self.Config.TrackerToken},Body=body})
+        assert(sent and type(result)=="table","Tracker connection failed")
+        return result
+    end,self.Config.TrackerTimeout)
+    local code=tonumber(response.StatusCode or response.Status)
+    if code==401 then return nil,"Tracker key rejected" end
+    if code==503 then return nil,"Tracker warming up or unavailable" end
+    if code~=200 then return nil,"Tracker HTTP "..tostring(code or "unavailable") end
+    if type(response.Body)~="string" or #response.Body>65536 then return nil,"Invalid tracker response" end
+    local decoded,data=pcall(S.HttpService.JSONDecode,S.HttpService,response.Body)
+    if not decoded or type(data)~="table" or data.schema~=1 or data.placeId~=game.PlaceId
+        or data.ageKind~="observed_minimum" or data.stale~=false or type(data.servers)~="table"
+        or #data.servers>100 or not finite(data.generatedAt) or not finite(data.lastScanAt)
+        or math.abs(os.time()-data.generatedAt)>120 or data.lastScanAt>data.generatedAt
+        or data.generatedAt-data.lastScanAt>900 then return nil,"Tracker data is stale or invalid" end
+    local ordered,accepted={},{}
+    for _,entry in ipairs(data.servers) do
+        if type(entry)=="table" and serverID(entry.id) and entry.id~=game.JobId
+            and not accepted[entry.id] and not self.Visited[entry.id]
+            and (not self.FailedServers[entry.id] or self.FailedServers[entry.id]<=os.time())
+            and finite(entry.firstSeen) and finite(entry.lastSeen) and entry.firstSeen>0
+            and entry.firstSeen<=entry.lastSeen and entry.lastSeen<=data.generatedAt
+            and data.generatedAt-entry.lastSeen<=self.Config.TrackerFreshness*60
+            and data.generatedAt-entry.firstSeen>=self.Config.TrackerMinAge*60
+            and finite(entry.playing) and finite(entry.maxPlayers)
+            and entry.playing>=0 and entry.playing<entry.maxPlayers then
+            accepted[entry.id]=true table.insert(ordered,entry)
+        end
+    end
+    table.sort(ordered,function(a,b)
+        if a.firstSeen~=b.firstSeen then return a.firstSeen<b.firstSeen end
+        if a.lastSeen~=b.lastSeen then return a.lastSeen>b.lastSeen end
+        return a.id<b.id
+    end)
+    local result={}
+    for _,entry in ipairs(ordered) do table.insert(result,entry.id) end
+    if #result==0 then return nil,"No eligible observed server" end
+    self.TrackerStatus=string.format("Ready - %d candidates - first observed at least %s ago",
+        #result,duration(data.generatedAt-ordered[1].firstSeen))
+    return result
+end
+function H:Servers(token)
+    token:Check()
+    if self.Config.TrackerEnabled and self.Config.TrackerURL~="" then
+        if os.clock()>=(self.TrackerRetryAt or 0) then
+            local ok,result,reason=pcall(self.TrackerServers,self,token)
+            if not ok and result==CANCEL then error(CANCEL,0) end
+            token:Check()
+            if ok and type(result)=="table" and #result>0 then
+                if self.ServerSource~="Oldest observed" then self:Log("Using oldest observed servers") end
+                self.TrackerRetryAt=nil self.TrackerFallbackLogged=false self.ServerSource="Oldest observed"
+                self:Log(self.TrackerStatus,"DEBUG")
+                return result
+            end
+            -- Never log a raw HTTP exception: some clients include headers in it.
+            self.TrackerStatus=ok and (reason or "No candidate") or "Tracker request failed or timed out"
+            self.TrackerRetryAt=os.clock()+self.Config.TrackerBackoff
+            if not self.TrackerFallbackLogged then
+                self:Log(self.TrackerStatus.." - using standard search","WARNING")
+                self.TrackerFallbackLogged=true
+            end
+        end
+    else
+        self.TrackerStatus=self.Config.TrackerEnabled and "Not configured" or "Disabled"
+    end
+    self.ServerSource="Standard"
+    return self:PublicServers(token)
 end
 function H:Bootstrap()
     assert(type(Queue)=="function", "queue_on_teleport unavailable - automatic continuation is not supported")
@@ -2239,7 +2347,14 @@ local function apply(key,newValue,control)
     if key=="Webhook" and candidate.Webhook~="" and not webhookURL(candidate.Webhook) then
         H:Log("Invalid Discord webhook URL","WARNING") return
     end
+    if key=="TrackerURL" and candidate.TrackerURL~="" and not trackerURL(candidate.TrackerURL) then
+        H:Log("Use your https://worker.account.workers.dev address without a path","WARNING") return
+    end
+    if key=="TrackerToken" and candidate.TrackerToken~="" and not trackerKey(candidate.TrackerToken) then
+        H:Log("Tracker key must contain 32 to 128 letters, numbers, dashes or underscores","WARNING") return
+    end
     H.Config=candidate
+    if key:sub(1,7)=="Tracker" then H.TrackerRetryAt=nil H.TrackerFallbackLogged=false end
     if controls.ScanWait then controls.ScanWait:Set(tostring(candidate.ScanWait),true) end
     if key=="AntiAfk" then H:SetAntiAfk(candidate.AntiAfk) end
     local target=H.PendingTeleportTarget
@@ -2251,10 +2366,10 @@ slot=settings:Dropdown({Title="Save slot",Options={"1","2","3","4","5","6"},Defa
     if H.Busy then slot:Set(tostring(H.Config.Slot),true) H:Log("Stop the hunt before changing slot","WARNING") return end
     apply("Slot",tonumber(v),slot)
 end})
-local function textSetting(parent,title,key,numeric,secret)
+local function textSetting(parent,title,key,numeric,secret,placeholder)
     local input
     input=parent:Textbox({Title=title,Default=secret and "" or tostring(H.Config[key]),
-        Placeholder=secret and (H.Config[key]~="" and "Saved - enter a URL to replace" or "https://discord.com/api/webhooks/...") or "",
+        Placeholder=secret and (H.Config[key]~="" and "Saved - enter a value to replace" or placeholder or "https://discord.com/api/webhooks/...") or placeholder or "",
         MaxLength=secret and 400 or 1000,Callback=function(v)
             if secret and v=="" then return end
             local n=numeric and tonumber(v) or v
@@ -2271,9 +2386,22 @@ for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"}}) do
     local toggle
     toggle=settings:Toggle({Title=title,Default=H.Config[key],Callback=function(v) apply(key,v,toggle) end})
 end
+local finder=settings:Section({Title="Server finder",Collapsible=true,Collapsed=false})
+local trackerToggle
+trackerToggle=finder:Toggle({Title="Prefer oldest observed",Default=H.Config.TrackerEnabled,
+    Callback=function(v) apply("TrackerEnabled",v,trackerToggle) end})
+textSetting(finder,"Worker URL","TrackerURL",false,false,"https://midnight-spooky-tracker.account.workers.dev")
+textSetting(finder,"Tracker key","TrackerToken",false,true,"Paste your private API_TOKEN")
+finder:Button({Title="Clear tracker key",Callback=function()
+    if H.Busy then H:Log("Stop the hunt before editing settings","WARNING") return end
+    H.Config.TrackerToken="" H.TrackerRetryAt=nil H.TrackerFallbackLogged=false
+    local saved,err=H:Persist(false) if not saved then H:Log(err,"WARNING") end
+end})
 local advanced=settings:Section({Title="Advanced",Collapsible=true,Collapsed=true})
 textSetting(advanced,"Script URL","ScriptURL",false)
 for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},
+    {"Tracker timeout (seconds)","TrackerTimeout"},{"Tracker retry (seconds)","TrackerBackoff"},
+    {"Last seen limit (minutes)","TrackerFreshness"},{"Minimum observed age (minutes)","TrackerMinAge"},
     {"Scan interval (seconds)","ScanInterval"},{"Tree confirmation (seconds)","ScanSettle"},
     {"Empty scan confirmation (seconds)","EmptyScanDelay"},{"Game stabilization (seconds)","GameSettle"},
     {"Scan timeout (seconds)","ScanWait"},{"Server search timeout (seconds)","ServerSearchTimeout"},
