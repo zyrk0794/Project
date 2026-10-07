@@ -1,8 +1,8 @@
 --[[
     Midnight UI Library
-    Version: 2.4.0
+    Version: 2.4.1
     Credits: Original implementation by OpenAI for this project.
-    Date: 2026-10-03
+    Date: 2026-10-07
     License: MIT
 
     Client-side Roblox Luau module with optional host capabilities.
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.4.0",
+    Version = "2.4.1",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -4371,7 +4371,7 @@ local function progressSurface(scope, parent, properties, backdrop)
         if state.Indeterminate then
             -- Analytic motion avoids restarting a tween every few frames.
             local phase = Midnight.ReducedMotion and 0 or state.Phase
-            local width = 0.24 + 0.1 * (0.5 + 0.5 * math.sin(phase * 2))
+            local width = 0.22
             local left = (1 - width) * (0.5 - 0.5 * math.cos(phase))
             fill.Position = UDim2.fromScale(left, 0)
             fill.Size = UDim2.fromScale(width, 1)
@@ -4399,7 +4399,7 @@ local function progressSurface(scope, parent, properties, backdrop)
         self.Indeterminate = nextMode
         self.Velocity = 0
         self.SettledCallback = nil
-        if nextMode then self.Phase = math.pi / 2 end
+        if nextMode then self.Phase = 0 end
         render()
     end
     function state:WhenSettled(callback)
@@ -4416,7 +4416,7 @@ local function progressSurface(scope, parent, properties, backdrop)
                 render()
                 return
             end
-            state.Phase = (state.Phase + math.min(delta, 0.1) * 2.4) % (math.pi * 2)
+            state.Phase = (state.Phase + math.min(delta, 0.1) * 1.65) % (math.pi * 2)
             render()
             return
         end
