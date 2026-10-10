@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.8.0 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.9.0 - Lumber Tycoon 2
     October 7, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -49,17 +49,18 @@ local Request = cap("request", request) or cap("http_request", http_request)
 local Queue = cap("queue_on_teleport", queue_on_teleport) or cap("queueonteleport", queueonteleport)
     or (type(synAPI) == "table" and synAPI.queue_on_teleport)
 local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
-local FILE = "MidnightSpookyHunter.json"
+local LEGACY_FILE = "MidnightSpookyHunter.json"
+local FILE = "MidnightSpookyHunter_"..tostring(Player.UserId)..".json"
 local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
-local DEFAULT = { Slot = 1, Webhook = "", ScriptURL = "", HopDelay = 1, ScanWait = 12,
+local DEFAULT = { Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
     VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
     TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.8.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.9.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -109,10 +110,6 @@ local function cleanURL(url)
     url = tostring(url or ""):match("^%s*(.-)%s*$")
     return url
 end
-local function webhookURL(url)
-    return url:match("^https://discord%.com/api/webhooks/%d+/[%w_-]+$")
-        or url:match("^https://discordapp%.com/api/webhooks/%d+/[%w_-]+$")
-end
 local function trackerURL(url)
     return type(url)=="string" and url:match("^https://[%w%-]+%.[%w%-]+%.workers%.dev$")~=nil
 end
@@ -136,7 +133,8 @@ local function configFrom(source)
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
     end
     result.ScanWait=math.max(result.ScanWait,math.max(result.ScanSettle,result.EmptyScanDelay)+result.ScanInterval)
-    result.Webhook = cleanURL(result.Webhook):sub(1, 400)
+    result.BotURL = cleanURL(result.BotURL):gsub("/+$", ""):lower():sub(1,200)
+    result.BotKey = cleanURL(result.BotKey):sub(1,128)
     result.ScriptURL = cleanURL(result.ScriptURL):sub(1, 1000)
     result.TrackerURL = cleanURL(result.TrackerURL):gsub("/+$", ""):lower():sub(1, 200)
     result.TrackerToken = cleanURL(result.TrackerToken):sub(1, 128)
@@ -235,7 +233,7 @@ function H:RecordFailure(stage,reason)
 end
 local restored
 if Read then
-    for _, path in ipairs({FILE, FILE .. ".bak"}) do
+    for _, path in ipairs({FILE, FILE .. ".bak", LEGACY_FILE}) do
         local ok, encoded = pcall(Read, path)
         if ok then
             local decoded, data = pcall(S.HttpService.JSONDecode, S.HttpService, encoded)
@@ -249,6 +247,18 @@ if Read then
 end
 if restored then
     H.Config = configFrom(restored.Config)
+    H.BotCommandVersion=finite(restored.BotCommandVersion) and math.max(0,math.floor(restored.BotCommandVersion)) or 0
+    H.BotDesired=restored.BotDesired
+    H.BotQueue={}
+    if type(restored.BotQueue)=="table" then
+        for _,event in ipairs(restored.BotQueue) do
+            if #H.BotQueue>=50 then break end
+            if type(event)=="table" and type(event.id)=="string" and type(event.title)=="string" and type(event.content)=="string"
+                and (event.kind=="found" or event.kind=="complete" or event.kind=="interrupted" or event.kind=="info") then
+                table.insert(H.BotQueue,{id=event.id:sub(1,64),kind=event.kind,title=event.title:sub(1,120),content=event.content:sub(1,700),snapshot=type(event.snapshot)=="table" and event.snapshot or nil,capturedAt=event.capturedAt})
+            end
+        end
+    end
     if type(restored.Departure)=="table" and restored.Departure.JobId==game.JobId then
         H.ServerExitReason=tostring(restored.Departure.Reason or "Modwood was interrupted")
     end
@@ -324,14 +334,14 @@ local function shortError(message)
 end
 function H:Log(message, level, display)
     message=tostring(message) level=level or "INFO"
-    if self.Config.Webhook~="" then message=message:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
+    if self.Config.BotKey~="" then message=message:gsub(self.Config.BotKey:gsub("([^%w])","%%%1"),"[client key]") end
     if self.Config.TrackerToken~="" then message=message:gsub(self.Config.TrackerToken:gsub("([^%w])","%%%1"),"[tracker key]") end
     -- Keep technical timings in the copied report, never in the visible feed.
     table.insert(self.Logs,os.date("!%H:%M:%S").."  "..level.."  "..message)
     while #self.Logs>160 do table.remove(self.Logs,1) end
     if level=="DEBUG" or display==false then return end
     local visible=type(display)=="string" and display or shortError(message)
-    if self.Config.Webhook~="" then visible=visible:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
+    if self.Config.BotKey~="" then visible=visible:gsub(self.Config.BotKey:gsub("([^%w])","%%%1"),"[client key]") end
     if self.Config.TrackerToken~="" then visible=visible:gsub(self.Config.TrackerToken:gsub("([^%w])","%%%1"),"[tracker key]") end
     visible=uiText(visible)
     local entries=self.ActivityEntries
@@ -505,7 +515,7 @@ function H:Persist(resume, target)
         if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
     end
     local data = { Schema = 2, Version = self.Version, TimingRevision = 1, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
-        VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
+        VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, BotQueue=self.BotQueue or {}, BotDesired=self.BotDesired, BotCommandVersion=self.BotCommandVersion or 0, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
         StartedAt = self.StartedAt, Resume = resume == true, Target = target, TicketTime = os.time(),
         Departure = self.ServerExitReason and {JobId=game.JobId,Reason=self.ServerExitReason} or nil }
     local ok = pcall(function()
@@ -1203,7 +1213,7 @@ function H:SyncPhysics(token,rounds,diagnostic,refresh)
                 diagnostic.SyncReplies=diagnostic.SyncReplies+1
             else ping=nil diagnostic.SyncFallback="TestPing rejected" end
         else diagnostic.SyncFallback=diagnostic.SyncFallback or "TestPing unavailable" end
-        token:Sleep(0.15)
+        token:Sleep(self.Config.FastHarvest and 0.03 or 0.15)
     end
     if refresh then refresh() end
     return diagnostic.SyncReplies
@@ -1287,7 +1297,11 @@ function H:Chop(entry, tool, stats, token, checkpoint)
                 local moved=(avatar.Position-trunk.Position).Magnitude>10
                 if moved then self:Teleport(CFrame.lookAt(stand,trunk.Position)) end
                 if not cut.Synchronized or moved then
-                    self:SyncPhysics(token,cut.Synchronized and 2 or 8,cut)
+                    if self.Config.FastHarvest then
+                        -- Send the first targeted strike after one scheduler frame,
+                        -- without eight synchronous round trips in front of it.
+                        token:Sleep(0.03)
+                    else self:SyncPhysics(token,cut.Synchronized and 2 or 8,cut) end
                     cut.Synchronized=true
                     -- Replication may have produced the felled log during the wait.
                     found=self:FindFelledLog(cut)
@@ -1296,6 +1310,12 @@ function H:Chop(entry, tool, stats, token, checkpoint)
                 nextPosition=os.clock()+0.75
             end
             if os.clock()>=nextStrike then
+                if self.Config.FastHarvest and cut.Strikes>=3 and not cut.RecoverySynced and owner==nil then
+                    self:SyncPhysics(token,2,cut)
+                    cut.RecoverySynced=true
+                    found=self:FindFelledLog(cut)
+                    if found then cut.Result=found return found end
+                end
                 token:Check()
                 cut.Strikes=cut.Strikes+1
                 local sectionId=tonumber(value(trunk,"ID"))
@@ -1626,8 +1646,10 @@ function H:BuildReport()
             end
         end
     end
+    table.insert(lines,"Discord bot: "..tostring(self.BotStatus or "Not connected"))
     local text=table.concat(lines,"\n\n")
-    if self.Config.Webhook~="" then text=text:gsub(self.Config.Webhook:gsub("([^%w])","%%%1"),"[webhook]") end
+    if self.Config.TrackerToken~="" then text=text:gsub(self.Config.TrackerToken:gsub("([^%w])","%%%1"),"[tracker key]") end
+    if self.Config.BotKey~="" then text=text:gsub(self.Config.BotKey:gsub("([^%w])","%%%1"),"[client key]") end
     return text
 end
 -- Executor ownership checks are advisory. Ancestor's supplied implementation
@@ -1929,7 +1951,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             else standBy(parent) end
             drag:FireServer(log)
             self:DampWood(log)
-            token:Sleep(0.06)
+            token:Sleep(self:AdaptiveWait(self.Config.FastHarvest and 0.03 or 0.06,0.12))
             if state.IgnitionObserved and state.Phase=="Ignited" and state.ParentSeparated then break end
         end
         -- Ancestor leaves wood collisions enabled outside the transfer itself.
@@ -2009,7 +2031,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     -- Ancestor primes the inlet above center before feeding at its center.
     for _=1,25 do
         if not feed(0.5) then break end
-        token:Sleep(0.06)
+        token:Sleep(self:AdaptiveWait(self.Config.FastHarvest and 0.03 or 0.06,0.12))
     end
     self:UpdateHarvestProgress(0.64)
     deadline=os.clock()+self.Config.ChopTimeout
@@ -2122,9 +2144,57 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             hover:Release()
             return state.Outputs
         end
-        token:Sleep(0.06)
+        token:Sleep(self:AdaptiveWait(self.Config.FastHarvest and 0.03 or 0.06,0.12))
     until os.clock()>=deadline
     error("Modwood - whole-tree conversion or finished output not confirmed; wood left in this server",0)
+end
+function H:PlankPlacement(plank,center)
+    local plot=self:Plot()
+    assert(plot and owned(plot),"Your plot is no longer owned")
+    local bounds,size=plank:GetBoundingBox()
+    local relative=plank:GetPivot():ToObjectSpace(bounds)
+    local rotation=CFrame.new()
+    local width,height,depth=size.X,size.Y,size.Z
+    if size.Y>size.X and size.Y>size.Z then
+        rotation=CFrame.Angles(0,0,math.pi/2)
+        width,height=size.Y,size.X
+    end
+    local tiles=self:PlotTiles(plot)
+    local function onLand(x,z)
+        for _,tile in ipairs(tiles) do
+            if tile:IsA("BasePart") and (tile.Name=="Square" or tile.Name=="OriginSquare")
+                and math.abs(x-tile.Position.X)<=tile.Size.X/2-0.05
+                and math.abs(z-tile.Position.Z)<=tile.Size.Z/2-0.05 then return true end
+        end
+        return false
+    end
+    local params=RaycastParams.new()
+    params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances={Player.Character,plank}
+    params.RespectCanCollide=true params.IgnoreWater=true
+    local offsets={{0,0},{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}}
+    local best,bestScore
+    for _,offset in ipairs(offsets) do
+        local x=center.Position.X+offset[1]*(width+0.6)
+        local z=center.Position.Z+offset[2]*(depth+0.6)
+        local support,valid=center.Position.Y,true
+        for _,corner in ipairs({{0,0},{-1,-1},{1,-1},{-1,1},{1,1}}) do
+            local px,pz=x+corner[1]*width/2,z+corner[2]*depth/2
+            if not onLand(px,pz) then valid=false break end
+            local hit=S.Workspace:Raycast(Vector3.new(px,center.Position.Y+200,pz),Vector3.new(0,-205,0),params)
+            if not hit then valid=false break end
+            support=math.max(support,hit.Position.Y)
+        end
+        if valid and support-center.Position.Y<12 then
+            local score=(support-center.Position.Y)*10+math.abs(x-center.Position.X)+math.abs(z-center.Position.Z)
+            if not bestScore or score<bestScore then
+                bestScore=score
+                best=CFrame.new(x,support+height/2+0.04,z)*rotation*relative:Inverse()
+            end
+        end
+    end
+    assert(best,"No supported placement near the plot center - clear space for this plank")
+    return best
 end
 function H:Deliver(planks, center, token, checkpoint)
     local remaining = {}
@@ -2136,19 +2206,8 @@ function H:Deliver(planks, center, token, checkpoint)
     self:UpdateHarvestProgress(0.85+0.10*deliveredCount/math.max(1,#planks),
         string.format("Planks %d / %d",deliveredCount,#planks))
     for _, plank in ipairs(remaining) do
-        local bounds, size = plank:GetBoundingBox()
-        local relative = plank:GetPivot():ToObjectSpace(bounds)
-        -- Upright bounding frame; place directly on the owned land tile and stack without overlap.
-        local support=center.Position.Y+self.StackHeight
-        local params=RaycastParams.new()
-        params.FilterType=Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances={Player.Character,plank}
-        params.RespectCanCollide=true params.IgnoreWater=true
-        local hit=S.Workspace:Raycast(center.Position+Vector3.new(0,200,0),Vector3.new(0,-201,0),params)
-        if hit then support=math.max(support,hit.Position.Y) end
-        local target = CFrame.new(center.Position.X, support + size.Y/2 + 0.04, center.Position.Z) * relative:Inverse()
+        local target=self:PlankPlacement(plank,center)
         self:Move(plank, target, token)
-        self.StackHeight = self.StackHeight + size.Y + 0.05
         self.Stats.Planks = self.Stats.Planks + 1
         self.UnsavedDelivery=true
         if checkpoint then checkpoint.Delivered[plank] = true end
@@ -2181,59 +2240,118 @@ function H:SaveSlot(token)
     token:Sleep(2)
     self.UnsavedDelivery=false
 end
-function H:SendWebhook(title, description, token, receipt)
-    local url = self.Config.Webhook
-    if url == "" then return end
-    assert(webhookURL(url), "Webhook must be a Discord webhook URL without extra parameters")
-    assert(type(Request) == "function", "Your executor has no HTTP request function")
-    local fields = {
-        {name = "Server", value = game.JobId, inline = false},
-        {name = "Date (UTC)", value = os.date("!%Y-%m-%d %H:%M:%S"), inline = true},
-        {name = "Hunt duration", value = duration(os.time() - self.StartedAt), inline = true},
-        {name = "Slot", value = tostring(self.Config.Slot), inline = true},
-    }
-    if receipt then
-        table.insert(fields, {name="Trees processed", value=tostring(receipt.Trees), inline=true})
-        table.insert(fields, {name="Planks delivered", value=tostring(receipt.Planks), inline=true})
-        table.insert(fields, {name="Processing time", value=duration(receipt.Seconds), inline=true})
-        table.insert(fields, {name="Slot save", value="Confirmed", inline=true})
-        if receipt.Skipped > 0 then
-            table.insert(fields, {name="Unavailable trees skipped", value=tostring(receipt.Skipped), inline=true})
+-- Only the per-account client key is stored here. The Discord token stays in Cloudflare.
+function H:PersistBotState()
+    local target=self.PendingTeleportTarget
+    return self:Persist(target~=nil,target)
+end
+function H:BotSnapshot(event)
+    return {accountId=tostring(Player.UserId),jobId=game.JobId,version=self.Version,
+        stage=self.Stage,running=self.Running,progress=self.Progress*100,slot=self.Config.Slot,
+        pending=#self.PendingWood,stats={Scanned=self.Stats.Scanned,FoundTrees=self.Stats.FoundTrees,
+            Harvested=self.Stats.Harvested,Planks=self.Stats.Planks,Skipped=self.Stats.Skipped},
+        lastConfirmed=self.LastConfirmedMilestone or "",report=self:BuildReport():sub(1,8000),
+        ackVersion=self.BotCommandVersion or 0,event=event}
+end
+function H:BotRequest(event)
+    if not self.Alive or not self.Config.BotEnabled or self.Config.BotURL=="" or self.Config.BotKey=="" then return false end
+    if type(Request)~="function" then return false end
+    local response
+    local url,secret=self.Config.BotURL,self.Config.BotKey
+    local encoded=S.HttpService:JSONEncode(self:BotSnapshot(event))
+    local worker=task.spawn(function()
+        response=table.pack(pcall(Request,{Url=url.."/v1/sync",Method="POST",
+            Headers={["Content-Type"]="application/json",Authorization="Bearer "..secret},Body=encoded}))
+    end)
+    self.BotRequestThread=worker
+    local deadline=os.clock()+8
+    while self.Alive and not response and os.clock()<deadline do task.wait(0.08) end
+    if not response then pcall(task.cancel,worker) end
+    self.BotRequestThread=nil
+    if not self.Alive or url~=self.Config.BotURL or secret~=self.Config.BotKey then return false end
+    if not response or not response[1] or type(response[2])~="table" then
+        self.BotStatus="Service unavailable" return false
+    end
+    local status=tonumber(response[2].StatusCode or response[2].Status)
+    if status~=200 then
+        self.BotStatus=status==401 and "Client key rejected" or "Service HTTP "..tostring(status)
+        return false
+    end
+    local body=response[2].Body
+    if type(body)~="string" or #body>8192 then return false end
+    local ok,data=pcall(S.HttpService.JSONDecode,S.HttpService,body)
+    if not ok or type(data)~="table" or data.ok~=true then return false end
+    self.BotStatus="Connected"
+    if data.desired=="paused" or data.desired=="running" or data.desired=="observe" then self.BotDesired=data.desired end
+    local revision=data.commandVersion
+    if finite(revision) and revision>=0 and revision==math.floor(revision) then
+        if revision>(self.BotCommandVersion or 0) then
+            local acknowledged=false
+            if data.desired=="paused" then self:Stop() acknowledged=true
+            elseif data.desired=="running" and not self.Busy then self:Start() acknowledged=true
+            elseif data.desired=="running" and self.Running then acknowledged=true
+            elseif data.desired=="observe" then acknowledged=true end
+            if acknowledged then
+                self.BotCommandVersion=revision
+                self:PersistBotState()
+                self:Log(data.desired=="paused" and "Stopped from Discord" or "Discord command received")
+            end
+        elseif data.desired=="paused" and self.Running then self:Stop() end
+    end
+    return not event or data.eventAccepted==true
+end
+function H:StartBot()
+    if self.BotLoop then return end
+    self.BotQueue=self.BotQueue or {}
+    self.BotLoop=task.defer(function()
+        local failures=0
+        while self.Alive do
+            local event=self.BotQueue[1]
+            local ok,accepted=pcall(self.BotRequest,self,event)
+            if not self.Alive then break end
+            if self.UI and self.UI.BotConnection then
+                local status=self.Config.BotEnabled and (self.BotStatus or "Not configured") or "Disabled"
+                if status~=self.BotShownStatus then
+                    self.BotShownStatus=status
+                    self.UI.BotConnection:Set("Bot - "..status,"Roblox account "..tostring(Player.UserId))
+                end
+            end
+            if ok and accepted then
+                failures=0
+                if event then table.remove(self.BotQueue,1) self:PersistBotState() end
+            else failures=math.min(4,failures+1) end
+            local pause=failures>0 and math.min(120,15*2^(failures-1)) or (#self.BotQueue>0 and 2 or 30)
+            local untilTime=os.clock()+pause
+            repeat task.wait(0.25) until not self.Alive or os.clock()>=untilTime or self.BotWake
+            self.BotWake=false
         end
-    elseif self.Counts then
-        table.insert(fields, {name="Spooky", value=string.format("%d trees / %.1f studs3",self.Counts.Spooky,self.Counts.SpookyVolume), inline=true})
-        table.insert(fields, {name="SpookyNeon", value=string.format("%d trees / %.1f studs3",self.Counts.SpookyNeon,self.Counts.SpookyNeonVolume), inline=true})
-    end
-    local body = S.HttpService:JSONEncode({ username = "Midnight Spooky Hunter", allowed_mentions = {parse = {}},
-        embeds = {{title = title, description = description, color = receipt and 8641782 or 4881663, fields = fields,
-            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}} })
-    local response = token:Await(function()
-        local ok, result = pcall(Request, {Url=url .. "?wait=true",Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
-        assert(ok and type(result)=="table", "Webhook transport failed (details hidden)") return result
-    end, 15)
-    local status = tonumber(response.StatusCode or response.Status)
-    if status == 429 then
-        local ok, data = pcall(S.HttpService.JSONDecode, S.HttpService, response.Body or "")
-        local delay = ok and type(data)=="table" and tonumber(data.retry_after) or 5
-        token:Sleep(math.clamp(delay or 5,1,60))
-        response = token:Await(function()
-            local ok, result = pcall(Request, {Url=url .. "?wait=true",Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
-            assert(ok and type(result)=="table", "Webhook retry failed (details hidden)") return result
-        end,15)
-        status = tonumber(response.StatusCode or response.Status)
-    end
-    assert(status and status >= 200 and status < 300, "Webhook failed with HTTP " .. tostring(status))
-    self:Log("Webhook delivered","DEBUG")
+        self.BotLoop=nil
+    end)
 end
-function H:TryWebhook(title, description, token, receipt)
-    local ok, err = pcall(self.SendWebhook, self, title, description, token, receipt)
-    if not ok then
-        if err == CANCEL then error(CANCEL, 0) end
-        token:Check()
-        self:Log("Webhook unavailable - " .. cleanError(err), "WARNING")
+function H:NotifyBot(title,description,token,receipt)
+    token:Check()
+    if not self.Config.BotEnabled or self.Config.BotURL=="" or self.Config.BotKey=="" then return false end
+    local kind=receipt and "complete" or title=="Rare trees found" and "found"
+        or title=="Harvest interrupted" and "interrupted" or "info"
+    local event={id=S.HttpService:GenerateGUID(false):lower(),kind=kind,title=title,content=description,capturedAt=os.time()}
+    event.snapshot=self:BotSnapshot()
+    event.snapshot.report=nil event.snapshot.ackVersion=nil
+    if receipt then
+        event.content=string.format("%d trees processed - %d planks delivered - slot save confirmed. Processing: %s.",
+            receipt.Trees,receipt.Planks,duration(receipt.Seconds))
     end
-    return ok
+    self.BotQueue=self.BotQueue or {}
+    if #self.BotQueue>=50 then
+        self:Log("Discord queue full - oldest pending notice removed","WARNING")
+        table.remove(self.BotQueue,1)
+    end
+    table.insert(self.BotQueue,event)
+    self:PersistBotState()
+    self.BotWake=true
+    self:StartBot()
+    return true
 end
+
 function H:PublicServers(token)
     assert(type(Request) == "function", "An HTTP request function is required for server search")
     local cursor, servers, ids, cursors = nil, {}, {}, {}
@@ -2469,7 +2587,7 @@ function H:Run(token)
         if #entries==0 then self:SetStage("No rare tree found",0.1) return self:Hop(token) end
         self:SetStage("Rare trees found",0.1,tostring(#entries).." trees")
         if not self.FoundNotified then
-            self:TryWebhook("Rare trees found",self.Config.FullCycle and "Spooky wood detected." or "Search paused in this server.",token)
+            self:NotifyBot("Rare trees found",self.Config.FullCycle and "Spooky wood detected." or "Search paused in this server.",token)
             self.FoundNotified=true
         end
         if not self.Config.FullCycle then return "Found - search paused in this server" end
@@ -2601,10 +2719,10 @@ function H:Run(token)
     end
     if self.NeedsAttention then return "Equip a compatible inventory axe, then retry" end
     if processed>0 then
-        self:TryWebhook(processed == #entries and "Harvest complete" or "Harvest complete - some trees unavailable",
+        self:NotifyBot(processed == #entries and "Harvest complete" or "Harvest complete - some trees unavailable",
             "Wood processed, planks delivered to your plot and slot save confirmed.",token,
             {Trees=processed, Planks=self.Stats.Planks-initialPlanks, Seconds=os.clock()-batchStarted, Skipped=skipped})
-    else self:TryWebhook("Trees no longer available","No harvest was performed. Moving to the next server.",token) end
+    else self:NotifyBot("Trees no longer available","No harvest was performed. Moving to the next server.",token) end
     token:Clean() token.Character=nil
     return self:Hop(token)
 end
@@ -2626,7 +2744,7 @@ function H:LeaveStalledServer(token,reason)
     local report=self:BuildReport()
     self.LastRecoveryReport=report
     if Write then pcall(Write,"MidnightSpookyHunter-last-recovery.txt",report) end
-    self:TryWebhook("Harvest interrupted",reason..". Moving to another server. Remaining wood was not confirmed as processed.",token)
+    self:NotifyBot("Harvest interrupted",reason..". Moving to another server. Remaining wood was not confirmed as processed.",token)
     self.AbandonedTasks=(self.AbandonedTasks or 0)+#self.PendingWood
     self.PendingWood={} self.Dirty=false self.NeedsAttention=false
     self.Abandoning=true
@@ -2693,6 +2811,8 @@ function H:Destroy()
     self:Stop() self.Alive=false
     if self.AntiAfkConnection then self.AntiAfkConnection:Disconnect() self.AntiAfkConnection=nil end
     if self.Worker then pcall(task.cancel,self.Worker) end
+    if self.BotRequestThread then pcall(task.cancel,self.BotRequestThread) self.BotRequestThread=nil end
+    if self.BotLoop then pcall(task.cancel,self.BotLoop) self.BotLoop=nil end
     for _,c in ipairs(self.Connections) do c:Disconnect() end
     if self.ProgressTween then self.ProgressTween:Cancel() end
     if self.StageTween then self.StageTween:Cancel() end
@@ -2747,8 +2867,14 @@ local function apply(key,newValue,control)
     end
     local candidate=table.clone(H.Config) candidate[key]=newValue
     candidate=configFrom(candidate)
-    if key=="Webhook" and candidate.Webhook~="" and not webhookURL(candidate.Webhook) then
-        H:Log("Invalid Discord webhook URL","WARNING") return
+    if key=="BotURL" and candidate.BotURL~="" and not trackerURL(candidate.BotURL) then
+        control:Set(H.Config[key],true) H:Log("Use your Discord worker https://name.account.workers.dev address","WARNING") return
+    end
+    if key=="BotKey" and candidate.BotKey~="" and not candidate.BotKey:match("^[a-f0-9]+$") then
+        H:Log("Enter the client key issued by /hunter register","WARNING") return
+    end
+    if key=="BotKey" and candidate.BotKey~="" and #candidate.BotKey~=64 then
+        H:Log("Client keys contain 64 hexadecimal characters","WARNING") return
     end
     if key=="TrackerURL" and candidate.TrackerURL~="" and not trackerURL(candidate.TrackerURL) then
         H:Log("Use your https://worker.account.workers.dev address without a path","WARNING") return
@@ -2757,6 +2883,7 @@ local function apply(key,newValue,control)
         H:Log("Tracker key must contain 32 to 128 letters, numbers, dashes or underscores","WARNING") return
     end
     H.Config=candidate
+    if key=="BotKey" or key=="BotURL" then H.BotCommandVersion=0 H.BotWake=true end
     if key:sub(1,7)=="Tracker" then H.TrackerRetryAt=nil H.TrackerFallbackLogged=false end
     if controls.ScanWait then controls.ScanWait:Set(tostring(candidate.ScanWait),true) end
     if key=="AntiAfk" then H:SetAntiAfk(candidate.AntiAfk) end
@@ -2772,7 +2899,7 @@ end})
 local function textSetting(parent,title,key,numeric,secret,placeholder)
     local input
     input=parent:Textbox({Title=title,Default=secret and "" or tostring(H.Config[key]),
-        Placeholder=secret and (H.Config[key]~="" and "Saved - enter a value to replace" or placeholder or "https://discord.com/api/webhooks/...") or placeholder or "",
+        Placeholder=secret and (H.Config[key]~="" and "Saved - enter a value to replace" or placeholder or "Enter your client key") or placeholder or "",
         MaxLength=secret and 400 or 1000,Callback=function(v)
             if secret and v=="" then return end
             local n=numeric and tonumber(v) or v
@@ -2782,9 +2909,15 @@ local function textSetting(parent,title,key,numeric,secret,placeholder)
         end})
     controls[key]=input
 end
-textSetting(settings,"Discord webhook","Webhook",false,true)
-settings:Button({Title="Clear webhook",Callback=function() if not H.Busy then H.Config.Webhook="" H:Persist(false) end end})
-for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"}}) do
+local botSection=settings:Section({Title="Discord bot",Collapsible=true,Collapsed=false})
+textSetting(botSection,"Bot service URL","BotURL",false,false,"https://midnight-hunter-discord.account.workers.dev")
+textSetting(botSection,"Client key","BotKey",false,true,"Key from /hunter register")
+H.UI.BotConnection=botSection:Label({Title="Bot - Not connected",Description="Roblox account "..tostring(Player.UserId)})
+local botToggle
+botToggle=botSection:Toggle({Title="Connect to Discord",Default=H.Config.BotEnabled,
+    Callback=function(v) apply("BotEnabled",v,botToggle) H.BotWake=true end})
+botSection:Button({Title="Reconnect bot",Callback=function() H.BotWake=true H:StartBot() end})
+for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"Fast harvest","FastHarvest"}}) do
     local title,key=entry[1],entry[2]
     local toggle
     toggle=settings:Toggle({Title=title,Default=H.Config[key],Callback=function(v) apply(key,v,toggle) end})
@@ -2828,9 +2961,10 @@ end)
 if H.ConfigWarning then H:Log(H.ConfigWarning,"WARNING") end
 H:Log("Ready")
 H:SetAntiAfk(H.Config.AntiAfk)
+H:StartBot()
 if H.RecoveredSession then H:Log("Resuming unfinished wood") end
 local resume=Env.MidnightSpookyResume==true and restored and restored.Resume==true and restored.Target==game.JobId
     and finite(restored.TicketTime) and os.time()-restored.TicketTime<600
 Env.MidnightSpookyResume=nil
-if resume or (H.RecoveredSession and wasRunning) then H:Start() end
+if (resume or (H.RecoveredSession and wasRunning)) and H.BotDesired~="paused" then H:Start() end
 return H
