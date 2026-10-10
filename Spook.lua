@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.10.2 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.10.3 - Lumber Tycoon 2
     October 10, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -62,7 +62,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.10.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.10.3", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -1550,6 +1550,17 @@ function H:Move(model,destination,token)
     local part=partOf(model)
     self:AcquireWood(model,part,token,record)
     local restore=self:QuietWood(model,token)
+    -- Do not let gravity carry the wood through the plot while collisions are off.
+    local suspended=false
+    local suspension=S.RunService.PreSimulation:Connect(function()
+        if suspended and self.Alive and self.Running and token.Generation==self.Generation
+            and model.Parent and owned(model) then self:DampWood(model) end
+    end)
+    local function releaseSuspension()
+        suspended=false
+        suspension:Disconnect()
+    end
+    token:Finally(releaseSuspension)
     local relative=model:GetPivot():ToObjectSpace(part.CFrame)
     local placements,stableSince,nextPlacement=0,nil,0
     local deadline=os.clock()+8
@@ -1567,6 +1578,7 @@ function H:Move(model,destination,token)
             drag:FireServer(model)
             model:PivotTo(destination)
             self:DampWood(model)
+            suspended=true
             placements=placements+1 nextPlacement=os.clock()+0.5 stableSince=nil
             record.Placements=placements
         elseif distance<=1.5 then stableSince=stableSince or os.clock()
@@ -1577,6 +1589,7 @@ function H:Move(model,destination,token)
     until os.clock()>=deadline
     assert(stableSince and os.clock()-stableSince>=0.6,"Wood did not settle at its destination")
     restore()
+    releaseSuspension()
     -- Observe restored collisions too; a local placement is not delivery proof.
     for _=1,5 do
         token:Sleep(0.15)
@@ -1586,6 +1599,13 @@ function H:Move(model,destination,token)
     end
     record.Settled=true
 end
+local function worldBoundsSize(frame,size)
+    local right,up,back=frame.RightVector,frame.UpVector,frame.LookVector
+    return Vector3.new(
+        math.abs(right.X)*size.X+math.abs(up.X)*size.Y+math.abs(back.X)*size.Z,
+        math.abs(right.Y)*size.X+math.abs(up.Y)*size.Y+math.abs(back.Y)*size.Z,
+        math.abs(right.Z)*size.X+math.abs(up.Z)*size.Y+math.abs(back.Z)*size.Z)
+end
 function H:BringTreeToBase(log, plot, token)
     local owner = plot and plot:FindFirstChild("Owner")
     assert(owner and owner:IsA("ObjectValue") and owner.Value == Player, "Your plot is no longer owned")
@@ -1593,8 +1613,9 @@ function H:BringTreeToBase(log, plot, token)
     local center = self:PlotCenter(plot)
     local bounds, size = log:GetBoundingBox()
     local relative = log:GetPivot():ToObjectSpace(bounds)
-    local target = CFrame.new(center.Position.X, center.Position.Y + size.Y/2 + 0.1, center.Position.Z)
-        * relative:Inverse()
+    local height=worldBoundsSize(bounds,size).Y
+    local target = CFrame.new(center.Position.X, center.Position.Y + height/2 + 4, center.Position.Z)
+        * bounds.Rotation * relative:Inverse()
     self:Move(log, target, token)
     self:Log("Felled tree delivered to your plot before Modwood","INFO","Tree delivered")
 end
@@ -2470,12 +2491,9 @@ function H:PlankPlacement(plank,center)
     assert(plot and owned(plot),"Your plot is no longer owned")
     local bounds,size=plank:GetBoundingBox()
     local relative=plank:GetPivot():ToObjectSpace(bounds)
-    local rotation=CFrame.new()
-    local width,height,depth=size.X,size.Y,size.Z
-    if size.Y>size.X and size.Y>size.Z then
-        rotation=CFrame.Angles(0,0,math.pi/2)
-        width,height=size.Y,size.X
-    end
+    local rotation=bounds.Rotation
+    local extent=worldBoundsSize(bounds,size)
+    local width,height,depth=extent.X,extent.Y,extent.Z
     local tiles=self:PlotTiles(plot)
     local function onLand(x,z)
         for _,tile in ipairs(tiles) do
@@ -2506,7 +2524,7 @@ function H:PlankPlacement(plank,center)
             local score=(support-center.Position.Y)*10+math.abs(x-center.Position.X)+math.abs(z-center.Position.Z)
             if not bestScore or score<bestScore then
                 bestScore=score
-                best=CFrame.new(x,support+height/2+0.04,z)*rotation*relative:Inverse()
+                best=CFrame.new(x,support+height/2+4,z)*rotation*relative:Inverse()
             end
         end
     end
