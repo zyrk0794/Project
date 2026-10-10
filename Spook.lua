@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.10.0 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.10.1 - Lumber Tycoon 2
     October 10, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -62,7 +62,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.10.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.10.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -1815,6 +1815,9 @@ function H:BuildReport()
         end
     end
     table.insert(lines,"Discord bot: "..tostring(self.BotStatus or "Not connected"))
+    if self.LastDisconnect then
+        table.insert(lines,"Confirmed disconnect: "..self.LastDisconnect.Code.."\nInterrupted stage: "..self.LastDisconnect.Stage)
+    end
     local text=table.concat(lines,"\n\n")
     if self.Config.TrackerToken~="" then text=text:gsub(self.Config.TrackerToken:gsub("([^%w])","%%%1"),"[tracker key]") end
     if self.Config.BotKey~="" then text=text:gsub(self.Config.BotKey:gsub("([^%w])","%%%1"),"[client key]") end
@@ -2689,10 +2692,43 @@ function H:Bootstrap()
         .. "local env=type(getgenv)=='function' and getgenv() or _G;if env.MidnightSpookyBootServer==game.JobId then return end;"
         .. "env.MidnightSpookyBootServer=game.JobId;env.MidnightSpookyResume=true;" .. loader
 end
+-- ErrorMessageChanged also reports non-disconnect errors. Never cancel a live
+-- harvest merely because an error string was displayed.
+function H:ConfirmedDisconnect()
+    local gotMessage,message=pcall(function() return S.GuiService:GetErrorMessage() end)
+    if not gotMessage or type(message)~="string" or message=="" then return false end
+    local gotCode,code=pcall(function() return S.GuiService:GetErrorCode() end)
+    if not gotCode then return false end
+    local name=typeof(code)=="EnumItem" and code.Name or ""
+    local numberCode=typeof(code)=="EnumItem" and code.Value or tonumber(code)
+    -- Use the typed engine reason when exposed. Numeric fallbacks are limited
+    -- to disconnect reasons; HTTP, purchase and teleport errors are excluded.
+    local disconnected=name:sub(1,10)=="Disconnect" and not name:find("Teleport",1,true)
+    local knownCodes={[266]=true,[267]=true,[277]=true,[278]=true,[285]=true,[288]=true}
+    if not disconnected and not knownCodes[numberCode] then return false end
+    return true,message,name~="" and name or tostring(numberCode)
+end
+function H:ScheduleRejoinCheck()
+    self.DisconnectRevision=(self.DisconnectRevision or 0)+1
+    local revision=self.DisconnectRevision
+    if self.DisconnectCheck then pcall(task.cancel,self.DisconnectCheck) self.DisconnectCheck=nil end
+    if not self.Config.AutoRejoin or self.Rejoining or not self.Running then return end
+    self.DisconnectCheck=task.delay(1.5,function()
+        self.DisconnectCheck=nil
+        if not self.Alive or revision~=self.DisconnectRevision then return end
+        local confirmed,message,code=self:ConfirmedDisconnect()
+        if not confirmed then return end
+        local ok,err=pcall(self.BeginRejoin,self,message,code)
+        if not ok and self.Alive then self:Log("Rejoin preparation failed - "..cleanError(err),"WARNING") end
+    end)
+end
 -- Recovery uses a separate, cancellable worker. It cannot restart a closed Roblox process.
 function H:BeginRejoin(message)
     if not self.Alive or not self.Config.AutoRejoin or self.Rejoining
         or self.BotDesired == "paused" or self.HopAttempt or not (self.Running or self.Busy) then return end
+    local disconnected,currentMessage,disconnectCode=self:ConfirmedDisconnect()
+    if not disconnected then return end
+    self.LastDisconnect={Stage=self.Stage,Code=disconnectCode,Message=currentMessage,Time=os.time()}
     local ready, bootstrap = pcall(self.Bootstrap, self)
     if not ready then self:Log("Auto rejoin unavailable - " .. cleanError(bootstrap), "WARNING") return end
     self.Rejoining = true
@@ -2705,7 +2741,7 @@ function H:BeginRejoin(message)
     self.HopAttempt = nil
     self.HopUncertain = false
     self:NotifyBot("Connection interrupted", "Attempting to reconnect. Unfinished wood is not counted as collected.")
-    self:Log("Connection interrupted - preparing rejoin", "WARNING")
+    self:Log("Connection interrupted during "..self.LastDisconnect.Stage.." - "..disconnectCode.." - preparing rejoin", "WARNING")
     self.RejoinWorker = task.defer(function()
         local attempt = 0
         local function waitFor(seconds)
@@ -3062,6 +3098,8 @@ function H:Start()
     end)
 end
 function H:Stop()
+    self.DisconnectRevision=(self.DisconnectRevision or 0)+1
+    if self.DisconnectCheck then pcall(task.cancel,self.DisconnectCheck) self.DisconnectCheck=nil end
     self.Rejoining=false
     if self.RejoinWorker then pcall(task.cancel,self.RejoinWorker) self.RejoinWorker=nil end
     self.RejoinAttempt=nil
@@ -3243,13 +3281,7 @@ H:Connect(S.TeleportService.TeleportInitFailed,function(player,_,message,placeId
     H.HopAttempt.Error="Teleport failed - "..tostring(message):sub(1,160)
 end)
 local rejoinHookOK=pcall(function()
-    H:Connect(S.GuiService.ErrorMessageChanged,function(message)
-        if type(message)~="string" then
-            local ok,current=pcall(S.GuiService.GetErrorMessage,S.GuiService)
-            message=ok and current or ""
-        end
-        if message~="" then H:BeginRejoin(message) end
-    end)
+    H:Connect(S.GuiService.ErrorMessageChanged,function() H:ScheduleRejoinCheck() end)
 end)
 if not rejoinHookOK then H:Log("Disconnect detection is unavailable in this executor","WARNING") end
 if H.ConfigWarning then H:Log(H.ConfigWarning,"WARNING") end
