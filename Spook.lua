@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.10.1 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.10.2 - Lumber Tycoon 2
     October 10, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -55,14 +55,14 @@ local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
 local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeconds = 1200,
     GrowthMinWait = 600, GrowthMaxWait = 16200, GrowthNotifySeconds = 600,
-    AutoRejoin = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
+    AutoRejoin = true, ModwoodHighlights = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
     VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
     TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.10.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.10.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -478,7 +478,7 @@ function H:SetStage(text, progress, detail)
     local shown=stageTitles[text] or uiText(text)
     local useful=detail and (detail:match("^Tree %d") or detail:match("^Piece %d") or text=="Equipping inventory axe"
         or text=="Rare trees found" or text=="Waiting for available servers" or text=="Needs attention"
-        or text=="Task stopped")
+        or text=="Task stopped" or text=="Modwood - igniting parent section")
     local caption=useful and uiText(shortError(detail)) or ""
     self:RenderProgress(caption)
     local diagnostic=text..(detail and (" - "..detail) or "")
@@ -1886,6 +1886,7 @@ function H:ModwoodHover(token,diagnostic)
         assert(finite(p.X) and finite(p.Y) and finite(p.Z) and math.abs(p.X)<1000000 and math.abs(p.Z)<1000000,
             "Modwood - invalid movement target")
         assert(p.Y>guard.MinimumY,"Modwood - movement toward the void blocked")
+        assert(H:ClearOfLava(p,5),"Modwood - character movement into lava blocked")
     end
     function guard:Release()
         if not self.Active then return end
@@ -1963,8 +1964,10 @@ function H:ModwoodHover(token,diagnostic)
         local ok=pcall(function()
             assert(position.Parent==avatar and orientation.Parent==avatar and attachment.Parent==avatar)
             local p=avatar.Position
+            validate(guard.Target)
+            local nearLava=not H:ClearOfLava(p,5)
             assert(finite(p.X) and finite(p.Y) and finite(p.Z))
-            if p.Y<guard.MinimumY or (p-guard.Target.Position).Magnitude>16 then
+            if nearLava or p.Y<guard.MinimumY or (p-guard.Target.Position).Magnitude>16 then
                 guard.Rescues=guard.Rescues+1 diagnostic.HoverRescues=guard.Rescues
                 if guard.Rescues>3 then
                     guard.Failure="Modwood - repeated character displacement; changing server"
@@ -1982,20 +1985,131 @@ function H:ModwoodHover(token,diagnostic)
     return guard
 end
 
-function H:FindLava()
-    local region = S.Workspace:FindFirstChild("Region_Volcano")
-    assert(region, "Modwood - Region_Volcano missing")
-    local anchor = Vector3.new(-1675.2002, 255.002533, 1284.19983)
-    local found, distance = nil, 12
-    for _, part in ipairs(region:GetDescendants()) do
-        if part:IsA("BasePart") and part.Name == "Lava" then
-            local delta = (part.Position - anchor).Magnitude
-            if delta < distance then found, distance = part, delta end
+function H:FindLava(token)
+    local deadline=os.clock()+math.min(self.Config.MetadataTimeout,10)
+    local problem="Volcano lava group is not ready"
+    repeat
+        token:Check()
+        local region=S.Workspace:FindFirstChild("Region_Volcano")
+        if region then
+            local function candidate(group)
+                if not group or not group:FindFirstChild("LavaLayer") then return nil end
+                local choices={}
+                for _,part in ipairs(group:GetChildren()) do
+                    if part:IsA("BasePart") and part.Name=="Lava" and part.CanTouch
+                        and part:FindFirstChildWhichIsA("TouchTransmitter") then
+                        table.insert(choices,part)
+                    end
+                end
+                if #choices==1 then return choices[1] end
+                if #choices>1 then problem="Several touch-enabled Lava parts in the selected group" end
+            end
+            -- The supplied index is only a hint; its contents must match the named structure.
+            local children=region:GetChildren()
+            local lava=candidate(children[2])
+            if not lava then
+                local matches={}
+                for _,group in ipairs(children) do
+                    local found=candidate(group)
+                    if found then table.insert(matches,found) end
+                end
+                if #matches==1 then lava=matches[1]
+                elseif #matches>1 then problem="Several Lava/LavaLayer groups - lava selection is ambiguous" end
+            end
+            if lava then
+                local hazards,seen={},{}
+                for _,item in ipairs(region:GetDescendants()) do
+                    if item.Name=="Lava" or item.Name=="LavaLayer" then
+                        if item:IsA("BasePart") and not seen[item] then seen[item]=true table.insert(hazards,item) end
+                        for _,part in ipairs(item:GetDescendants()) do
+                            if part:IsA("BasePart") and not seen[part] then seen[part]=true table.insert(hazards,part) end
+                        end
+                    end
+                end
+                self.ModwoodLavaHazards=hazards
+                self.SelectedLava=lava
+                self:Log("Modwood lava selected - "..lava:GetFullName(),"DEBUG")
+                return lava
+            end
+        end
+        token:Sleep(0.15)
+    until os.clock()>=deadline
+    error("Modwood - "..problem.."; requires Lava, LavaLayer and a live TouchInterest",0)
+end
+function H:ClearOfLava(position,radius)
+    for _,lava in ipairs(self.ModwoodLavaHazards or {}) do
+        if livePart(lava) then
+            local point=lava.CFrame:PointToObjectSpace(position)
+            local half=lava.Size*0.5
+            local outside=Vector3.new(math.max(0,math.abs(point.X)-half.X),
+                math.max(0,math.abs(point.Y)-half.Y),math.max(0,math.abs(point.Z)-half.Z))
+            if outside.Magnitude<=radius then return false end
         end
     end
-    assert(found, "Modwood - the source's lava part could not be identified")
-    return found
+    return true
 end
+function H:MarkModwood(root,leaf,parent,token)
+    if not self.Config.ModwoodHighlights then return end
+    local effects={}
+    token:Finally(function()
+        for _,effect in ipairs(effects) do pcall(effect.Destroy,effect) end
+    end)
+    local ok=pcall(function()
+        for _,entry in ipairs({{leaf,"MidnightSawmillSection",Color3.fromRGB(74,124,255)},
+            {parent,"MidnightBurnSection",Color3.fromRGB(75,220,145)},
+            {root,"MidnightTrunkSection",Color3.fromRGB(245,185,70)}}) do
+            local highlight=Instance.new("Highlight")
+            table.insert(effects,highlight)
+            highlight.Name=entry[2]
+            highlight.Adornee=entry[1]
+            highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.FillColor=entry[3] highlight.OutlineColor=entry[3]
+            highlight.FillTransparency=0.75 highlight.OutlineTransparency=0.1
+            highlight.Parent=entry[1]
+        end
+    end)
+    if not ok then
+        for _,effect in ipairs(effects) do pcall(effect.Destroy,effect) end
+        self:Log("Modwood highlights unavailable - continuing without markers","DEBUG")
+    end
+end
+function H:HoldIgnitionWood(log,parent,token,state)
+    local pivot=log:GetPivot()
+    local parentContainer=parent.Parent
+    local active,connection=true,nil
+    local corrections=0
+    local function release()
+        if not active then return end
+        active=false
+        if connection then connection:Disconnect() connection=nil end
+    end
+    token:Finally(release)
+    connection=S.RunService.PreSimulation:Connect(function()
+        if not active then return end
+        if not self.Alive or not self.Running or token.Generation~=self.Generation
+            or not log.Parent or not parent.Parent or parent.Parent~=parentContainer
+            or state.ParentSeparated then release() return end
+        local ok,reason=pcall(function()
+            assert(owned(log) and under(parent,log),"Wood ownership changed during ignition")
+            local bounds,size=log:GetBoundingBox()
+            assert(self:ClearOfLava(bounds.Position,size.Magnitude*0.5+4),"Wood approached physical lava during ignition")
+            local drift=(log:GetPivot().Position-pivot.Position).Magnitude
+            if drift>1.5 then
+                corrections=corrections+1
+                assert(corrections<=3,"Wood repeatedly moved away during ignition")
+                log:PivotTo(pivot)
+                state.IgnitionCorrections=corrections
+            end
+            self:DampWood(log)
+        end)
+        if not ok then
+            token.ModwoodFailure="Modwood - "..cleanError(reason)
+            release()
+        end
+    end)
+    return release
+end
+
 function H:Modwood(log, mill, inlet, token, checkpoint)
     checkpoint=checkpoint or {}
     local previous=self.ModwoodAttempts[log]
@@ -2042,14 +2156,15 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local root,leaf,parent,reason=self:ModwoodParts(log)
     self:CaptureModwood(log,mill,reason or "Ancestor selection")
     assert(root,reason)
-    local lava=self:FindLava()
+    local lava=self:FindLava(token)
     local originalPrimary=log.PrimaryPart
     local character,_,avatar=self:Character()
-    local state={Phase="Prepared",SourceRevision="Ancestor-20261007-180421",Log=log,Mill=mill,Inlet=inlet,
+    local state={Phase="Prepared",SourceRevision="Ancestor-20261007-180421-LavaGroup-1.10.2",Log=log,Mill=mill,Inlet=inlet,
         Root=root,Leaf=leaf,Parent=parent,ParentContainer=parent.Parent,Kind=value(log,"TreeClass"),
         OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
-        RootID=value(root,"ID"),LeafID=value(leaf,"ID"),ParentID=value(parent,"ID")}
+        LavaPath=lava:GetFullName(),IgnitionCorrections=0,RootID=value(root,"ID"),LeafID=value(leaf,"ID"),ParentID=value(parent,"ID")}
     checkpoint.Modwood=state
+    self:MarkModwood(root,leaf,parent,token)
     self.ModwoodSelection={Wood=log,Sawmill=mill,Leaf=leaf,Parent=parent}
     for _,part in ipairs(log:GetDescendants()) do
         if part:IsA("BasePart") and part.Name=="WoodSection" then table.insert(state.OriginalSections,part) end
@@ -2057,6 +2172,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     for _,model in ipairs(playerModels:GetChildren()) do state.BeforeOutput[model]=true end
     local function snapshot(reasonText)
         local lines={"Modwood runtime - "..reasonText,"Protocol: "..state.SourceRevision,"Phase: "..state.Phase,
+            "Lava target: "..state.LavaPath.."; ignition corrections: "..state.IgnitionCorrections,
             string.format("Touch pairs: %d; ignition: %s; separation: %s; feed frames: %d",state.TouchPairs,
                 tostring(state.IgnitionObserved==true),tostring(state.ParentSeparated==true),state.FeedFrames),
             string.format("Control: %s; TestPing replies: %d; fallback: %s",state.NetworkStatus or "Not checked",
@@ -2100,7 +2216,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             state.IgnitionObserved=true state.Phase="Ignited"
         end
     end
-    local fireConnection=parent.ChildAdded:Connect(observeFire)
+    local fireConnection=parent.DescendantAdded:Connect(observeFire)
     token:Finally(function() observing=false fireConnection:Disconnect() end)
     local tool,stats=self:EnsureAxe(state.Kind,token)
     local function standBy(part)
@@ -2110,7 +2226,11 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local function transfer(frame)
         -- Changing PrimaryPart is essential: Ancestor pivots around the burn
         -- parent, not the original trunk. Keep the avatar beside that pivot.
+        local box,size=log:GetBoundingBox()
+        local futureBox=frame*log:GetPivot():ToObjectSpace(box)
+        assert(self:ClearOfLava(futureBox.Position,size.Magnitude*0.5+4),"Modwood - whole-tree transfer into lava blocked")
         local restoreCollision=self:QuietWood(log,token)
+        local settled=0
         for index=1,25 do
             checkMill() requireLive(root,"root") requireLive(leaf,"retained section")
             requireLive(parent,"burn parent")
@@ -2124,36 +2244,62 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             self:DampWood(log)
             token:Sleep(self:AdaptiveWait(self.Config.FastHarvest and 0.03 or 0.06,0.12))
             if state.IgnitionObserved and state.Phase=="Ignited" and state.ParentSeparated then break end
+            if livePart(parent) and (parent.Position-frame.Position).Magnitude<=0.6 then settled=settled+1 else settled=0 end
+            if settled>=4 then break end
         end
         -- Ancestor leaves wood collisions enabled outside the transfer itself.
         restoreCollision()
     end
-    self:SetStage("Modwood - igniting parent section",0.52)
+    self:SetStage("Modwood - igniting parent section",0.52,
+        self.Config.ModwoodHighlights and "Blue: sawmill - Green: burn - Gold: trunk" or nil)
     self:AcquireWood(log,root,token,state,function() return state.IgnitionObserved==true end)
     if livePart(parent) and under(parent,log) then log.PrimaryPart=parent
     else assert(state.IgnitionObserved,"Modwood - burn parent disappeared before ignition") end
-    local deadline=os.clock()+self:AdaptiveWait(self.Config.BurnTimeout,120)
-    local fire=parent:FindFirstChild("LavaFire")
+    local fire=parent:FindFirstChild("LavaFire",true)
     if fire then observeFire(fire) end
-    while not state.IgnitionObserved do
-        assert(os.clock()<deadline,"Modwood - no LavaFire detected; changing server")
+    local releaseIgnition=function() end
+    if not state.IgnitionObserved then
         checkpoint.AtBase=false
+        -- Keep the existing Ancestor work area. Only the burn part receives
+        -- a synthetic contact; neither the full tree nor the avatar enters lava.
         transfer(CFrame.new(-1425,489,1244))
-        if not state.IgnitionObserved then
-            checkMill() requireLive(lava,"lava contact") requireLive(parent,"burn parent")
-            -- Paired calls are synchronous and always release a begun contact.
-            local pressed,pressError=pcall(touch,lava,parent,0)
-            local released,releaseError=pcall(touch,lava,parent,1)
-            assert(pressed and released,"Modwood touch failed - "..tostring(pressError or releaseError))
-            state.TouchPairs=state.TouchPairs+1
-            token:Sleep(0.15)
-            fire=parent:FindFirstChild("LavaFire")
-            if fire then observeFire(fire) end
-        end
+        if not state.IgnitionObserved then releaseIgnition=self:HoldIgnitionWood(log,parent,token,state) end
     end
+    local deadline=os.clock()+self:AdaptiveWait(self.Config.BurnTimeout,120)
+    local contactActive=false
+    local function endContact()
+        if not contactActive then return true end
+        contactActive=false
+        return pcall(touch,lava,parent,1)
+    end
+    token:Finally(endContact)
+    while not state.IgnitionObserved do
+        assert(os.clock()<deadline,"Modwood - selected lava produced no LavaFire; changing server")
+        checkMill() requireLive(lava,"lava contact") requireLive(parent,"burn parent")
+        assert(lava.CanTouch and lava:FindFirstChildWhichIsA("TouchTransmitter"),"Modwood - selected lava touch handler is no longer available")
+        assert(owned(log) and under(parent,log),"Modwood - burn target changed before lava contact")
+        standBy(parent)
+        drag:FireServer(log)
+        contactActive=true
+        local pressed,pressError=pcall(touch,lava,parent,0)
+        -- Let one short physics interval elapse, but release even if cancelled.
+        local waited,waitError=pcall(function() token:Sleep(0.04) end)
+        local released,releaseError=endContact()
+        if not waited then error(waitError,0) end
+        assert(pressed and released,"Modwood touch failed - "..tostring(pressError or releaseError))
+        state.TouchPairs=state.TouchPairs+1
+        local untilTime=os.clock()+self:AdaptiveWait(0.2,0.5)
+        repeat
+            fire=parent:FindFirstChild("LavaFire",true)
+            if fire then observeFire(fire) end
+            if state.IgnitionObserved then break end
+            token:Sleep(0.04)
+        until os.clock()>=untilTime
+    end
+    releaseIgnition()
     observing=false fireConnection:Disconnect()
     observeSeparation()
-    fire=parent:FindFirstChild("LavaFire")
+    fire=parent:FindFirstChild("LavaFire",true)
     if fire then fire:Destroy() end -- Ancestor removes the local visual after observing ignition.
     snapshot("Ignition confirmed")
     self:UpdateHarvestProgress(0.50)
@@ -3229,7 +3375,7 @@ local botToggle
 botToggle=botSection:Toggle({Title="Connect to Discord",Default=H.Config.BotEnabled,
     Callback=function(v) apply("BotEnabled",v,botToggle) H.BotWake=true end})
 botSection:Button({Title="Reconnect bot",Callback=function() H.BotWake=true H:StartBot() end})
-for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"Fast harvest","FastHarvest"},{"Auto rejoin","AutoRejoin"}}) do
+for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"Fast harvest","FastHarvest"},{"Auto rejoin","AutoRejoin"},{"Modwood highlights","ModwoodHighlights"}}) do
     local title,key=entry[1],entry[2]
     local toggle
     toggle=settings:Toggle({Title=title,Default=H.Config[key],Callback=function(v) apply(key,v,toggle) end})
