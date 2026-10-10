@@ -1,13 +1,13 @@
 --[[
-    Midnight Spooky Hunter 1.9.0 - Lumber Tycoon 2
-    October 7, 2026. Client script using Midnight UI Library 2.4.0 or newer.
+    Midnight Spooky Hunter 1.10.0 - Lumber Tycoon 2
+    October 10, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
 ]]
 local S = {}
 for _, name in ipairs({"Players", "Workspace", "ReplicatedStorage", "HttpService", "TweenService",
-    "UserInputService", "RunService", "TeleportService"}) do S[name] = game:GetService(name) end
+    "UserInputService", "RunService", "TeleportService", "GuiService"}) do S[name] = game:GetService(name) end
 local Player = S.Players.LocalPlayer
 assert(Player, "Spooky Hunter requires a client")
 local Env = type(getgenv) == "function" and getgenv() or _G
@@ -53,23 +53,31 @@ local LEGACY_FILE = "MidnightSpookyHunter.json"
 local FILE = "MidnightSpookyHunter_"..tostring(Player.UserId)..".json"
 local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
-local DEFAULT = { Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
+local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeconds = 1200,
+    GrowthMinWait = 600, GrowthMaxWait = 16200, GrowthNotifySeconds = 600,
+    AutoRejoin = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
     VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
     TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.9.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.10.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
     StartedAt = os.time(), Arrived = os.clock(), Generation = 0, Stage = "Ready", Progress = 0 }
+local function emptyCollection()
+    return {Spooky={Trees=0,TreeVolume=0,Planks=0,PlankVolume=0}, SpookyNeon={Trees=0,TreeVolume=0,Planks=0,PlankVolume=0}}
+end
+H.Collection=emptyCollection()
+H.BatchCollection=emptyCollection()
 H.JobId=game.JobId
 H.ModwoodAttempts={}
 if old and (old.JobId==game.JobId or (old.LoadReceipt and old.LoadReceipt.JobId==game.JobId)) then
     H.ModwoodAttempts=old.ModwoodAttempts or {}
     H.ServerExitReason=old.ServerExitReason
+    H.GrowthTarget=old.GrowthTarget
 end
 -- Instance references can survive a script update in the same live server.
 -- Never deserialize these references or reuse them after a server change.
@@ -124,14 +132,16 @@ local function configFrom(source)
     local result = table.clone(DEFAULT)
     if type(source) ~= "table" then return result end
     for key in pairs(result) do if type(source[key]) == type(result[key]) then result[key] = source[key] end end
+    if result.TargetSpecies~="Spooky" and result.TargetSpecies~="SpookyNeon" and result.TargetSpecies~="Both" then result.TargetSpecies="Both" end
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
-    for key, limits in pairs({VisitCooldownHours={0.1,168}, HarvestCooldownHours={0.1,336}, LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {1, 180}, ScanWait = {2, 120},
+    for key, limits in pairs({GrowthStableSeconds={120,7200}, GrowthMinWait={120,14400}, GrowthMaxWait={1800,43200}, GrowthNotifySeconds={120,3600}, RejoinDelay={3,60}, VisitCooldownHours={0.1,168}, HarvestCooldownHours={0.1,336}, LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {1, 180}, ScanWait = {2, 120},
         ScanInterval = {0.05, 1}, ScanSettle = {0.1, 5}, EmptyScanDelay = {0.5, 15}, GameSettle = {0.5, 5},
         TrackerTimeout = {2, 10}, TrackerFreshness = {5, 60}, TrackerMinAge = {0, 10080}, TrackerBackoff = {30, 900},
         ServerSearchTimeout = {3, 30}, ServerRetryDelay = {1, 60}, ChopTimeout = {15, 180},
         BurnTimeout = {10, 120}, MillTimeout = {15, 180}, TaskTimeout = {300, 1800}}) do
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
     end
+    result.GrowthMaxWait=math.max(result.GrowthMaxWait,result.GrowthStableSeconds+300,result.GrowthMinWait+300)
     result.ScanWait=math.max(result.ScanWait,math.max(result.ScanSettle,result.EmptyScanDelay)+result.ScanInterval)
     result.BotURL = cleanURL(result.BotURL):gsub("/+$", ""):lower():sub(1,200)
     result.BotKey = cleanURL(result.BotKey):sub(1,128)
@@ -139,6 +149,12 @@ local function configFrom(source)
     result.TrackerURL = cleanURL(result.TrackerURL):gsub("/+$", ""):lower():sub(1, 200)
     result.TrackerToken = cleanURL(result.TrackerToken):sub(1, 128)
     return result
+end
+function H:WantsTree(kind)
+    return rare(kind) and (self.Config.TargetSpecies=="Both" or self.Config.TargetSpecies==kind)
+end
+function H:EligibleVolume(kind, volume)
+    return finite(volume) and volume>0 and (volume>=MIN_TREE_VOLUME or (kind=="SpookyNeon" and self.Config.GrowSinister))
 end
 function H:IsServerExcluded(id)
     if id==game.JobId then return true end
@@ -194,6 +210,15 @@ function H:RecordHarvest(work)
     self:RememberServer(game.JobId)
     self.VisitRecords[game.JobId].HarvestedAt=os.time()
     self.Stats.Harvested=self.Stats.Harvested+1
+    for _,collection in ipairs({self.Collection,self.BatchCollection}) do
+        local record=collection[work.Kind]
+        if record then
+            record.Trees=record.Trees+1
+            record.TreeVolume=record.TreeVolume+(work.TreeVolume or 0)
+            record.Planks=record.Planks+(work.Planks and #work.Planks or 0)
+            record.PlankVolume=record.PlankVolume+(work.DeliveredVolume or 0)
+        end
+    end
     self:RefreshMetrics()
     local ok,err=self:Persist(false) if not ok then self:Log(err,"WARNING") end
 end
@@ -247,6 +272,12 @@ if Read then
 end
 if restored then
     H.Config = configFrom(restored.Config)
+    for kind,record in pairs(H.Collection) do
+        local saved=type(restored.Collection)=="table" and restored.Collection[kind]
+        if type(saved)=="table" then
+            for key in pairs(record) do if finite(saved[key]) then record[key]=math.clamp(saved[key],0,1e12) end end
+        end
+    end
     H.BotCommandVersion=finite(restored.BotCommandVersion) and math.max(0,math.floor(restored.BotCommandVersion)) or 0
     H.BotDesired=restored.BotDesired
     H.BotQueue={}
@@ -516,6 +547,7 @@ function H:Persist(resume, target)
     end
     local data = { Schema = 2, Version = self.Version, TimingRevision = 1, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
         VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, BotQueue=self.BotQueue or {}, BotDesired=self.BotDesired, BotCommandVersion=self.BotCommandVersion or 0, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
+        Collection=self.Collection, PlaceId=game.PlaceId, Recovery=self.Rejoining==true and target=="*",
         StartedAt = self.StartedAt, Resume = resume == true, Target = target, TicketTime = os.time(),
         Departure = self.ServerExitReason and {JobId=game.JobId,Reason=self.ServerExitReason} or nil }
     local ok = pcall(function()
@@ -1023,7 +1055,7 @@ function H:FindMill(token, plot)
     until os.clock()>=deadline
     error("No ready owned Sawmill4L - check its Particles inlet and DimX/DimZ settings",0)
 end
-function H:AxeStats(tool, kind)
+function H:AxeStats(tool, kind, inverse)
     local definitions = S.ReplicatedStorage:FindFirstChild("AxeClasses")
     local name = value(tool, "ToolName")
     local module = definitions and name and definitions:FindFirstChild("AxeClass_" .. tostring(name))
@@ -1033,7 +1065,9 @@ function H:AxeStats(tool, kind)
     stats = table.clone(stats)
     local special = stats.SpecialTrees and stats.SpecialTrees[kind]
     if type(special) == "table" then for k,v in pairs(special) do stats[k] = v end end
-    if finite(stats.Damage) and stats.Damage > 0 and finite(stats.SwingCooldown) and stats.SwingCooldown > 0 then return stats end
+    local usable=inverse and name=="InverseAxe" and finite(stats.Damage) and stats.Damage<=0
+        or not inverse and name~="InverseAxe" and finite(stats.Damage) and stats.Damage>0
+    if usable and finite(stats.SwingCooldown) and stats.SwingCooldown>0 then return stats end
 end
 function H:FindAxe(kind)
     local character=Player.Character
@@ -1087,7 +1121,8 @@ function H:Scan(token)
                 local kind = value(model,"TreeClass")
                 if kind then ready = ready + 1 snapshot[model] = kind end
                 local ownerField = rare(kind) and model:FindFirstChild("Owner")
-                if model:IsA("Model") and rare(kind) and ownerField and ownerField:IsA("ObjectValue") and ownerField.Value == nil
+                if model:IsA("Model") and self:WantsTree(kind) and ownerField and ownerField:IsA("ObjectValue")
+                    and (ownerField.Value == nil or (model==self.GrowthTarget and ownerField.Value==Player))
                     and model:FindFirstChild("CutEvent") and not model:FindFirstChild("RootCut") then
                     local trunk, volume = nil, 0
                     for _, section in ipairs(model:GetDescendants()) do
@@ -1097,8 +1132,9 @@ function H:Scan(token)
                         end
                     end
                     if volume<MIN_TREE_VOLUME then counts.IgnoredSmall=counts.IgnoredSmall+1 end
-                    if trunk and volume>=MIN_TREE_VOLUME then
-                        table.insert(matches, { Model = model, Trunk = trunk, Kind = kind, Volume = volume })
+                    if trunk and self:EligibleVolume(kind,volume) then
+                        table.insert(matches, { Model = model, Trunk = trunk, Kind = kind, Volume = volume,
+                            GrowthClaimed=model==self.GrowthTarget and ownerField.Value==Player })
                         counts[kind] = counts[kind] + 1 counts[kind .. "Volume"] = counts[kind .. "Volume"] + volume
                     end
                 end
@@ -1109,7 +1145,10 @@ function H:Scan(token)
             end
         end
     end
-    table.sort(matches, function(a,b) return a.Volume > b.Volume end)
+    table.sort(matches, function(a,b)
+        if self.Config.GrowSinister and a.Kind~=b.Kind then return a.Kind=="SpookyNeon" end
+        return a.Volume>b.Volume
+    end)
     self.Counts = counts
     if self.UI then
         self.UI.Spooky:Set(counts.Spooky,string.format("%.0f studs3",counts.SpookyVolume))
@@ -1247,13 +1286,137 @@ function H:AttemptChop(model,tool,stats,token,section,height)
         faceVector=Vector3.new(1,0,0),hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
     return id
 end
+-- Volume stability is an observation, not proof that the tree reached its maximum size.
+function H:WaitForSinisterGrowth(entry, token, parentToken)
+    if entry.Kind ~= "SpookyNeon" or not self.Config.GrowSinister or entry.GrowthComplete then return end
+    local tool, stats
+    for _, container in pairs({Player.Character, Player:FindFirstChildOfClass("Backpack")}) do
+        for _, candidate in ipairs(container:GetChildren()) do
+            if candidate:IsA("Tool") and value(candidate, "ToolName") == "InverseAxe" then
+                local candidateStats = self:AxeStats(candidate, entry.Kind, true)
+                if candidateStats then tool, stats = candidate, candidateStats break end
+            end
+        end
+        if tool then break end
+    end
+    assert(tool and stats, "Growth requires an inventory InverseAxe with non-positive damage verified from AxeClasses")
+    assert(self:FindAxe(entry.Kind), "Growth requires a second, damaging axe in your inventory")
+    self.GrowthTarget=entry.Model
+    local started = os.clock()
+    local allowance = self.Config.GrowthMaxWait + 30
+    local watchdog = self.Watchdog
+    token.Deadline = token.Deadline + allowance
+    parentToken.Deadline = parentToken.Deadline + allowance
+    self.Watchdog = false
+    local growth = {Active=true, Kind=entry.Kind, Initial=entry.Volume, Volume=entry.Volume,
+        Gain=0, Elapsed=0, StableFor=0, StableSeconds=self.Config.GrowthStableSeconds,
+        MaxWait=self.Config.GrowthMaxWait, Hits=0, Ownership="Pending", Status="Claiming"}
+    self.Growth = growth
+    local finished = false
+    local function finishGrowth()
+        if finished then return end
+        finished = true
+        local elapsed = os.clock() - started
+        token.Deadline = token.Deadline - allowance + elapsed
+        parentToken.Deadline = parentToken.Deadline - allowance + elapsed
+        growth.Active = false
+        if growth.Status ~= "Stable" then growth.Status = "Interrupted" end
+        self.Watchdog = watchdog
+        self.LastProgressAt = os.clock()
+        self.BotWake = true
+    end
+    token:Finally(finishGrowth)
+    self:SetStage("Waiting for Sinister growth", nil)
+    self:NotifyBot("Sinister growth started", "Tracking volume while maintaining the tree with InverseAxe.", token)
+    local lastChange, lastVolume = started, entry.Volume
+    local nextSample, nextStrike, nextNotice = 0, 0, started + self.Config.GrowthNotifySeconds
+    local unownedSince = started
+    local samples = 0
+    local observedGrowth = false
+    while os.clock() - started < self.Config.GrowthMaxWait do
+        token:Check()
+        local tree = entry.Model
+        assert(tree and under(tree, S.Workspace) and tree.Parent.Name == "TreeRegion"
+            and not tree:FindFirstChild("RootCut"), "Growth target was removed or cut")
+        assert(value(tree, "TreeClass") == entry.Kind, "Growth target class changed")
+        local owner = value(tree, "Owner")
+        assert(owner == nil or owner == Player, "Growth target belongs to another player")
+        if owner == Player then
+            unownedSince = nil
+            entry.GrowthClaimed = true
+            growth.Ownership = "Confirmed"
+        else
+            unownedSince = unownedSince or os.clock()
+            growth.Ownership = "Pending"
+            assert(os.clock() - unownedSince < 30, "InverseAxe ownership was not confirmed within 30 seconds")
+        end
+        local trunk = self:LowestSection(tree)
+        assert(livePart(trunk) and tonumber(value(trunk, "ID")) == 1, "Growing trunk is unavailable")
+        entry.Trunk = trunk
+        if tool.Parent ~= Player.Character then
+            assert(tool.Parent == Player:FindFirstChildOfClass("Backpack"), "InverseAxe left the inventory")
+            local _, humanoid = self:Character()
+            humanoid:EquipTool(tool)
+            token:Sleep(0.15)
+            assert(tool.Parent == Player.Character, "InverseAxe could not be equipped")
+        end
+        if os.clock() >= nextStrike then
+            -- Keep the game's actual non-positive damage and cooldown; never use a damaging axe here.
+            self:AttemptChop(tree, tool, stats, token, trunk, math.min(0.3, trunk.Size.Y * 0.25))
+            growth.Hits = growth.Hits + 1
+            nextStrike = os.clock() + math.max(0.25, stats.SwingCooldown) + 0.05
+        end
+        if os.clock() >= nextSample then
+            local current = self:WoodVolume(tree)
+            assert(finite(current) and current > 0, "Growing tree volume is unavailable")
+            -- Compare against the last significant sample so tiny increases accumulate.
+            if current > growth.Initial + 0.001 then observedGrowth = true end
+            if current < lastVolume - math.max(0.1, lastVolume * 0.02) then
+                error("Growing tree lost wood - growth observation interrupted", 0)
+            end
+            if math.abs(current - lastVolume) > 0.001 then lastChange, lastVolume = os.clock(), current end
+            if self.Counts then
+                self.Counts.SpookyNeonVolume=math.max(0,self.Counts.SpookyNeonVolume+current-growth.Volume)
+            end
+            growth.Volume, growth.Gain = current, current - growth.Initial
+            growth.Elapsed, growth.StableFor = os.clock() - started, os.clock() - lastChange
+            growth.Status = "Observing"
+            samples = samples + 1
+            self:UpdateHarvestProgress(0, string.format("Sinister %.2f studs3 - unchanged %ds / %ds",
+                current, math.floor(growth.StableFor), self.Config.GrowthStableSeconds))
+            if self.UI then self.UI.Neon:Set(self.Counts and self.Counts.SpookyNeon or 1, string.format("Growing: %.2f studs3", current)) end
+            nextSample = os.clock() + 1
+            if owner == Player and samples >= 5 and growth.Elapsed >= self.Config.GrowthMinWait
+                and growth.StableFor >= self.Config.GrowthStableSeconds
+                and (observedGrowth or growth.Elapsed >= 11820) then
+                assert(current>=MIN_TREE_VOLUME,"Sinister stabilized below the 40 studs3 harvest minimum")
+                entry.Volume = current
+                entry.GrowthComplete = true
+                growth.Active, growth.Status = false, "Stable"
+                finishGrowth()
+                self:NotifyBot("Sinister growth stable", string.format(
+                    "%.2f -> %.2f studs3 (%+.2f). Unchanged for %ds. Switching to the harvest axe.",
+                    growth.Initial, current, growth.Gain, math.floor(growth.StableFor)), token)
+                return
+            end
+        end
+        if os.clock() >= nextNotice then
+            self:NotifyBot("Sinister growth update", string.format("%.2f studs3 (%+.2f) - observed for %s - unchanged %ds.",
+                growth.Volume, growth.Gain, duration(growth.Elapsed), math.floor(growth.StableFor)), token)
+            nextNotice = os.clock() + self.Config.GrowthNotifySeconds
+        end
+        token:Sleep(0.1)
+    end
+    error("Sinister growth time limit reached - stable growth was not confirmed", 0)
+end
+
 function H:Chop(entry, tool, stats, token, checkpoint)
     local tree, trunk=entry.Model,entry.Trunk
     assert(tree and trunk,"The selected tree has no recorded trunk")
     local logs=S.Workspace:FindFirstChild("LogModels") assert(logs,"LogModels missing")
     local cut=checkpoint and checkpoint.Cut
     if not cut then
-        assert(tree.Parent and trunk.Parent and value(tree,"Owner")==nil,"The selected tree is no longer available")
+        assert(tree.Parent and trunk.Parent and (value(tree,"Owner")==nil or (entry.GrowthClaimed and owned(tree))),"The selected tree is no longer available")
         cut={Tree=tree,Trunk=trunk,Kind=entry.Kind,Origin=trunk.Position,Radius=math.max(80,trunk.Size.Y),
             Previous={},Strikes=0,Started=os.clock()}
         for _, model in ipairs(logs:GetChildren()) do cut.Previous[model]=true end
@@ -1612,6 +1775,11 @@ function H:BuildReport()
         self.Stats.FoundTrees,self.Stats.Harvested,self.Stats.TrackerFinds,self.Stats.TrackerScans,
         self.Stats.StandardFinds,self.Stats.StandardScans,tostring(self.Config.AdaptiveTiming),
         self.ServerRTT and string.format("%.3fs",self.ServerRTT) or "Not measured"))
+    table.insert(lines,"Targets: "..self.Config.TargetSpecies.."; growth: "..tostring(self.Config.GrowSinister).."; auto rejoin: "..tostring(self.Config.AutoRejoin))
+    if self.Growth then
+        table.insert(lines,string.format("Sinister growth: %s; volume: %.3f; gain: %.3f; elapsed: %.0fs; stable: %.0fs; owner: %s",
+            self.Growth.Status,self.Growth.Volume,self.Growth.Gain,self.Growth.Elapsed,self.Growth.StableFor,self.Growth.Ownership))
+    end
     if self.LastFailure then
         table.insert(lines,"Failure code: "..(self.LastFailure.Code or "Unavailable")
             .."\nLast confirmed: "..(self.LastFailure.LastConfirmed or "Unavailable")
@@ -2209,6 +2377,7 @@ function H:Deliver(planks, center, token, checkpoint)
         local target=self:PlankPlacement(plank,center)
         self:Move(plank, target, token)
         self.Stats.Planks = self.Stats.Planks + 1
+        if checkpoint then checkpoint.DeliveredVolume=(checkpoint.DeliveredVolume or 0)+self:WoodVolume(plank) end
         self.UnsavedDelivery=true
         if checkpoint then checkpoint.Delivered[plank] = true end
         deliveredCount=deliveredCount+1
@@ -2246,11 +2415,22 @@ function H:PersistBotState()
     return self:Persist(target~=nil,target)
 end
 function H:BotSnapshot(event)
+    local counts=self.Counts or {}
+    local growth=self.Growth and table.clone(self.Growth) or nil
+    local function copyCollection(source)
+        local result={}
+        for kind,record in pairs(source) do result[kind]=table.clone(record) end
+        return result
+    end
     return {accountId=tostring(Player.UserId),jobId=game.JobId,version=self.Version,
         stage=self.Stage,running=self.Running,progress=self.Progress*100,slot=self.Config.Slot,
+        target=self.Config.TargetSpecies,growSinister=self.Config.GrowSinister,autoRejoin=self.Config.AutoRejoin,
+        counts={Spooky=counts.Spooky or 0,SpookyNeon=counts.SpookyNeon or 0,
+            SpookyVolume=counts.SpookyVolume or 0,SpookyNeonVolume=counts.SpookyNeonVolume or 0},
+        collection=copyCollection(self.Collection),batch=copyCollection(self.BatchCollection),growth=growth,
         pending=#self.PendingWood,stats={Scanned=self.Stats.Scanned,FoundTrees=self.Stats.FoundTrees,
             Harvested=self.Stats.Harvested,Planks=self.Stats.Planks,Skipped=self.Stats.Skipped},
-        lastConfirmed=self.LastConfirmedMilestone or "",report=self:BuildReport():sub(1,8000),
+        lastConfirmed=self.LastConfirmedMilestone or "",report=self:BuildReport():sub(1,6000),
         ackVersion=self.BotCommandVersion or 0,event=event}
 end
 function H:BotRequest(event)
@@ -2277,6 +2457,7 @@ function H:BotRequest(event)
         self.BotStatus=status==401 and "Client key rejected" or "Service HTTP "..tostring(status)
         return false
     end
+    self.BotLastSync=os.time()
     local body=response[2].Body
     if type(body)~="string" or #body>8192 then return false end
     local ok,data=pcall(S.HttpService.JSONDecode,S.HttpService,body)
@@ -2329,11 +2510,13 @@ function H:StartBot()
     end)
 end
 function H:NotifyBot(title,description,token,receipt)
-    token:Check()
+    if token then token:Check() end
     if not self.Config.BotEnabled or self.Config.BotURL=="" or self.Config.BotKey=="" then return false end
     local kind=receipt and "complete" or title=="Rare trees found" and "found"
         or title=="Harvest interrupted" and "interrupted" or "info"
-    local event={id=S.HttpService:GenerateGUID(false):lower(),kind=kind,title=title,content=description,capturedAt=os.time()}
+    local eventId=kind=="found" and (game.JobId.."-"..(self.Config.TargetSpecies=="Spooky" and "01" or self.Config.TargetSpecies=="SpookyNeon" and "02" or "03"))
+        or S.HttpService:GenerateGUID(false):lower()
+    local event={id=eventId,kind=kind,title=title,content=description,capturedAt=os.time()}
     event.snapshot=self:BotSnapshot()
     event.snapshot.report=nil event.snapshot.ackVersion=nil
     if receipt then
@@ -2341,6 +2524,14 @@ function H:NotifyBot(title,description,token,receipt)
             receipt.Trees,receipt.Planks,duration(receipt.Seconds))
     end
     self.BotQueue=self.BotQueue or {}
+    -- Coalesce unsent periodic growth messages; discovery and completion remain distinct.
+    if title=="Sinister growth update" then
+        for i=#self.BotQueue,2,-1 do
+            if self.BotQueue[i].title==title and self.BotQueue[i].snapshot and self.BotQueue[i].snapshot.jobId==game.JobId then
+                table.remove(self.BotQueue,i)
+            end
+        end
+    end
     if #self.BotQueue>=50 then
         self:Log("Discord queue full - oldest pending notice removed","WARNING")
         table.remove(self.BotQueue,1)
@@ -2486,7 +2677,7 @@ function H:Bootstrap()
     assert(Read and Write, "Saved continuation requires readfile and writefile")
     local source = Env.MidnightSpookySource
     local loader
-    if type(source)=="string" and #source>100 then
+    if type(source)=="string" and #source>100 and source:find("Midnight Spooky Hunter "..self.Version,1,true) then
         loader = "local source=" .. string.format("%q",source) .. ";local env=type(getgenv)=='function' and getgenv() or _G;env.MidnightSpookySource=source;local f,e=loadstring(source);assert(f,e);f()"
     else
         local url=self.Config.ScriptURL
@@ -2494,10 +2685,71 @@ function H:Bootstrap()
         loader = "local source=game:HttpGet(" .. string.format("%q",url) .. ");local env=type(getgenv)=='function' and getgenv() or _G;env.MidnightSpookySource=source;local f,e=loadstring(source);assert(f,e);f()"
     end
     return "local deadline=os.clock()+300;repeat task.wait(0.2) until game:IsLoaded() or os.clock()>=deadline;if not game:IsLoaded() then return end;local ok,d=pcall(function() return game:GetService('HttpService'):JSONDecode(readfile('"..FILE.."')) end);"
-        .. "if not ok or not d.Resume or d.Target~=game.JobId or os.time()-(d.TicketTime or 0)>600 then return end;"
+        .. "if not ok or not d.Resume or (d.Target~=game.JobId and not (d.Target=='*' and d.Recovery==true and d.PlaceId==game.PlaceId)) or os.time()-(d.TicketTime or 0)>600 then return end;"
         .. "local env=type(getgenv)=='function' and getgenv() or _G;if env.MidnightSpookyBootServer==game.JobId then return end;"
         .. "env.MidnightSpookyBootServer=game.JobId;env.MidnightSpookyResume=true;" .. loader
 end
+-- Recovery uses a separate, cancellable worker. It cannot restart a closed Roblox process.
+function H:BeginRejoin(message)
+    if not self.Alive or not self.Config.AutoRejoin or self.Rejoining
+        or self.BotDesired == "paused" or self.HopAttempt or not (self.Running or self.Busy) then return end
+    local ready, bootstrap = pcall(self.Bootstrap, self)
+    if not ready then self:Log("Auto rejoin unavailable - " .. cleanError(bootstrap), "WARNING") return end
+    self.Rejoining = true
+    self.Generation = self.Generation + 1
+    self.Watchdog = false
+    if self.Worker then pcall(task.cancel, self.Worker) self.Worker = nil end
+    if self.ActiveToken then self.ActiveToken:Clean() self.ActiveToken = nil end
+    if self.ModwoodGuard then self.ModwoodGuard:Release() end
+    self.Running, self.Busy = true, true
+    self.HopAttempt = nil
+    self.HopUncertain = false
+    self:NotifyBot("Connection interrupted", "Attempting to reconnect. Unfinished wood is not counted as collected.")
+    self:Log("Connection interrupted - preparing rejoin", "WARNING")
+    self.RejoinWorker = task.defer(function()
+        local attempt = 0
+        local function waitFor(seconds)
+            local deadline = os.clock() + seconds
+            repeat
+                if not self.Alive or not self.Rejoining or not self.Config.AutoRejoin then return false end
+                task.wait(0.2)
+            until os.clock() >= deadline
+            return true
+        end
+        while self.Alive and self.Rejoining and self.Config.AutoRejoin do
+            attempt = attempt + 1
+            local delay = math.min(60, self.Config.RejoinDelay * 2 ^ math.min(attempt - 1, 4))
+            self:SetStage("Rejoining game", nil, "Attempt " .. attempt)
+            if not waitFor(delay) then break end
+            -- A wildcard ticket is valid only for a recovery into this exact place.
+            self.PendingTeleportTarget = "*"
+            local saved, failure = self:Persist(true, "*")
+            local queued = saved and pcall(Queue, bootstrap)
+            if saved and queued then
+                self.RejoinAttempt = {Number=attempt}
+                local sent, reason = pcall(S.TeleportService.Teleport, S.TeleportService, game.PlaceId, Player)
+                if not sent then self.RejoinAttempt.Error = tostring(reason) end
+                local deadline = os.clock() + 45
+                while self.Rejoining and not self.RejoinAttempt.Error and os.clock() < deadline do
+                    if not waitFor(0.2) then break end
+                end
+                if self.Rejoining then self:Log(self.RejoinAttempt.Error or "Rejoin has not completed - retry pending", "WARNING") end
+                self.RejoinAttempt = nil
+            else
+                self:Log(failure or "Could not queue the script for rejoin", "WARNING")
+            end
+        end
+        self.RejoinWorker = nil
+        if self.Alive and self.Rejoining then
+            self.Rejoining = false
+            self.Running, self.Busy = false, false
+            self.PendingTeleportTarget = nil
+            self:Persist(false)
+            self:SetStage("Ready", nil)
+        end
+    end)
+end
+
 function H:Hop(token)
     assert(not self.Dirty, "Unfinished wood is still in this server")
     self.Watchdog=false
@@ -2583,11 +2835,12 @@ function H:Run(token)
         end
         self:SetStage("Resuming unfinished wood",0.42,tostring(#entries).." tasks")
     else
+        self.BatchCollection=emptyCollection()
         entries=self:ScanReady(token)
         if #entries==0 then self:SetStage("No rare tree found",0.1) return self:Hop(token) end
         self:SetStage("Rare trees found",0.1,tostring(#entries).." trees")
         if not self.FoundNotified then
-            self:NotifyBot("Rare trees found",self.Config.FullCycle and "Spooky wood detected." or "Search paused in this server.",token)
+            self:NotifyBot("Rare trees found",self.Config.FullCycle and "Selected trees detected. Volumes shown below." or "Selected trees detected - search paused in this server.",token)
             self.FoundNotified=true
         end
         if not self.Config.FullCycle then return "Found - search paused in this server" end
@@ -2606,8 +2859,8 @@ function H:Run(token)
     local processed, skipped = 0, 0
     for index,entry in ipairs(entries) do
         token:Check()
-        if entry.Work or (entry.Model.Parent and value(entry.Model,"Owner")==nil
-            and not entry.Model:FindFirstChild("RootCut") and self:WoodVolume(entry.Model)>=MIN_TREE_VOLUME) then
+        if entry.Work or (entry.Model.Parent and (value(entry.Model,"Owner")==nil or (entry.GrowthClaimed and owned(entry.Model)))
+            and not entry.Model:FindFirstChild("RootCut") and self:EligibleVolume(entry.Kind,self:WoodVolume(entry.Model))) then
             self:SelectHarvestProgress(entry)
             local scope=self:Token(token)
             local work=entry.Work
@@ -2616,17 +2869,27 @@ function H:Run(token)
             local ok,result=pcall(function()
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed during harvesting")
                 if not work or (not work.Log and work.Cut) then
+                    if not work and entry.Kind=="SpookyNeon" and self.Config.GrowSinister then
+                        local grown,growthError=pcall(self.WaitForSinisterGrowth,self,entry,scope,token)
+                        if not grown then
+                            if growthError==CANCEL then error(CANCEL,0) end
+                            self.ServerExitReason=cleanError(growthError)
+                            error(growthError,0)
+                        end
+                        assert(entry.Volume>=MIN_TREE_VOLUME,"Growth stabilized below the 40 studs3 harvest minimum")
+                    end
                     local tool,stats=self:EnsureAxe(entry.Kind,scope)
                     self:UpdateHarvestProgress(0.02)
                     self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
                     if not work then
-                        work={Kind=entry.Kind,Reason="Cut started"}
+                        work={Kind=entry.Kind,TreeVolume=self:WoodVolume(entry.Model),Reason="Cut started"}
                         table.insert(self.PendingWood,work)
                     end
                     self:LinkHarvestProgress(work)
                     cutStarted=true self.Dirty=true
                     local target=work.Cut and {Model=work.Cut.Tree,Trunk=work.Cut.Trunk,Kind=work.Kind} or entry
                     log=self:Chop(target,tool,stats,scope,work)
+                    if self.GrowthTarget==entry.Model then self.GrowthTarget=nil end
                     work.Log=log self.Stats.Trees=self.Stats.Trees+1
                 end
                 self:LinkHarvestProgress(work)
@@ -2667,7 +2930,7 @@ function H:Run(token)
             if result==CANCEL then error(CANCEL,0) end
             if self.ServerExitReason then
                 local reason=self.ServerExitReason
-                work.Reason=reason
+                if work then work.Reason=reason end
                 self:RecordFailure(self.Stage,reason)
                 self:Log("Modwood failed - "..reason,"WARNING","Modwood failed - changing server")
                 self.Stats.Skipped=self.Stats.Skipped+1
@@ -2751,7 +3014,7 @@ function H:LeaveStalledServer(token,reason)
     return self:Hop(token)
 end
 function H:Start()
-    if self.Busy or not self.Alive then return end
+    if self.Busy or self.Rejoining or not self.Alive then return end
     self.Running=true self.Busy=true self.NeedsAttention=false self.HopUncertain=false
     self.LastProgressAt=os.clock() self.ProgressKeys={} self.Watchdog=true
     self.Abandoning=self.Abandoning==true
@@ -2799,6 +3062,10 @@ function H:Start()
     end)
 end
 function H:Stop()
+    self.Rejoining=false
+    if self.RejoinWorker then pcall(task.cancel,self.RejoinWorker) self.RejoinWorker=nil end
+    self.RejoinAttempt=nil
+    if not self.Worker then self.Busy=false end
     self.Running=false self.Generation=self.Generation+1
     self.HopUncertain=false self.PendingTeleportTarget=nil
     self:Persist(false)
@@ -2842,7 +3109,7 @@ H.Window=Window H.Gui=Window.Gui
 home=Window:CreatePage({Title="Hunt",Icon="Moon"})
 local activityPage=Window:CreatePage({Title="Activity",Icon="Terminal"})
 settings=Window:CreatePage({Title="Settings",Icon="Settings"})
-local progress=home:ProgressBar({Title="Ready",Description="Spooky and Sinister - 40 studs3 minimum - Modwood only",Default=0})
+local progress=home:ProgressBar({Title="Ready",Description="Selected trees - Modwood only",Default=0})
 local cards=home:Row({Title="Rare trees",Height=66,Columns=2})
 local spooky=cards:Stat({Title="Spooky",Value=0,Description="0 studs3"})
 local sinister=cards:Stat({Title="Sinister",Value=0,Description="0 studs3",Token="Secondary"})
@@ -2896,6 +3163,13 @@ slot=settings:Dropdown({Title="Save slot",Options={"1","2","3","4","5","6"},Defa
     if H.Busy then slot:Set(tostring(H.Config.Slot),true) H:Log("Stop the hunt before changing slot","WARNING") return end
     apply("Slot",tonumber(v),slot)
 end})
+local speciesLabel={Both="Both",Spooky="Spooky",SpookyNeon="Sinister"}
+local speciesValue={Both="Both",Spooky="Spooky",Sinister="SpookyNeon"}
+local targetDropdown
+ targetDropdown=settings:Dropdown({Title="Target trees",Options={"Both","Spooky","Sinister"},Default=speciesLabel[H.Config.TargetSpecies],Callback=function(v)
+    if H.Busy then targetDropdown:Set(speciesLabel[H.Config.TargetSpecies],true) H:Log("Stop the hunt before changing targets","WARNING") return end
+    apply("TargetSpecies",speciesValue[v] or "Both",targetDropdown)
+end})
 local function textSetting(parent,title,key,numeric,secret,placeholder)
     local input
     input=parent:Textbox({Title=title,Default=secret and "" or tostring(H.Config[key]),
@@ -2917,11 +3191,19 @@ local botToggle
 botToggle=botSection:Toggle({Title="Connect to Discord",Default=H.Config.BotEnabled,
     Callback=function(v) apply("BotEnabled",v,botToggle) H.BotWake=true end})
 botSection:Button({Title="Reconnect bot",Callback=function() H.BotWake=true H:StartBot() end})
-for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"Fast harvest","FastHarvest"}}) do
+for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"Fast harvest","FastHarvest"},{"Auto rejoin","AutoRejoin"}}) do
     local title,key=entry[1],entry[2]
     local toggle
     toggle=settings:Toggle({Title=title,Default=H.Config[key],Callback=function(v) apply(key,v,toggle) end})
 end
+local growthSettings=settings:Section({Title="Sinister growth",Collapsible=true,Collapsed=false})
+local growthToggle
+ growthToggle=growthSettings:Toggle({Title="Wait for Sinister growth",Description="Includes small trees - requires InverseAxe and a harvest axe",Default=H.Config.GrowSinister,
+    Callback=function(v) apply("GrowSinister",v,growthToggle) end})
+textSetting(growthSettings,"Unchanged volume (seconds)","GrowthStableSeconds",true)
+textSetting(growthSettings,"Minimum observation (seconds)","GrowthMinWait",true)
+textSetting(growthSettings,"Maximum wait (seconds)","GrowthMaxWait",true)
+textSetting(growthSettings,"Discord updates (seconds)","GrowthNotifySeconds",true)
 local finder=settings:Section({Title="Server finder",Collapsible=true,Collapsed=false})
 local trackerToggle
 trackerToggle=finder:Toggle({Title="Prefer oldest observed",Default=H.Config.TrackerEnabled,
@@ -2940,7 +3222,7 @@ adaptiveToggle=finder:Toggle({Title="Adaptive server timing",Default=H.Config.Ad
     Callback=function(v) apply("AdaptiveTiming",v,adaptiveToggle) end})
 local advanced=settings:Section({Title="Advanced",Collapsible=true,Collapsed=true})
 textSetting(advanced,"Script URL","ScriptURL",false)
-for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},
+for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},{"Rejoin retry delay (seconds)","RejoinDelay"},
     {"Tracker timeout (seconds)","TrackerTimeout"},{"Tracker retry (seconds)","TrackerBackoff"},
     {"Last seen limit (minutes)","TrackerFreshness"},{"Minimum observed age (minutes)","TrackerMinAge"},
     {"Scan interval (seconds)","ScanInterval"},{"Tree confirmation (seconds)","ScanSettle"},
@@ -2953,17 +3235,30 @@ for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},
 end
 settings:Button({Title="Reset window position",Callback=function() Window:SetPosition({X=0.5,Y=0.5}) end})
 H:Connect(S.TeleportService.TeleportInitFailed,function(player,_,message,placeId,options)
-    if player~=Player or placeId~=game.PlaceId or not H.HopAttempt then return end
+    if player~=Player or placeId~=game.PlaceId then return end
+    if H.RejoinAttempt then H.RejoinAttempt.Error="Rejoin failed - "..tostring(message):sub(1,160) return end
+    if not H.HopAttempt then return end
     local id=options and options.ServerInstanceId
     if id and id~="" and id~=H.HopAttempt.Id then return end
     H.HopAttempt.Error="Teleport failed - "..tostring(message):sub(1,160)
 end)
+local rejoinHookOK=pcall(function()
+    H:Connect(S.GuiService.ErrorMessageChanged,function(message)
+        if type(message)~="string" then
+            local ok,current=pcall(S.GuiService.GetErrorMessage,S.GuiService)
+            message=ok and current or ""
+        end
+        if message~="" then H:BeginRejoin(message) end
+    end)
+end)
+if not rejoinHookOK then H:Log("Disconnect detection is unavailable in this executor","WARNING") end
 if H.ConfigWarning then H:Log(H.ConfigWarning,"WARNING") end
 H:Log("Ready")
 H:SetAntiAfk(H.Config.AntiAfk)
 H:StartBot()
 if H.RecoveredSession then H:Log("Resuming unfinished wood") end
-local resume=Env.MidnightSpookyResume==true and restored and restored.Resume==true and restored.Target==game.JobId
+local resume=Env.MidnightSpookyResume==true and restored and restored.Resume==true
+    and (restored.Target==game.JobId or (restored.Target=="*" and restored.Recovery==true and restored.PlaceId==game.PlaceId))
     and finite(restored.TicketTime) and os.time()-restored.TicketTime<600
 Env.MidnightSpookyResume=nil
 if (resume or (H.RecoveredSession and wasRunning)) and H.BotDesired~="paused" then H:Start() end
