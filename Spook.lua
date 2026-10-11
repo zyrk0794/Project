@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.10.6 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.10.8 - Lumber Tycoon 2
     October 11, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -55,14 +55,14 @@ local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
 local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeconds = 400,
     GrowthMinWait = 400, GrowthMaxWait = 16200, GrowthNotifySeconds = 600,
-    AutoRejoin = true, ModwoodHighlights = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
+    AutoRejoin = true, NoRender = false, HiddenPosition = true, ModwoodHighlights = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
     VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
     TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.10.6", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.10.8", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -494,6 +494,17 @@ function H:SetStage(text, progress, detail)
         self:Log(diagnostic,"INFO",visible~=self.LastStageVisible and visible or false)
         self.LastStageVisible=visible
     end
+end
+function H:SetNoRender(enabled)
+    enabled=enabled==true
+    local ok=pcall(function() S.RunService:Set3dRenderingEnabled(not enabled) end)
+    if not ok then
+        self:Log("3D rendering control is unavailable in this client","WARNING")
+        return false
+    end
+    self.RenderDisabled=enabled
+    self.Config.NoRender=enabled
+    return true
 end
 function H:SetAntiAfk(enabled)
     self.Config.AntiAfk=enabled==true
@@ -1327,6 +1338,85 @@ function H:SyncPhysics(token,rounds,diagnostic,refresh)
     if refresh then refresh() end
     return diagnostic.SyncReplies
 end
+-- Hold the character under a standing trunk, independently of tree physics.
+-- Never weld the avatar to the tree: a falling trunk must not drag it away.
+function H:HoldUnderTree(entry,token)
+    if not self.Config.HiddenPosition or token.HiddenTreeGuard then return end
+    local trunk=entry.Trunk
+    if not livePart(trunk) or not trunk.Anchored then return end
+    local character,humanoid,root=self:Character()
+    local base=trunk.CFrame:PointToWorldSpace(Vector3.new(0,-trunk.Size.Y/2,0))
+    local original={CFrame=root.CFrame,Anchored=root.Anchored,AutoRotate=humanoid.AutoRotate}
+    local guard={Tree=entry.Model,Character=character,Released=false}
+    token.HiddenTreeGuard=guard
+    local saved={}
+    local connections={}
+    local target=CFrame.new(base-Vector3.new(0,3.5,0))*root.CFrame.Rotation
+    local exitFrame=original.CFrame
+    local parameters=RaycastParams.new()
+    parameters.FilterType=Enum.RaycastFilterType.Exclude
+    local excluded={entry.Model}
+    for _,other in ipairs(S.Players:GetPlayers()) do
+        if other.Character then table.insert(excluded,other.Character) end
+    end
+    parameters.FilterDescendantsInstances=excluded
+    parameters.RespectCanCollide=true
+    local surface=S.Workspace:Raycast(base+Vector3.new(5,12,0),Vector3.new(0,-48,0),parameters)
+    if surface and surface.Normal.Y>0.5 then
+        local stand=surface.Position+Vector3.new(0,humanoid.HipHeight+root.Size.Y/2+0.5,0)
+        exitFrame=CFrame.new(stand)*original.CFrame.Rotation
+    end
+    function guard:Release()
+        if self.Released then return end
+        self.Released=true
+        for _,connection in ipairs(connections) do connection:Disconnect() end
+        -- Move above the surface before restoring collisions and gravity.
+        if root.Parent and Player.Character==character and humanoid.Health>0 then
+            root.CFrame=exitFrame
+            root.AssemblyLinearVelocity=Vector3.zero
+            root.AssemblyAngularVelocity=Vector3.zero
+        end
+        for part,canCollide in pairs(saved) do
+            if part.Parent then pcall(function() part.CanCollide=canCollide end) end
+        end
+        if root.Parent then root.Anchored=original.Anchored end
+        if humanoid.Parent then humanoid.AutoRotate=original.AutoRotate end
+        if token.HiddenTreeGuard==self then token.HiddenTreeGuard=nil end
+    end
+    token:Finally(function() guard:Release() end)
+    local function noCollision(part)
+        if part:IsA("BasePart") then
+            if saved[part]==nil then saved[part]=part.CanCollide end
+            part.CanCollide=false
+        end
+    end
+    for _,part in ipairs(character:GetDescendants()) do noCollision(part) end
+    table.insert(connections,character.DescendantAdded:Connect(noCollision))
+    local function hold()
+        if guard.Released then return end
+        if not H.Alive or token.Generation~=H.Generation or Player.Character~=character
+            or not root.Parent or humanoid.Health<=0 then
+            guard:Release()
+            return
+        end
+        humanoid.AutoRotate=false
+        root.Anchored=true
+        if (root.Position-target.Position).Magnitude>0.02 then root.CFrame=target end
+        root.AssemblyLinearVelocity=Vector3.zero
+        root.AssemblyAngularVelocity=Vector3.zero
+        for part in pairs(saved) do
+            if part:IsDescendantOf(character) then
+                part.CanCollide=false
+            else
+                if part.Parent then part.CanCollide=saved[part] end
+                saved[part]=nil
+            end
+        end
+    end
+    hold()
+    table.insert(connections,S.RunService.PreSimulation:Connect(hold))
+end
+
 function H:AttemptChop(model,tool,stats,token,section,height)
     token:Check()
     assert(model and under(model,S.Workspace),"The cut target is no longer in the world")
@@ -1343,9 +1433,11 @@ function H:AttemptChop(model,tool,stats,token,section,height)
     assert(tool and tool.Parent==Player.Character,"The selected axe is not equipped")
     local _,_,avatar=self:Character()
     local inverse=value(tool,"ToolName")=="InverseAxe" and stats.Damage<=0
+    local hidden=token.HiddenTreeGuard and not token.HiddenTreeGuard.Released
+        and token.HiddenTreeGuard.Tree==model
     local point=inverse and section.CFrame:PointToWorldSpace(Vector3.new(0,-section.Size.Y/2+height,0)) or section.Position
     local stand=point+(inverse and Vector3.new(4,2,0) or Vector3.new(0,0,5))
-    if inverse then
+    if inverse and not hidden then
         local parameters=RaycastParams.new()
         parameters.FilterType=Enum.RaycastFilterType.Exclude
         parameters.FilterDescendantsInstances={model,Player.Character}
@@ -1356,7 +1448,7 @@ function H:AttemptChop(model,tool,stats,token,section,height)
             stand=Vector3.new(stand.X,hit.Position.Y+humanoid.HipHeight+avatar.Size.Y/2+0.1,stand.Z)
         end
     end
-    if (avatar.Position-point).Magnitude>(inverse and 7 or 10) then
+    if not hidden and (avatar.Position-point).Magnitude>(inverse and 7 or 10) then
         self:Teleport(CFrame.lookAt(stand,point))
         token:Sleep(0.25)
     end
@@ -1743,7 +1835,9 @@ function H:Chop(entry, tool, stats, token, checkpoint)
             if os.clock()>=nextPosition then
                 local stand=trunk.Position+Vector3.new(5,0,0)
                 local _,_,avatar=self:Character()
-                local moved=(avatar.Position-trunk.Position).Magnitude>10
+                local hidden=token.HiddenTreeGuard and not token.HiddenTreeGuard.Released
+                    and token.HiddenTreeGuard.Tree==tree
+                local moved=not hidden and (avatar.Position-trunk.Position).Magnitude>10
                 if moved then self:Teleport(CFrame.lookAt(stand,trunk.Position)) end
                 if not cut.Synchronized or moved then
                     if self.Config.FastHarvest then
@@ -3358,6 +3452,9 @@ function H:Run(token)
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed during harvesting")
                 self:ProtectHarvestCharacter(scope)
                 if not work or (not work.Log and work.Cut) then
+                    local standingTarget=work and work.Cut
+                        and {Model=work.Cut.Tree,Trunk=work.Cut.Trunk,Kind=work.Kind} or entry
+                    self:HoldUnderTree(standingTarget,scope)
                     if not work and entry.Kind=="SpookyNeon" and self.Config.GrowSinister then
                         local grown,growthError=pcall(self.WaitForSinisterGrowth,self,entry,scope,token)
                         if not grown then
@@ -3379,6 +3476,7 @@ function H:Run(token)
                     cutStarted=true self.Dirty=true
                     local target=work.Cut and {Model=work.Cut.Tree,Trunk=work.Cut.Trunk,Kind=work.Kind} or entry
                     log=self:Chop(target,tool,stats,scope,work)
+                    if scope.HiddenTreeGuard then scope.HiddenTreeGuard:Release() end
                     if self.GrowthTarget==entry.Model then self.GrowthTarget=nil end
                     work.Log=log self.Stats.Trees=self.Stats.Trees+1
                 end
@@ -3568,6 +3666,10 @@ end
 function H:Destroy()
     if not self.Alive then return end
     self:Stop() self.Alive=false
+    if self.RenderDisabled then
+        pcall(function() S.RunService:Set3dRenderingEnabled(true) end)
+        self.RenderDisabled=false
+    end
     if self.AntiAfkConnection then self.AntiAfkConnection:Disconnect() self.AntiAfkConnection=nil end
     if self.Worker then pcall(task.cancel,self.Worker) end
     if self.BotRequestThread then pcall(task.cancel,self.BotRequestThread) self.BotRequestThread=nil end
@@ -3621,7 +3723,7 @@ H.UI={Results=results,Progress=progress,Stage=progress.Root:FindFirstChild("Prog
 H:RefreshMetrics()
 local controls={}
 local function apply(key,newValue,control)
-    if H.Busy and key~="AntiAfk" then
+    if H.Busy and key~="AntiAfk" and key~="NoRender" then
         control:Set(H.Config[key],true)
         H:Log("Stop the hunt before editing settings","WARNING") return
     end
@@ -3641,6 +3743,10 @@ local function apply(key,newValue,control)
     end
     if key=="TrackerToken" and candidate.TrackerToken~="" and not trackerKey(candidate.TrackerToken) then
         H:Log("Tracker key must contain 32 to 128 letters, numbers, dashes or underscores","WARNING") return
+    end
+    if key=="NoRender" and not H:SetNoRender(candidate.NoRender) then
+        control:Set(H.Config.NoRender,true)
+        return
     end
     H.Config=candidate
     if key=="BotKey" or key=="BotURL" then H.BotCommandVersion=0 H.BotWake=true end
@@ -3684,10 +3790,11 @@ local botToggle
 botToggle=botSection:Toggle({Title="Connect to Discord",Default=H.Config.BotEnabled,
     Callback=function(v) apply("BotEnabled",v,botToggle) H.BotWake=true end})
 botSection:Button({Title="Reconnect bot",Callback=function() H.BotWake=true H:StartBot() end})
-for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"Fast harvest","FastHarvest"},{"Auto rejoin","AutoRejoin"},{"Modwood highlights","ModwoodHighlights"}}) do
+for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"No render","NoRender"},{"Hidden position","HiddenPosition"},{"Fast harvest","FastHarvest"},{"Auto rejoin","AutoRejoin"},{"Modwood highlights","ModwoodHighlights"}}) do
     local title,key=entry[1],entry[2]
     local toggle
     toggle=settings:Toggle({Title=title,Default=H.Config[key],Callback=function(v) apply(key,v,toggle) end})
+    controls[key]=toggle
 end
 local growthSettings=settings:Section({Title="Sinister growth",Collapsible=true,Collapsed=false})
 local growthToggle
@@ -3742,6 +3849,10 @@ if not rejoinHookOK then H:Log("Disconnect detection is unavailable in this exec
 if H.ConfigWarning then H:Log(H.ConfigWarning,"WARNING") end
 H:Log("Ready")
 H:SetAntiAfk(H.Config.AntiAfk)
+if H.Config.NoRender and not H:SetNoRender(true) then
+    H.Config.NoRender=false
+    if controls.NoRender then controls.NoRender:Set(false,true) end
+end
 H:StartBot()
 if H.RecoveredSession then H:Log("Resuming unfinished wood") end
 local resume=Env.MidnightSpookyResume==true and restored and restored.Resume==true
