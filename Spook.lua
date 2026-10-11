@@ -1,5 +1,5 @@
 --[[
-    Midnight Spooky Hunter 1.10.4 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.10.6 - Lumber Tycoon 2
     October 11, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
@@ -53,8 +53,8 @@ local LEGACY_FILE = "MidnightSpookyHunter.json"
 local FILE = "MidnightSpookyHunter_"..tostring(Player.UserId)..".json"
 local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
-local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeconds = 1200,
-    GrowthMinWait = 600, GrowthMaxWait = 16200, GrowthNotifySeconds = 600,
+local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeconds = 400,
+    GrowthMinWait = 400, GrowthMaxWait = 16200, GrowthNotifySeconds = 600,
     AutoRejoin = true, ModwoodHighlights = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
     VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
@@ -62,7 +62,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.10.4", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.10.6", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -272,6 +272,12 @@ if Read then
 end
 if restored then
     H.Config = configFrom(restored.Config)
+    -- Apply the requested growth timing once, including existing saved settings.
+    -- Future edits in Advanced settings remain persistent.
+    if restored.GrowthTimingRevision ~= 1 then
+        H.Config.GrowthStableSeconds = 400
+        H.Config.GrowthMinWait = math.min(H.Config.GrowthMinWait, 400)
+    end
     for kind,record in pairs(H.Collection) do
         local saved=type(restored.Collection)=="table" and restored.Collection[kind]
         if type(saved)=="table" then
@@ -545,7 +551,7 @@ function H:Persist(resume, target)
     for id, untilTime in pairs(self.FailedServers) do
         if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
     end
-    local data = { Schema = 2, Version = self.Version, TimingRevision = 1, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
+    local data = { Schema = 2, Version = self.Version, TimingRevision = 1, GrowthTimingRevision = 1, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
         VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, BotQueue=self.BotQueue or {}, BotDesired=self.BotDesired, BotCommandVersion=self.BotCommandVersion or 0, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
         Collection=self.Collection, PlaceId=game.PlaceId, Recovery=self.Rejoining==true and target=="*",
         StartedAt = self.StartedAt, Resume = resume == true, Target = target, TicketTime = os.time(),
@@ -1364,9 +1370,151 @@ function H:AttemptChop(model,tool,stats,token,section,height)
         faceVector=Vector3.new(1,0,0),hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
     return id
 end
+-- Local protection for the current growth/harvest task. Only character-to-character
+-- collisions are suppressed; world, wood and vehicle physics are left unchanged.
+function H:ProtectHarvestCharacter(token)
+    local folder=Instance.new("Folder")
+    folder.Name="MidnightHarvestCharacterProtection"
+    folder.Parent=S.Workspace
+    local pairsByPart={}
+    local active=true
+    local worker
+    local humanoid, seatedEnabled, sitConnection
+    local function restoreHumanoid()
+        if sitConnection then sitConnection:Disconnect() sitConnection=nil end
+        if humanoid and humanoid.Parent then
+            pcall(humanoid.SetStateEnabled,humanoid,Enum.HumanoidStateType.Seated,seatedEnabled)
+        end
+        humanoid=nil
+    end
+    token:Finally(function()
+        active=false
+        if worker and coroutine.status(worker)~="dead" then pcall(task.cancel,worker) end
+        restoreHumanoid()
+        folder:Destroy()
+        table.clear(pairsByPart)
+    end)
+    local function refresh()
+        local character=Player.Character
+        local current=character and character:FindFirstChildOfClass("Humanoid")
+        if current~=humanoid then
+            restoreHumanoid()
+            humanoid=current
+            if humanoid then
+                local bound=humanoid
+                seatedEnabled=bound:GetStateEnabled(Enum.HumanoidStateType.Seated)
+                local function standUp()
+                    if active and bound.Parent and bound.Health>0 and bound.Sit then
+                        bound.Sit=false
+                        bound:ChangeState(Enum.HumanoidStateType.GettingUp)
+                    end
+                end
+                sitConnection=bound:GetPropertyChangedSignal("Sit"):Connect(standUp)
+                bound:SetStateEnabled(Enum.HumanoidStateType.Seated,false)
+                standUp()
+            end
+        end
+        local mine, others={},{}
+        if character then
+            for _,part in ipairs(character:GetChildren()) do
+                if part:IsA("BasePart") then mine[part]=true end
+            end
+        end
+        for _,other in ipairs(S.Players:GetPlayers()) do
+            if other~=Player and other.Character then
+                for _,part in ipairs(other.Character:GetChildren()) do
+                    if part:IsA("BasePart") then others[part]=true end
+                end
+            end
+        end
+        for ownPart, links in pairs(pairsByPart) do
+            for otherPart, constraint in pairs(links) do
+                if not mine[ownPart] or not others[otherPart] or not constraint.Parent then
+                    constraint:Destroy()
+                    links[otherPart]=nil
+                end
+            end
+            if not mine[ownPart] then pairsByPart[ownPart]=nil end
+        end
+        for ownPart in pairs(mine) do
+            local links=pairsByPart[ownPart] or {}
+            pairsByPart[ownPart]=links
+            for otherPart in pairs(others) do
+                if not links[otherPart] then
+                    local constraint=Instance.new("NoCollisionConstraint")
+                    constraint.Name="CharacterPushProtection"
+                    constraint.Part0=ownPart
+                    constraint.Part1=otherPart
+                    constraint.Parent=folder
+                    links[otherPart]=constraint
+                end
+            end
+        end
+    end
+    local ok,reason=pcall(refresh)
+    if not ok then self:Log("Character protection unavailable - "..tostring(reason),"WARNING") end
+    worker=task.spawn(function()
+        while active and self.Alive and token.Generation==self.Generation do
+            task.wait(1)
+            if not active then break end
+            local refreshed,failure=pcall(refresh)
+            if not refreshed then
+                self:Log("Character protection interrupted - "..tostring(failure),"WARNING")
+                break
+            end
+        end
+    end)
+end
+
+function H:NearbyPlayerCount()
+    local character=Player.Character
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local count=0
+    for _,other in ipairs(S.Players:GetPlayers()) do
+        if other~=Player then
+            local otherCharacter=other.Character
+            local otherRoot=otherCharacter and otherCharacter:FindFirstChild("HumanoidRootPart")
+            local otherHumanoid=otherCharacter and otherCharacter:FindFirstChildOfClass("Humanoid")
+            if otherRoot and otherHumanoid and otherHumanoid.Health>0
+                and (otherRoot.Position-root.Position).Magnitude<=50 then
+                count=count+1
+            end
+        end
+    end
+    return count
+end
+
+function H:AnnounceSafetyHarvest(token)
+    if token.SafetyAnnouncementAttempted then return end
+    token.SafetyAnnouncementAttempted=true
+    local ok,status=pcall(function()
+        return token:Await(function()
+            local chat=game:GetService("TextChatService")
+            if chat.ChatVersion==Enum.ChatVersion.TextChatService then
+                local channels=chat:FindFirstChild("TextChannels")
+                local general=channels and channels:FindFirstChild("RBXGeneral")
+                assert(general and general:IsA("TextChannel"),"Public chat is unavailable")
+                local message=general:SendAsync("Powered by MoonClient")
+                assert(message and message.Status==Enum.TextChatMessageStatus.Success,
+                    "Public chat did not confirm delivery")
+                return "Chat announcement delivered"
+            end
+            local events=S.ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+            local say=events and events:FindFirstChild("SayMessageRequest")
+            assert(say and say:IsA("RemoteEvent"),"Public chat is unavailable")
+            say:FireServer("Powered by MoonClient","All")
+            return "Chat announcement requested"
+        end,8)
+    end)
+    token:Check()
+    if ok then self:Log(status,"DEBUG")
+    else self:Log("Chat announcement unavailable - continuing safety harvest","WARNING") end
+end
+
 -- Volume stability is an observation, not proof that the tree reached its maximum size.
 function H:WaitForSinisterGrowth(entry, token, parentToken)
-    if entry.Kind ~= "SpookyNeon" or not self.Config.GrowSinister or entry.GrowthComplete then return end
+    if entry.Kind ~= "SpookyNeon" or not self.Config.GrowSinister or entry.GrowthComplete or entry.EarlyHarvest then return end
     local tool, stats
     for _, container in pairs({Player.Character, Player:FindFirstChildOfClass("Backpack")}) do
         for _, candidate in ipairs(container:GetChildren()) do
@@ -1398,7 +1546,7 @@ function H:WaitForSinisterGrowth(entry, token, parentToken)
         token.Deadline = token.Deadline - allowance + elapsed
         parentToken.Deadline = parentToken.Deadline - allowance + elapsed
         growth.Active = false
-        if growth.Status ~= "Stable" then growth.Status = "Interrupted" end
+        if growth.Status ~= "Stable" and growth.Status ~= "Safety harvest" then growth.Status = "Interrupted" end
         self.Watchdog = watchdog
         self.LastProgressAt = os.clock()
         self.BotWake = true
@@ -1414,6 +1562,7 @@ function H:WaitForSinisterGrowth(entry, token, parentToken)
     local lastOwnerField=nil
     local samples = 0
     local observedGrowth = false
+    local crowd={ThreeSeconds=0,FourSeconds=0,LastSample=nil,PreviousCount=0,NextSample=0}
     while os.clock() - started < self.Config.GrowthMaxWait do
         token:Check()
         local tree = entry.Model
@@ -1451,6 +1600,45 @@ function H:WaitForSinisterGrowth(entry, token, parentToken)
         local trunk = self:TreeTrunk(tree)
         assert(livePart(trunk) and tonumber(value(trunk, "ID")) == 1, "Growing trunk is unavailable")
         entry.Trunk = trunk
+        local now=os.clock()
+        if now>=crowd.NextSample then
+            local nearby=self:NearbyPlayerCount()
+            local gap=crowd.LastSample and now-crowd.LastSample or 0
+            -- Missing samples and long client stalls cannot prove continuous presence.
+            if nearby==nil or gap>3 then
+                crowd.ThreeSeconds,crowd.FourSeconds=0,0
+            else
+                crowd.ThreeSeconds=nearby>=3 and (crowd.PreviousCount>=3 and crowd.ThreeSeconds+gap or 0) or 0
+                crowd.FourSeconds=nearby>=4 and (crowd.PreviousCount>=4 and crowd.FourSeconds+gap or 0) or 0
+            end
+            crowd.PreviousCount=nearby or 0
+            crowd.LastSample=now
+            crowd.NextSample=now+0.5
+            growth.NearbyPlayers=nearby or 0
+            growth.CrowdSeconds=math.floor(crowd.ThreeSeconds)
+            growth.LargeCrowdSeconds=math.floor(crowd.FourSeconds)
+            local reason
+            if crowd.FourSeconds>=120 then reason="4 or more nearby players for 2 minutes"
+            elseif crowd.ThreeSeconds>=300 then reason="3 or more nearby players for 5 minutes" end
+            if reason then
+                local current=self:WoodVolume(tree)
+                assert(finite(current) and current>0,"Safety harvest target has no wood")
+                entry.Volume=current
+                entry.EarlyHarvest=true
+                entry.EarlyHarvestReason=reason
+                growth.Volume,growth.Gain=current,current-growth.Initial
+                growth.Elapsed=now-started
+                growth.Status="Safety harvest"
+                self:SetStage("Safety harvest",nil,reason)
+                self:Log("Safety harvest - "..reason,"WARNING")
+                self:AnnounceSafetyHarvest(token)
+                finishGrowth()
+                self:NotifyBot("Sinister safety harvest",string.format(
+                    "%s within 50 studs. Harvesting %.2f studs3 before growth completes; processing, delivery and saving will follow.",
+                    reason,current),token)
+                return
+            end
+        end
         if tool.Parent ~= Player.Character then
             assert(tool.Parent == Player:FindFirstChildOfClass("Backpack"), "InverseAxe left the inventory")
             local _, humanoid = self:Character()
@@ -3168,6 +3356,7 @@ function H:Run(token)
             local cutStarted=work~=nil
             local ok,result=pcall(function()
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed during harvesting")
+                self:ProtectHarvestCharacter(scope)
                 if not work or (not work.Log and work.Cut) then
                     if not work and entry.Kind=="SpookyNeon" and self.Config.GrowSinister then
                         local grown,growthError=pcall(self.WaitForSinisterGrowth,self,entry,scope,token)
@@ -3176,7 +3365,8 @@ function H:Run(token)
                             self.ServerExitReason=cleanError(growthError)
                             error(growthError,0)
                         end
-                        assert(entry.Volume>=MIN_TREE_VOLUME,"Growth stabilized below the 40 studs3 harvest minimum")
+                        assert((entry.EarlyHarvest and entry.Volume>0) or entry.Volume>=MIN_TREE_VOLUME,
+                            "Growth stabilized below the 40 studs3 harvest minimum")
                     end
                     local tool,stats=self:EnsureAxe(entry.Kind,scope)
                     self:UpdateHarvestProgress(0.02)
