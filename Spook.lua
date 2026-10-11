@@ -1,9 +1,13 @@
 --[[
-    Midnight Spooky Hunter 1.12.0 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.13.0 - Lumber Tycoon 2
     October 11, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.13.0: guarded teleport bootstrap with retries and OnTeleport backup;
+    persistent oldest-observed batches and a six-hour visit cycle.
+    Standard fallback is now opt-in when the tracker is enabled.
 
     1.12.0: local step retries, grounded chop repositioning, executor capability
     diagnostics, projected Drawing.new wireframes and touch argument compatibility.
@@ -41,6 +45,24 @@ local Env = type(getgenv) == "function" and getgenv() or _G
 local LIBRARY_URL="https://raw.githubusercontent.com/zyrk0794/Project/refs/heads/main/Library.lua"
 local function loadMidnight()
     assert(type(loadstring)=="function","This script requires a client with loadstring")
+    local cachePath="MidnightUI-Hunter-1.13.0.cache.lua"
+    local reader,writer=Env.readfile or readfile,Env.writefile or writefile
+    local function instantiate(source)
+        if type(source)~="string" then return nil end
+        local compiled=loadstring(source)
+        if not compiled then return nil end
+        local ok,library=pcall(compiled)
+        if ok and type(library)=="table" and type(library.CreateCompactWindow)=="function" then return library end
+        if ok and type(library)=="table" and type(library.Destroy)=="function" then pcall(library.Destroy,library) end
+        return nil
+    end
+    if type(reader)=="function" then
+        local ok,cached=pcall(reader,cachePath)
+        if ok then
+            local library=instantiate(cached)
+            if library then return library end
+        end
+    end
     local failure
     for attempt=1,3 do
         local response
@@ -52,7 +74,10 @@ local function loadMidnight()
             local compiled,message=loadstring(response[2])
             if compiled then
                 local ok,library=pcall(compiled)
-                if ok and type(library)=="table" and type(library.CreateCompactWindow)=="function" then return library end
+                if ok and type(library)=="table" and type(library.CreateCompactWindow)=="function" then
+                    if type(writer)=="function" then pcall(writer,cachePath,response[2]) end
+                    return library
+                end
                 if ok and type(library)=="table" and type(library.Destroy)=="function" then pcall(library.Destroy,library) end
                 failure="Upload Library.lua 2.4.0 to the configured GitHub URL first"
                 break
@@ -73,11 +98,28 @@ end
 local synAPI, httpAPI = Env.syn or syn, Env.http or http
 local Request = cap("request", request) or cap("http_request", http_request)
     or (type(synAPI) == "table" and synAPI.request) or (type(httpAPI) == "table" and httpAPI.request)
-local Queue = cap("queue_on_teleport", queue_on_teleport) or cap("queueonteleport", queueonteleport)
-    or (type(synAPI) == "table" and synAPI.queue_on_teleport)
+local function queueAPIs()
+    local result,seen={},{}
+    local function add(fn,name)
+        if type(fn)=="function" and not seen[fn] then
+            seen[fn]=true result[#result+1]={Call=fn,Name=name}
+        end
+    end
+    add(cap("queue_on_teleport",queue_on_teleport),"queue_on_teleport")
+    add(cap("queueonteleport",queueonteleport),"queueonteleport")
+    for _,name in ipairs({"syn","fluxus"}) do
+        local fallback
+        if name=="syn" then fallback=syn else fallback=fluxus end
+        local api=Env[name] or _G[name] or fallback
+        if type(api)=="table" then add(api.queue_on_teleport,name..".queue_on_teleport") end
+    end
+    return result
+end
 local Read, Write = cap("readfile", readfile), cap("writefile", writefile)
 local LEGACY_FILE = "MidnightSpookyHunter.json"
 local FILE = "MidnightSpookyHunter_"..tostring(Player.UserId)..".json"
+local CONTINUATION_TTL = 1800
+local SERVER_CYCLE_SECONDS = 6 * 60 * 60
 local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
 local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeconds = 400,
@@ -87,11 +129,11 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     AutoRejoin = true, NoRender = false, ModwoodHighlights = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 0.25, ScanWait = 12,
     VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
-    TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
+    TrackerEnabled = true, TrackerAllowFallback = false, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.12.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.13.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -186,8 +228,26 @@ end
 function H:EligibleVolume(kind, volume)
     return finite(volume) and volume>0 and (volume>=MIN_TREE_VOLUME or (kind=="SpookyNeon" and self.Config.GrowSinister))
 end
+function H:EnsureServerCycle()
+    local now=os.time()
+    if not self.ServerCycle or now>=self.ServerCycle.StartedAt+SERVER_CYCLE_SECONDS
+        or now<self.ServerCycle.StartedAt then
+        self.ServerCycle={StartedAt=now,Visited={}}
+        self.OldServerBatch=nil
+        self.TrackerSuppressed=nil
+        self.ServerCandidateCache=nil
+        self.TrackerRetryAt=nil
+        self.TrackerEmptyUntil=nil
+        self.ServerSearchRevision=(self.ServerSearchRevision or 0)+1
+    end
+    self.ServerCycle.Visited[game.JobId]=self.ServerCycle.Visited[game.JobId] or now
+    return self.ServerCycle
+end
 function H:IsServerExcluded(id)
     if id==game.JobId then return true end
+    if self.Config.TrackerEnabled then
+        return self:EnsureServerCycle().Visited[id]~=nil
+    end
     local record=self.VisitRecords[id]
     if not record then return false end
     local untilTime=math.max((record.LastVisit or 0)+self.Config.VisitCooldownHours*3600,
@@ -196,6 +256,7 @@ function H:IsServerExcluded(id)
 end
 function H:RememberServer(id,restoring)
     if type(id)~="string" or id=="" then return end
+    if not restoring then self:EnsureServerCycle().Visited[id]=os.time() end
     for i=#self.ServerHistory,1,-1 do
         if self.ServerHistory[i]==id then table.remove(self.ServerHistory,i) end
     end
@@ -317,8 +378,52 @@ if Read then
         end
     end
 end
+-- The bootstrap keeps the validated arrival ticket across startup retries.
+-- Partial UI initialization may already have written a non-resume settings file.
+local arrivalTicket=Env.MidnightSpookyResumeTicket
+if Env.MidnightSpookyResume==true and type(arrivalTicket)=="table"
+    and arrivalTicket.PlaceId==game.PlaceId and arrivalTicket.Resume==true
+    and finite(arrivalTicket.TicketTime) and os.time()-arrivalTicket.TicketTime>=-60
+    and os.time()-arrivalTicket.TicketTime<CONTINUATION_TTL
+    and (arrivalTicket.Target==game.JobId or (arrivalTicket.Target=="*" and arrivalTicket.Recovery==true)) then
+    restored=arrivalTicket
+end
 if restored then
     H.Config = configFrom(restored.Config)
+    local cycle=restored.ServerCycle
+    if type(cycle)=="table" and finite(cycle.StartedAt) and cycle.StartedAt<=os.time()
+        and os.time()-cycle.StartedAt<SERVER_CYCLE_SECONDS and type(cycle.Visited)=="table" then
+        H.ServerCycle={StartedAt=cycle.StartedAt,Visited={}}
+        H.TrackerSuppressed={}
+        if type(restored.TrackerSuppressed)=="table" then
+            for _,id in ipairs(restored.TrackerSuppressed) do
+                if #H.TrackerSuppressed>=1150 then break end
+                if serverID(id) then H.TrackerSuppressed[#H.TrackerSuppressed+1]=id end
+            end
+        end
+        local count=0
+        for id,stamp in pairs(cycle.Visited) do
+            if count>=25000 then break end
+            if serverID(id) and finite(stamp) and stamp>=cycle.StartedAt and stamp<=os.time() then
+                H.ServerCycle.Visited[id]=stamp count=count+1
+            end
+        end
+        local batch=restored.OldServerBatch
+        if type(batch)=="table" and batch.URL==H.Config.TrackerURL and type(batch.Entries)=="table"
+            and finite(batch.FetchedAt) and batch.FetchedAt<=os.time() and os.time()-batch.FetchedAt<300 then
+            local entries={}
+            for _,entry in ipairs(batch.Entries) do
+                if #entries>=100 then break end
+                if type(entry)=="table" and serverID(entry.id) and finite(entry.firstSeen)
+                    and finite(entry.lastSeen) and entry.firstSeen>0 and entry.firstSeen<=entry.lastSeen
+                    and entry.lastSeen<=os.time() and finite(entry.playing) and finite(entry.maxPlayers)
+                    and entry.playing>=0 and entry.playing<entry.maxPlayers then
+                    entries[#entries+1]=entry
+                end
+            end
+            H.OldServerBatch={URL=batch.URL,FetchedAt=batch.FetchedAt,Entries=entries}
+        end
+    end
     -- Apply the requested growth timing once, including existing saved settings.
     -- Future edits in Advanced settings remain persistent.
     if restored.GrowthTimingRevision ~= 1 then
@@ -399,6 +504,7 @@ if restored then
     H.ScanCounted=restored.LastScannedServer==game.JobId
     if not H.ArrivalSource and restored.CurrentServer==game.JobId then H.ArrivalSource=restored.ArrivalSource end
 end
+H:EnsureServerCycle()
 local function uiText(text) return tostring(text):gsub("SpookyNeon", "Sinister") end
 local function cleanError(err)
     local message = tostring(err)
@@ -626,6 +732,7 @@ function H:Persist(resume, target)
         if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
     end
     local data = { Schema = 2, Version = self.Version, TimingRevision = 1, GrowthTimingRevision = 1, PerformanceRevision = 1,
+        ServerCycle=self:EnsureServerCycle(),OldServerBatch=self.OldServerBatch,TrackerSuppressed=self.TrackerSuppressed,
         PublicCursor=self.PublicCursor,PublicCursorUntil=self.PublicCursorUntil,
         WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
         VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, BotQueue=self.BotQueue or {}, BotDesired=self.BotDesired, BotCommandVersion=self.BotCommandVersion or 0, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
@@ -2360,6 +2467,12 @@ function H:BuildReport()
     table.insert(lines,"Server finder: "..(self.Config.TrackerEnabled and "Oldest observed" or "Standard")
         .."\nTracker: "..tostring(self.TrackerStatus or "Not queried")
         .."\nServer source: "..tostring(self.ServerSource or "Not selected"))
+    local cycle=self:EnsureServerCycle()
+    local visitCount=0
+    for _ in pairs(cycle.Visited) do visitCount=visitCount+1 end
+    table.insert(lines,string.format("Oldest-server cycle: %d visited; reset in %s\nCached old candidates: %d\nStandard fallback: %s\nTeleport queue: %s",
+        visitCount,duration(math.max(0,cycle.StartedAt+SERVER_CYCLE_SECONDS-os.time())),
+        #self:CachedOldServers(),tostring(self.Config.TrackerAllowFallback),self.QueueBackend or "Not armed"))
     table.insert(lines,"Gameplay reference: supplied Ancestor script\nModwood policy: one attempt; leave on failure")
     if self.ServerExitReason then table.insert(lines,"Pending server departure: "..self.ServerExitReason) end
     if self.MoveDiagnostic then table.insert(lines,self.MoveDiagnostic) end
@@ -3393,6 +3506,27 @@ function H:EligibleServers(candidates)
     return result
 end
 
+function H:CachedOldServers()
+    self:EnsureServerCycle()
+    local batch=self.OldServerBatch
+    if not batch or batch.URL~=self.Config.TrackerURL or os.time()-batch.FetchedAt>=300 then return {} end
+    table.sort(batch.Entries,function(a,b)
+        if a.firstSeen~=b.firstSeen then return a.firstSeen<b.firstSeen end
+        if a.lastSeen~=b.lastSeen then return a.lastSeen>b.lastSeen end
+        return a.id<b.id
+    end)
+    local result={}
+    for _,entry in ipairs(batch.Entries) do
+        if os.time()-entry.lastSeen<=self.Config.TrackerFreshness*60
+            and os.time()-entry.firstSeen>=self.Config.TrackerMinAge*60
+            and not self:IsServerExcluded(entry.id)
+            and (not self.FailedServers[entry.id] or self.FailedServers[entry.id]<=os.time()) then
+            result[#result+1]=entry.id
+        end
+    end
+    return result
+end
+
 function H:PublicServers(token)
     assert(type(Request)=="function","An HTTP request function is required for server search")
     local deadline=os.clock()+self.Config.ServerSearchBudget
@@ -3467,9 +3601,10 @@ function H:PublicServers(token)
 end
 
 -- The tracker supplies observation history, never a claimed server creation date.
--- A failed read cannot block harvesting or disable the ordinary Roblox search.
+-- Standard fallback is explicit; oldest-only mode waits for tracker recovery.
 function H:TrackerServers(token)
     token:Check()
+    if type(Request)~="function" then return nil,"HTTP request function unavailable" end
     if not trackerURL(self.Config.TrackerURL) then return nil,"Invalid Worker URL" end
     if not trackerKey(self.Config.TrackerToken) then return nil,"Tracker key missing or invalid" end
     local exclusions,seen={},{}
@@ -3479,8 +3614,17 @@ function H:TrackerServers(token)
         end
     end
     exclude(game.JobId)
-    for _,id in ipairs(self.ServerHistory) do if self:IsServerExcluded(id) then exclude(id) end end
     for id,untilTime in pairs(self.FailedServers) do if untilTime>os.time() then exclude(id) end end
+    -- A separate six-hour cycle survives hops and never relies on a 50-item list.
+    -- Send exclusions matching the last batch first; the Worker accepts 1250 IDs.
+    for _,entry in ipairs(self.OldServerBatch and self.OldServerBatch.Entries or {}) do
+        if self:IsServerExcluded(entry.id) then exclude(entry.id) end
+    end
+    for _,id in ipairs(self.TrackerSuppressed or {}) do exclude(id) end
+    local visits={}
+    for id,stamp in pairs(self:EnsureServerCycle().Visited) do visits[#visits+1]={Id=id,Stamp=stamp} end
+    table.sort(visits,function(a,b) return a.Stamp>b.Stamp end)
+    for _,entry in ipairs(visits) do exclude(entry.Id) end
     local body=S.HttpService:JSONEncode({placeId=game.PlaceId,exclude=exclusions,limit=100,
         maxSeenAgeSeconds=math.floor(self.Config.TrackerFreshness*60),
         minObservedAgeSeconds=math.floor(self.Config.TrackerMinAge*60)})
@@ -3502,7 +3646,11 @@ function H:TrackerServers(token)
         or math.abs(os.time()-data.generatedAt)>120 or data.lastScanAt>data.generatedAt
         or data.generatedAt-data.lastScanAt>900 then return nil,"Tracker data is stale or invalid" end
     local ordered,accepted={},{}
+    local suppressed={}
     for _,entry in ipairs(data.servers) do
+        if type(entry)=="table" and serverID(entry.id) and self:IsServerExcluded(entry.id) then
+            suppressed[#suppressed+1]=entry.id
+        end
         if type(entry)=="table" and serverID(entry.id) and entry.id~=game.JobId
             and not accepted[entry.id] and not self:IsServerExcluded(entry.id)
             and (not self.FailedServers[entry.id] or self.FailedServers[entry.id]<=os.time())
@@ -3522,6 +3670,18 @@ function H:TrackerServers(token)
     end)
     local result={}
     for _,entry in ipairs(ordered) do table.insert(result,entry.id) end
+    if #suppressed>0 then
+        local seenSuppressed={}
+        for _,id in ipairs(suppressed) do seenSuppressed[id]=true end
+        for _,id in ipairs(self.TrackerSuppressed or {}) do
+            if #suppressed>=1150 then break end
+            if not seenSuppressed[id] then
+                seenSuppressed[id]=true suppressed[#suppressed+1]=id
+            end
+        end
+        self.TrackerSuppressed=suppressed
+    end
+    self.OldServerBatch={URL=self.Config.TrackerURL,FetchedAt=os.time(),Entries=ordered}
     if #result==0 then return nil,"No eligible observed server" end
     self.TrackerStatus=string.format("Ready - %d candidates - first observed at least %s ago",
         #result,duration(data.generatedAt-ordered[1].firstSeen))
@@ -3529,10 +3689,18 @@ function H:TrackerServers(token)
 end
 function H:SearchServers(token)
     token:Check()
-    local useTracker=self.Config.TrackerEnabled and self.Config.TrackerURL~=""
-        and os.clock()>=(self.TrackerRetryAt or 0)
+    local useTracker=self.Config.TrackerEnabled
     if not useTracker then
         return self:PublicServers(token),"Standard"
+    end
+    local batch=self:CachedOldServers()
+    if #batch>0 then
+        self.TrackerStatus="Ready - "..#batch.." oldest-observed candidates cached"
+        return batch,"Oldest observed"
+    end
+    if os.clock()<(self.TrackerRetryAt or 0) then
+        if self.Config.TrackerAllowFallback then return self:PublicServers(token),"Standard" end
+        return {},"Oldest observed"
     end
     -- Both operations are reads. Preserve tracker preference, but overlap the
     -- standard fallback so a failed tracker does not add two network waits.
@@ -3556,7 +3724,7 @@ function H:SearchServers(token)
     local hedgeAt=os.clock()+0.6
     while not trackerResult do
         token:Check()
-        if self.Config.PerformanceMode and not publicWorker and os.clock()>=hedgeAt then
+        if self.Config.TrackerAllowFallback and self.Config.PerformanceMode and not publicWorker and os.clock()>=hedgeAt then
             publicWorker=task.spawn(function()
                 publicResult=table.pack(pcall(self.PublicServers,self,publicScope))
             end)
@@ -3564,7 +3732,7 @@ function H:SearchServers(token)
         token:Sleep(0.05)
     end
     if trackerResult[1] and type(trackerResult[2])=="table" and #trackerResult[2]>0 then
-        self.TrackerRetryAt=nil self.TrackerFallbackLogged=false
+        self.TrackerRetryAt=nil self.TrackerFallbackLogged=false self.TrackerFailures=0
         local result=trackerResult[2]
         clean()
         return result,"Oldest observed"
@@ -3572,10 +3740,19 @@ function H:SearchServers(token)
     if trackerResult[2]==CANCEL then clean() error(CANCEL,0) end
     self.TrackerStatus=trackerResult[1] and (trackerResult[3] or "No eligible tracked server")
         or "Tracker request failed or timed out"
-    self.TrackerRetryAt=os.clock()+self.Config.TrackerBackoff
+    self.TrackerFailures=math.min((self.TrackerFailures or 0)+1,5)
+    local retry=self.TrackerStatus=="No eligible observed server" and 15
+        or math.min(self.Config.TrackerBackoff,5*2^(self.TrackerFailures-1))
+    if self.TrackerStatus=="Tracker key rejected" or self.TrackerStatus=="Tracker key missing or invalid"
+        or self.TrackerStatus=="Invalid Worker URL" then retry=self.Config.TrackerBackoff end
+    self.TrackerRetryAt=os.clock()+retry
     if not self.TrackerFallbackLogged then
-        self:Log(self.TrackerStatus.." - using standard search","WARNING")
+        self:Log(self.TrackerStatus..(self.Config.TrackerAllowFallback and " - using standard search" or " - oldest-server search will retry"),"WARNING")
         self.TrackerFallbackLogged=true
+    end
+    if not self.Config.TrackerAllowFallback then
+        clean()
+        return {},"Oldest observed"
     end
     if not publicWorker then
         publicWorker=task.spawn(function()
@@ -3589,13 +3766,14 @@ function H:SearchServers(token)
 end
 
 function H:StartServerPrefetch(token)
+    self:EnsureServerCycle()
     if not self.Config.PrefetchServers then return end
     local cached=self.ServerCandidateCache
     if cached and os.clock()<cached.Until and #self:EligibleServers(cached.Servers)>0 then return end
     local previous=self.ServerPrefetch
     if previous and not previous.Done and not previous.Cancelled then return previous end
     if previous and previous.Done and os.clock()-(previous.Finished or 0)<2 then return previous end
-    local state={Scope=self:Token(token),Started=os.clock()}
+    local state={Scope=self:Token(token),Started=os.clock(),Revision=self.ServerSearchRevision}
     self.ServerPrefetch=state
     token:Finally(function()
         if not state.Done then
@@ -3608,7 +3786,9 @@ function H:StartServerPrefetch(token)
     state.Worker=task.spawn(function()
         local result=table.pack(pcall(self.SearchServers,self,state.Scope))
         state.Scope:Clean()
-        if state.Cancelled then return end
+        if state.Cancelled or state.Revision~=self.ServerSearchRevision then
+            state.Cancelled=true return
+        end
         state.Done=true state.Finished=os.clock()
         self.LastServerSearchSeconds=state.Finished-state.Started
         if result[1] then
@@ -3628,8 +3808,18 @@ end
 
 function H:Servers(token)
     token:Check()
+    self:EnsureServerCycle()
+    if self.Config.TrackerEnabled then
+        local batch=self:CachedOldServers()
+        if #batch>0 then
+            self.ServerSource="Oldest observed"
+            self.ServerCacheHits=(self.ServerCacheHits or 0)+1
+            return batch
+        end
+    end
     local cached=self.ServerCandidateCache
-    if cached and os.clock()<cached.Until then
+    if cached and os.clock()<cached.Until and (not self.Config.TrackerEnabled
+        or self.Config.TrackerAllowFallback or cached.Source=="Oldest observed") then
         local eligible=self:EligibleServers(cached.Servers)
         if #eligible>0 then
             self.ServerSource=cached.Source
@@ -3656,22 +3846,163 @@ function H:Servers(token)
     return servers
 end
 function H:Bootstrap()
-    assert(type(Queue)=="function", "queue_on_teleport unavailable - automatic continuation is not supported")
+    assert(#queueAPIs()>0, "queue_on_teleport unavailable - automatic continuation is not supported")
     assert(type(loadstring)=="function", "loadstring unavailable")
     assert(Read and Write, "Saved continuation requires readfile and writefile")
-    local source = Env.MidnightSpookySource
-    local loader
-    if type(source)=="string" and #source>100 and source:find("Midnight Spooky Hunter "..self.Version,1,true) then
-        loader = "local source=" .. string.format("%q",source) .. ";local env=type(getgenv)=='function' and getgenv() or _G;env.MidnightSpookySource=source;local f,e=loadstring(source);assert(f,e);f()"
+    if self.BootstrapPayload and self.BootstrapURL==self.Config.ScriptURL then return self.BootstrapPayload end
+    local marker="Midnight Spooky Hunter "..self.Version
+    local source=Env.MidnightSpookySource
+    local cacheFile="MidnightSpookyHunter-"..self.Version..".cache.lua"
+    local cached=false
+    local inline=""
+    if type(source)=="string" and source:find(marker,1,true) then
+        cached=pcall(function()
+            local ok,current=pcall(Read,cacheFile)
+            if not ok or current~=source then Write(cacheFile,source) end
+            assert(Read(cacheFile)==source,"Source cache verification failed")
+        end)
+        if not cached then inline=source end
     else
-        local url=self.Config.ScriptURL
-        assert(url:match("^https://"), "Set Script URL in Settings or start with the companion loader")
-        loader = "local source=game:HttpGet(" .. string.format("%q",url) .. ");local env=type(getgenv)=='function' and getgenv() or _G;env.MidnightSpookySource=source;local f,e=loadstring(source);assert(f,e);f()"
+        local ok,current=pcall(Read,cacheFile)
+        cached=ok and type(current)=="string" and current:find(marker,1,true)~=nil
     end
-    return "local deadline=os.clock()+300;repeat task.wait(0.2) until game:IsLoaded() or os.clock()>=deadline;if not game:IsLoaded() then return end;local ok,d=pcall(function() return game:GetService('HttpService'):JSONDecode(readfile('"..FILE.."')) end);"
-        .. "if not ok or not d.Resume or (d.Target~=game.JobId and not (d.Target=='*' and d.Recovery==true and d.PlaceId==game.PlaceId)) or os.time()-(d.TicketTime or 0)>600 then return end;"
-        .. "local env=type(getgenv)=='function' and getgenv() or _G;if env.MidnightSpookyBootServer==game.JobId then return end;"
-        .. "env.MidnightSpookyBootServer=game.JobId;env.MidnightSpookyResume=true;" .. loader
+    assert(cached or inline~="" or self.Config.ScriptURL:match("^https://"),
+        "Set Script URL in Settings or start with the companion loader")
+    local payload=[==[
+local env=type(getgenv)=="function" and getgenv() or _G
+local previous=env.MidnightSpookyBootstrap
+if type(previous)=="table" and previous.Active and not previous.Cancelled then return end
+local existing=env.MidnightSpookyHunter
+if type(existing)=="table" and existing.Alive and existing.BootReady and existing.JobId==game.JobId then return end
+local boot={Active=true,Cancelled=false,Attempts=0}
+env.MidnightSpookyBootstrap=boot
+task.spawn(function()
+    local ok=pcall(function()
+        local players=game:GetService("Players")
+        local deadline=os.clock()+900
+        while not game:IsLoaded() or not players.LocalPlayer or game.JobId=="" do
+            if boot.Cancelled or os.clock()>=deadline then return end
+            task.wait(0.2)
+        end
+        local reader=env.readfile or readfile
+        local compiler=env.loadstring or loadstring
+        if type(reader)~="function" or type(compiler)~="function" then
+            warn("[Spooky Hunter] Continuation requires readfile and loadstring in the new server")
+            return
+        end
+        local ticket
+        for attempt=1,10 do
+            local readOK,data=pcall(function()
+                return game:GetService("HttpService"):JSONDecode(reader(__FILE__))
+            end)
+            if not readOK or type(data)~="table" then
+                readOK,data=pcall(function()
+                    return game:GetService("HttpService"):JSONDecode(reader(__FILE__..".bak"))
+                end)
+            end
+            if readOK and type(data)=="table" then ticket=data break end
+            if boot.Cancelled then return end
+            task.wait(0.5)
+        end
+        if not ticket or ticket.Resume~=true or ticket.PlaceId~=game.PlaceId
+            or type(ticket.TicketTime)~="number" or ticket.TicketTime~=ticket.TicketTime
+            or os.time()-ticket.TicketTime< -60 or os.time()-ticket.TicketTime>1800
+            or (ticket.Target~=game.JobId and not (ticket.Target=="*" and ticket.Recovery==true))
+            or ticket.BotDesired=="paused" then return end
+        local source
+        local function valid(text)
+            return type(text)=="string" and #text>100 and text:find(__MARKER__,1,true)~=nil
+        end
+        local cacheOK,cache=pcall(reader,__CACHE__)
+        if cacheOK and valid(cache) then source=cache end
+        if not source and valid(__INLINE__) then source=__INLINE__ end
+        local url=__URL__
+        while not boot.Cancelled and os.time()-ticket.TicketTime<1800 do
+            boot.Attempts=boot.Attempts+1
+            if not source and url:match("^https://") then
+                local downloaded
+                local thread=task.spawn(function() downloaded=table.pack(pcall(game.HttpGet,game,url)) end)
+                local untilTime=os.clock()+20
+                while not downloaded and not boot.Cancelled and os.clock()<untilTime do task.wait(0.1) end
+                if not downloaded then pcall(task.cancel,thread)
+                elseif downloaded[1] and valid(downloaded[2]) then source=downloaded[2] end
+            end
+            if boot.Cancelled then return end
+            local compiled=source and compiler(source)
+            if type(compiled)=="function" then
+                env.MidnightSpookySource=source
+                env.MidnightSpookyResume=true
+                env.MidnightSpookyResumeTicket=ticket
+                local result
+                local thread=task.spawn(function() result=table.pack(pcall(compiled)) end)
+                local untilTime=os.clock()+180
+                while not result and not boot.Cancelled and os.clock()<untilTime do task.wait(0.1) end
+                if not result then pcall(task.cancel,thread) end
+                if boot.Cancelled then return end
+                if result and result[1] and type(result[2])=="table" and result[2].Alive and result[2].BootReady then
+                    env.MidnightSpookyBootServer=game.JobId
+                    boot.Completed=true
+                    return
+                end
+                local partial=env.MidnightSpookyHunter
+                boot.Cleaning=true
+                if type(partial)=="table" and type(partial.Destroy)=="function" then pcall(partial.Destroy,partial) end
+                boot.Cleaning=false
+            else source=nil end
+            if boot.Attempts==1 or boot.Attempts%5==0 then
+                warn("[Spooky Hunter] Startup incomplete - retrying automatically ("..boot.Attempts..")")
+            end
+            local untilTime=os.clock()+math.min(15,2*boot.Attempts)
+            while not boot.Cancelled and os.clock()<untilTime do task.wait(0.2) end
+        end
+    end)
+    boot.Active=false
+    env.MidnightSpookyResume=nil
+    env.MidnightSpookyResumeTicket=nil
+    if not boot.Completed and not boot.Cancelled then
+        warn(ok and "[Spooky Hunter] No valid continuation completed - check the script URL and executor"
+            or "[Spooky Hunter] Continuation failed before startup - check executor support")
+    end
+end)
+]==]
+    local substitutions={__FILE__=FILE,__MARKER__=marker,__CACHE__=cacheFile,
+        __INLINE__=inline,__URL__=self.Config.ScriptURL}
+    payload=payload:gsub("__[A-Z]+__",function(key) return string.format("%q",substitutions[key]) end)
+    self.BootstrapPayload=payload self.BootstrapURL=self.Config.ScriptURL
+    return payload
+end
+
+function H:QueueContinuation(arm,backup)
+    if not arm or self.TeleportArm~=arm or arm.Queuing then return false end
+    if backup and arm.BackupQueued then return true end
+    arm.Queuing=true
+    for _,api in ipairs(queueAPIs()) do
+        local ok,result=pcall(api.Call,arm.Payload)
+        if ok and result~=false then
+            arm.Queuing=false arm.Queued=true
+            if backup then arm.BackupQueued=true end
+            self.QueueBackend=api.Name
+            return true
+        end
+    end
+    arm.Queuing=false
+    return false
+end
+function H:ArmContinuation(target,payload)
+    self.PendingTeleportTarget=target
+    local arm={Target=target,Payload=payload or self:Bootstrap()}
+    self.TeleportArm=arm
+    local saved,reason=self:Persist(true,target)
+    if not saved then
+        self.PendingTeleportTarget=nil self.TeleportArm=nil
+        return false,reason
+    end
+    if not self:QueueContinuation(arm,false) then
+        self.PendingTeleportTarget=nil self.TeleportArm=nil
+        self:Persist(false)
+        return false,"All available teleport queue functions rejected continuation"
+    end
+    return true
 end
 -- ErrorMessageChanged also reports non-disconnect errors. Never cancel a live
 -- harvest merely because an error string was displayed.
@@ -3739,10 +4070,8 @@ function H:BeginRejoin(message)
             self:SetStage("Rejoining game", nil, "Attempt " .. attempt)
             if not waitFor(delay) then break end
             -- A wildcard ticket is valid only for a recovery into this exact place.
-            self.PendingTeleportTarget = "*"
-            local saved, failure = self:Persist(true, "*")
-            local queued = saved and pcall(Queue, bootstrap)
-            if saved and queued then
+            local armed, failure = self:ArmContinuation("*",bootstrap)
+            if armed then
                 self.RejoinAttempt = {Number=attempt}
                 local sent, reason = pcall(S.TeleportService.Teleport, S.TeleportService, game.PlaceId, Player)
                 if not sent then self.RejoinAttempt.Error = tostring(reason) end
@@ -3769,7 +4098,11 @@ end
 
 function H:Hop(token)
     assert(not self.Dirty, "Unfinished wood is still in this server")
+    -- Character removal is normal while teleporting; it must not cancel the
+    -- armed ticket and start a second destination request.
+    token.Character=nil
     self.Watchdog=false
+    self.AwaitingServer=true
     local bootstrap=self:Bootstrap()
     self:RememberServer(game.JobId)
     local stored, storeError = self:Persist(false) assert(stored, storeError)
@@ -3795,19 +4128,19 @@ function H:Hop(token)
         token:Check()
         local id=servers[i]
         self.FailedServers[id]=os.time()+600
-        local saved,err=self:Persist(true,id) assert(saved,err)
         -- Executors differ on whether a failed teleport consumes the queue.
         -- Requeue each attempt; the bootstrap permits only one launch per server.
-        local queued=pcall(Queue,bootstrap) assert(queued,"Could not queue continuation")
+        local armed,reason=self:ArmContinuation(id,bootstrap) assert(armed,reason)
         local attempt={Id=id} self.HopAttempt=attempt
-        self.PendingTeleportTarget=id
-        self:SetStage("Joining another server",1,"Attempt "..i)
+        self:SetStage("Joining another server",1,(self.ServerSource=="Oldest observed" and "Oldest available - " or "").."Attempt "..i)
         local ok=pcall(S.TeleportService.TeleportToPlaceInstance,S.TeleportService,game.PlaceId,id,Player)
         if not ok then attempt.Error="Teleport request rejected" end
         local deadline=os.clock()+35
         while not attempt.Error and os.clock()<deadline do token:Sleep(0.2) end
         self.HopAttempt=nil
         if not attempt.Error then self.HopUncertain=true error("Teleport outcome unknown - no second request sent",0) end
+        self.TeleportArm=nil self.PendingTeleportTarget=nil
+        self:Persist(false)
         self:Log(attempt.Error,"WARNING")
         local pause=self.Config.HopDelay
         if attempt.FailureKind=="GameFull" or attempt.FailureKind=="GameEnded" then
@@ -4077,7 +4410,7 @@ function H:Start()
         while self.Alive and self.Running do
             local token=self:Token() self.ActiveToken=token
             local ok
-            if self.Abandoning then
+            if self.Abandoning or self.AwaitingServer then
                 self.Watchdog=false
                 ok,result=pcall(self.Hop,self,token)
             elseif self.ServerExitReason then
@@ -4098,7 +4431,13 @@ function H:Start()
             -- Preserve the continuation ticket while an uncertain teleport settles.
             self.Watchdog=false
             token.Deadline=os.clock()+210
-            local waited,err=pcall(token.Sleep,token,self.HopUncertain and 180 or 0.75)
+            local retryDelay=self.HopUncertain and 180 or 0.75
+            if self.AwaitingServer and not self.HopUncertain and self.Config.TrackerEnabled
+                and not self.Config.TrackerAllowFallback then
+                retryDelay=math.max(retryDelay,math.min(30,(self.TrackerRetryAt or 0)-os.clock()))
+                self:SetStage("Waiting for oldest servers",0.98,self.TrackerStatus)
+            end
+            local waited,err=pcall(token.Sleep,token,retryDelay)
             if not waited then result=err break end
             if self.HopUncertain then
                 self.HopUncertain=false self.PendingTeleportTarget=nil self.HopAttempt=nil
@@ -4115,6 +4454,9 @@ function H:Start()
     end)
 end
 function H:Stop()
+    local boot=Env.MidnightSpookyBootstrap
+    if type(boot)=="table" and boot.Active and not boot.Cleaning then boot.Cancelled=true end
+    self.TeleportArm=nil self.AwaitingServer=false
     self.DisconnectRevision=(self.DisconnectRevision or 0)+1
     if self.DisconnectCheck then pcall(task.cancel,self.DisconnectCheck) self.DisconnectCheck=nil end
     self.Rejoining=false
@@ -4220,7 +4562,11 @@ local function apply(key,newValue,control)
         H.ServerCandidateCache=nil H.ServerPrefetch=nil
     end
     if key=="BotKey" or key=="BotURL" then H.BotCommandVersion=0 H.BotWake=true end
-    if key:sub(1,7)=="Tracker" then H.TrackerRetryAt=nil H.TrackerFallbackLogged=false end
+    if key:sub(1,7)=="Tracker" then
+        H.TrackerRetryAt=nil H.TrackerFallbackLogged=false H.TrackerFailures=0
+        H.OldServerBatch=nil H.TrackerSuppressed=nil
+        H.ServerSearchRevision=(H.ServerSearchRevision or 0)+1
+    end
     if controls.ScanWait then controls.ScanWait:Set(tostring(candidate.ScanWait),true) end
     if key=="AntiAfk" then H:SetAntiAfk(candidate.AntiAfk) end
     local target=H.PendingTeleportTarget
@@ -4276,8 +4622,12 @@ textSetting(growthSettings,"Maximum wait (seconds)","GrowthMaxWait",true)
 textSetting(growthSettings,"Discord updates (seconds)","GrowthNotifySeconds",true)
 local finder=settings:Section({Title="Server finder",Collapsible=true,Collapsed=false})
 local trackerToggle
-trackerToggle=finder:Toggle({Title="Prefer oldest observed",Default=H.Config.TrackerEnabled,
+trackerToggle=finder:Toggle({Title="Oldest observed servers",Default=H.Config.TrackerEnabled,
     Callback=function(v) apply("TrackerEnabled",v,trackerToggle) end})
+local fallbackToggle
+fallbackToggle=finder:Toggle({Title="Allow standard fallback",Default=H.Config.TrackerAllowFallback,
+    Callback=function(v) apply("TrackerAllowFallback",v,fallbackToggle) end})
+finder:Label({Title="Visit cycle - 6 hours",Description="Oldest first - history and next candidates survive teleports"})
 textSetting(finder,"Worker URL","TrackerURL",false,false,"https://midnight-spooky-tracker.account.workers.dev")
 textSetting(finder,"Tracker key","TrackerToken",false,true,"Paste your private API_TOKEN")
 finder:Button({Title="Clear tracker key",Callback=function()
@@ -4285,8 +4635,8 @@ finder:Button({Title="Clear tracker key",Callback=function()
     H.Config.TrackerToken="" H.TrackerRetryAt=nil H.TrackerFallbackLogged=false
     local saved,err=H:Persist(false) if not saved then H:Log(err,"WARNING") end
 end})
-textSetting(finder,"Revisit after (hours)","VisitCooldownHours",true)
-textSetting(finder,"After harvest (hours)","HarvestCooldownHours",true)
+textSetting(finder,"Standard revisit delay (hours)","VisitCooldownHours",true)
+textSetting(finder,"Standard harvest delay (hours)","HarvestCooldownHours",true)
 local adaptiveToggle
 adaptiveToggle=finder:Toggle({Title="Adaptive server timing",Default=H.Config.AdaptiveTiming,
     Callback=function(v) apply("AdaptiveTiming",v,adaptiveToggle) end})
@@ -4304,6 +4654,8 @@ textSetting(performance,"Maximum server pages","PublicPageLimit",true)
 performance:Button({Title="Clear search cache",Callback=function()
     if H.Busy then H:Log("Stop the hunt before clearing search cache","WARNING") return end
     H.ServerCandidateCache=nil H.ServerPrefetch=nil
+    H.OldServerBatch=nil H.TrackerSuppressed=nil H.TrackerRetryAt=nil
+    H.ServerSearchRevision=(H.ServerSearchRevision or 0)+1
     H.PublicCursor=nil H.PublicCursorUntil=nil
     H:Persist(false)
     H:Log("Search cache cleared - server history retained")
@@ -4321,6 +4673,25 @@ for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},{"Rejoin retry delay (
     textSetting(advanced,entry[1],entry[2],true)
 end
 settings:Button({Title="Reset window position",Callback=function() Window:SetPosition({X=0.5,Y=0.5}) end})
+H:Connect(Player.OnTeleport,function(state,placeId)
+    if placeId~=game.PlaceId then return end
+    if state==Enum.TeleportState.Failed then
+        if H.TeleportArm then H.TeleportArm.BackupQueued=false end
+        local attempt=H.HopAttempt or H.RejoinAttempt
+        if attempt then attempt.Error=attempt.Error or "Teleport failed - selecting another candidate" end
+        return
+    end
+    if state~=Enum.TeleportState.Started and state~=Enum.TeleportState.WaitingForServer
+        and state~=Enum.TeleportState.InProgress then return end
+    if not H.Running or H.BotDesired=="paused" then return end
+    local arm=H.TeleportArm
+    if not arm or arm.Target~=H.PendingTeleportTarget or arm.BackupQueued then return end
+    -- Queue again once during the actual teleport transition. The arrival
+    -- bootstrap has a shared lock, so two queued callbacks cannot start two hunts.
+    if not H:QueueContinuation(arm,true) then
+        H:Log("Teleport backup could not be queued - initial continuation remains armed","WARNING")
+    end
+end)
 H:Connect(S.TeleportService.TeleportInitFailed,function(player,result,message,placeId,options)
     if player~=Player or placeId~=game.PlaceId then return end
     if H.RejoinAttempt then H.RejoinAttempt.Error="Rejoin failed - "..tostring(message):sub(1,160) return end
@@ -4346,7 +4717,10 @@ H:StartBot()
 if H.RecoveredSession then H:Log("Resuming unfinished wood") end
 local resume=Env.MidnightSpookyResume==true and restored and restored.Resume==true
     and (restored.Target==game.JobId or (restored.Target=="*" and restored.Recovery==true and restored.PlaceId==game.PlaceId))
-    and finite(restored.TicketTime) and os.time()-restored.TicketTime<600
+    and finite(restored.TicketTime) and os.time()-restored.TicketTime>=-60
+    and os.time()-restored.TicketTime<CONTINUATION_TTL
 Env.MidnightSpookyResume=nil
+Env.MidnightSpookyResumeTicket=nil
+H.BootReady=true
 if (resume or (H.RecoveredSession and wasRunning)) and H.BotDesired~="paused" then H:Start() end
 return H
