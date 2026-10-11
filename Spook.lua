@@ -1,9 +1,36 @@
 --[[
-    Midnight Spooky Hunter 1.10.9 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.12.0 - Lumber Tycoon 2
     October 11, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.12.0: local step retries, grounded chop repositioning, executor capability
+    diagnostics, projected Drawing.new wireframes and touch argument compatibility.
+    Modwood still runs once. A real disconnection still uses Auto rejoin.
+
+    1.11.0 performance changes:
+    01. Prepare server candidates during loading and saving.
+    02. Share in-flight lookups and cache candidates briefly.
+    03. Overlap tracker requests and delayed standard fallback.
+    04. Recheck exclusions before choosing a cached destination.
+    05. Overlap server lookup with the configured departure delay.
+    06. Migrate the old one-second hop default to 0.25 seconds.
+    07. Resume recent public-list pagination; recover expired cursors.
+    08. Bound server lookup duration and page count.
+    09. Back off on transport failures and honor numeric Retry-After.
+    10. Handle full servers quickly and throttle flooded teleports.
+    11. Sample latency without blocking world readiness.
+    12. Budget initial tree indexing by elapsed CPU time.
+    13. Reuse standing-tree enumeration for at most 0.15 seconds.
+    14. Do not restart scan stability just because wood is growing.
+    15. Update scan cards only when their displayed data changes.
+    16. Validate and reuse remote, plot, sawmill and axe-stat caches.
+    17. Skip equipping an axe already held by the character.
+    18. Shorten post-save settling while retaining confirmation checks.
+    19. Coalesce routine bot-state writes; flush critical transitions.
+    20. Add performance controls and per-stage timing diagnostics.
+    These changes have not been benchmarked in a live Roblox server.
 ]]
 local S = {}
 for _, name in ipairs({"Players", "Workspace", "ReplicatedStorage", "HttpService", "TweenService",
@@ -55,14 +82,16 @@ local MIN_TREE_VOLUME = 40
 local STALL_TIMEOUT = 180
 local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeconds = 400,
     GrowthMinWait = 400, GrowthMaxWait = 16200, GrowthNotifySeconds = 600,
-    AutoRejoin = true, NoRender = false, ModwoodHighlights = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 1, ScanWait = 12,
+    PerformanceMode = true, PrefetchServers = true, CandidateCacheSeconds = 30,
+    ServerSearchBudget = 25, PublicPageLimit = 6,
+    AutoRejoin = true, NoRender = false, ModwoodHighlights = true, RejoinDelay = 5, Slot = 1, BotEnabled = true, BotURL = "", BotKey = "", FastHarvest = true, ScriptURL = "", HopDelay = 0.25, ScanWait = 12,
     VisitCooldownHours = 6, HarvestCooldownHours = 24, AdaptiveTiming = true,
     ScanInterval = 0.1, ScanSettle = 0.25, EmptyScanDelay = 1, GameSettle = 0.75,
     TrackerEnabled = true, TrackerURL = "", TrackerToken = "", TrackerTimeout = 4,
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
-    ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
+    ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.10.9", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.12.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -134,7 +163,7 @@ local function configFrom(source)
     for key in pairs(result) do if type(source[key]) == type(result[key]) then result[key] = source[key] end end
     if result.TargetSpecies~="Spooky" and result.TargetSpecies~="SpookyNeon" and result.TargetSpecies~="Both" then result.TargetSpecies="Both" end
     result.Slot = math.floor(math.clamp(finite(result.Slot) and result.Slot or 1, 1, 6))
-    for key, limits in pairs({GrowthStableSeconds={120,7200}, GrowthMinWait={120,14400}, GrowthMaxWait={1800,43200}, GrowthNotifySeconds={120,3600}, RejoinDelay={3,60}, VisitCooldownHours={0.1,168}, HarvestCooldownHours={0.1,336}, LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {1, 180}, ScanWait = {2, 120},
+    for key, limits in pairs({CandidateCacheSeconds={5,90}, ServerSearchBudget={8,90}, PublicPageLimit={1,10}, GrowthStableSeconds={120,7200}, GrowthMinWait={120,14400}, GrowthMaxWait={1800,43200}, GrowthNotifySeconds={120,3600}, RejoinDelay={3,60}, VisitCooldownHours={0.1,168}, HarvestCooldownHours={0.1,336}, LoadTimeout = {30, 300}, MetadataTimeout = {5, 90}, HopDelay = {0, 180}, ScanWait = {2, 120},
         ScanInterval = {0.05, 1}, ScanSettle = {0.1, 5}, EmptyScanDelay = {0.5, 15}, GameSettle = {0.5, 5},
         TrackerTimeout = {2, 10}, TrackerFreshness = {5, 60}, TrackerMinAge = {0, 10080}, TrackerBackoff = {30, 900},
         ServerSearchTimeout = {3, 30}, ServerRetryDelay = {1, 60}, ChopTimeout = {15, 180},
@@ -142,6 +171,7 @@ local function configFrom(source)
         result[key] = math.clamp(finite(result[key]) and result[key] or DEFAULT[key], limits[1], limits[2])
     end
     result.GrowthMaxWait=math.max(result.GrowthMaxWait,result.GrowthStableSeconds+300,result.GrowthMinWait+300)
+    result.PublicPageLimit=math.floor(result.PublicPageLimit)
     result.ScanWait=math.max(result.ScanWait,math.max(result.ScanSettle,result.EmptyScanDelay)+result.ScanInterval)
     result.BotURL = cleanURL(result.BotURL):gsub("/+$", ""):lower():sub(1,200)
     result.BotKey = cleanURL(result.BotKey):sub(1,128)
@@ -240,6 +270,23 @@ function H:SampleLatency(token)
     token:Check()
     if ok then self:ObserveLatency(os.clock()-started) end
 end
+function H:StartLatencySample(token)
+    if self.NetworkSampled or self.LatencyWorker then return end
+    if not self.Config.PerformanceMode then self:SampleLatency(token) return end
+    local scope=self:Token(token)
+    local worker
+    token:Finally(function()
+        if worker and coroutine.status(worker)~="dead" then pcall(task.cancel,worker) end
+        scope:Clean()
+        self.LatencyWorker=nil
+    end)
+    worker=task.spawn(function()
+        pcall(self.SampleLatency,self,scope)
+        scope:Clean()
+        self.LatencyWorker=nil
+    end)
+    self.LatencyWorker=worker
+end
 function H:RecordFailure(stage,reason)
     reason=tostring(reason)
     local lower=reason:lower()
@@ -301,6 +348,16 @@ if restored then
     end
     -- Apply the requested one-second hop once, then retain future user edits.
     if restored.TimingRevision~=1 then H.Config.HopDelay=1 end
+    if restored.PerformanceRevision~=1 then
+        if H.Config.HopDelay==1 then H.Config.HopDelay=0.25 end
+        if H.Config.ServerRetryDelay==5 then H.Config.ServerRetryDelay=2 end
+        if H.Config.ServerSearchTimeout==12 then H.Config.ServerSearchTimeout=8 end
+    end
+    if type(restored.PublicCursor)=="string" and #restored.PublicCursor<=2048
+        and finite(restored.PublicCursorUntil) and restored.PublicCursorUntil>os.time()
+        and restored.PublicCursorUntil<=os.time()+180 then
+        H.PublicCursor=restored.PublicCursor H.PublicCursorUntil=restored.PublicCursorUntil
+    end
     if type(restored.WindowPosition) == "table" and finite(restored.WindowPosition.X) and finite(restored.WindowPosition.Y) then
         H.WindowPosition = {X=math.clamp(restored.WindowPosition.X,0,1),Y=math.clamp(restored.WindowPosition.Y,0,1)}
     end
@@ -401,7 +458,7 @@ end
 local travelStages={
     ["Next server"]=true,["Finding another server"]=true,
     ["Waiting for available servers"]=true,["Joining another server"]=true,
-    ["Changing server"]=true,["Reconnecting"]=true,
+    ["Changing server"]=true,["Waiting for teleport"]=true,
 }
 function H:RenderProgress(detail)
     if not self.UI then return end
@@ -473,7 +530,13 @@ function H:UpdateHarvestProgress(fraction,detail)
 end
 function H:SetStage(text, progress, detail)
     local changed=self.Stage~=text
-    if changed then self.StageStarted=os.clock() end
+    if changed then
+        if self.Stage and self.StageStarted then
+            self.StageTimes=self.StageTimes or {}
+            self.StageTimes[self.Stage]=(self.StageTimes[self.Stage] or 0)+os.clock()-self.StageStarted
+        end
+        self.StageStarted=os.clock()
+    end
     self.Stage=text
     if progress and not self.HarvestProgress and not travelStages[text] then
         self.Progress=math.max(self.Progress,math.clamp(progress,0,0.99))
@@ -562,7 +625,9 @@ function H:Persist(resume, target)
     for id, untilTime in pairs(self.FailedServers) do
         if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
     end
-    local data = { Schema = 2, Version = self.Version, TimingRevision = 1, GrowthTimingRevision = 1, WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
+    local data = { Schema = 2, Version = self.Version, TimingRevision = 1, GrowthTimingRevision = 1, PerformanceRevision = 1,
+        PublicCursor=self.PublicCursor,PublicCursorUntil=self.PublicCursorUntil,
+        WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
         VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, BotQueue=self.BotQueue or {}, BotDesired=self.BotDesired, BotCommandVersion=self.BotCommandVersion or 0, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
         Collection=self.Collection, PlaceId=game.PlaceId, Recovery=self.Rejoining==true and target=="*",
         StartedAt = self.StartedAt, Resume = resume == true, Target = target, TicketTime = os.time(),
@@ -703,22 +768,32 @@ function H:EnsureTreeIndex(token)
         local function add(object)
             if object.Name=="TreeClass" and object:IsA("StringValue") and object.Parent and object.Parent:IsA("Model") then
                 self.TreeIndex[object.Parent]=object
+                self.StandingCache=nil
             end
         end
         self:Connect(S.Workspace.DescendantAdded,add)
         self:Connect(S.Workspace.DescendantRemoving,function(object)
-            if object.Name=="TreeClass" and object.Parent and self.TreeIndex[object.Parent]==object then self.TreeIndex[object.Parent]=nil end
+            if object.Name=="TreeClass" and object.Parent and self.TreeIndex[object.Parent]==object then
+                self.TreeIndex[object.Parent]=nil self.StandingCache=nil
+            end
         end)
         self.TreeIndexAdd=add
     end
+    local budgetStart=os.clock()
     for index,object in ipairs(S.Workspace:GetDescendants()) do
         self.TreeIndexAdd(object)
-        if index%512==0 then token:Sleep(0.001) end
+        if index%128==0 and os.clock()-budgetStart>=0.004 then
+            token:Sleep(0.001) budgetStart=os.clock()
+        end
     end
     self.TreeIndexReady=true
 end
 function H:StandingTrees(token)
     self:EnsureTreeIndex(token)
+    local cached=self.StandingCache
+    if self.Config.PerformanceMode and cached and os.clock()-cached.At<0.15 then
+        return cached.Models,cached.Regions
+    end
     local models,regions,seen={},{},{}
     for model,field in pairs(self.TreeIndex) do
         if not under(model,S.Workspace) or field.Parent~=model then
@@ -737,6 +812,7 @@ function H:StandingTrees(token)
     end
     local count=0
     for _ in pairs(regions) do count=count+1 end
+    self.StandingCache={Models=models,Regions=count,At=os.clock()}
     return models,count
 end
 
@@ -773,7 +849,7 @@ function H:WaitForGame(token)
         local changed=not lastSignature or #signature~=#lastSignature
         if not changed then for i,object in ipairs(signature) do if lastSignature[i]~=object then changed=true break end end end
         if #missing==0 then
-            self:SampleLatency(token)
+            self:StartLatencySample(token)
             if changed or not stableSince then stableSince=os.clock() end
             if os.clock()-stableSince>=self:AdaptiveWait(self.Config.GameSettle,5) then
                 self.LoadDiagnostic=string.format("Game ready - required objects stable for %.2f seconds",self.Config.GameSettle)
@@ -789,9 +865,15 @@ function H:WaitForGame(token)
     until false
 end
 function H:Remote(folder, name, class)
+    self.RemoteCache=self.RemoteCache or {}
+    local key=folder.."/"..name.."/"..(class or "RemoteEvent")
+    local cached=self.RemoteCache[key]
+    if self.Config.PerformanceMode and cached and cached.Parent and cached:IsA(class or "RemoteEvent")
+        and cached.Parent==S.ReplicatedStorage:FindFirstChild(folder) then return cached end
     local parent = S.ReplicatedStorage:FindFirstChild(folder)
     local remote = parent and parent:FindFirstChild(name)
     assert(remote and remote:IsA(class or "RemoteEvent"), "Missing game remote: " .. folder .. "." .. name)
+    self.RemoteCache[key]=remote
     return remote
 end
 function H:Character()
@@ -819,6 +901,9 @@ function H:PlotTiles(plot)
     return tiles
 end
 function H:Plot()
+    local cached=self.PlotCache
+    if self.Config.PerformanceMode and cached and os.clock()-cached.At<0.25
+        and under(cached.Plot,S.Workspace) and owned(cached.Plot) then return cached.Plot end
     local candidates, seen = {}, {}
     local function visit(node)
         if seen[node] then return end
@@ -845,6 +930,7 @@ function H:Plot()
         if not best or score > bestScore then best, bestScore = plot, score end
     end
     self.LoadedPlot = best
+    self.PlotCache=best and {Plot=best,At=os.clock()} or nil
     return best
 end
 function H:PlotCenter(plot)
@@ -1114,13 +1200,21 @@ function H:LoadSlot(token)
     self:SetStage("Slot loaded", 0.18, "Owned plot confirmed")
     local character, _, root = self:Character()
     token.Character = character
-    local origin = root.CFrame
-    token:Finally(function()
-        if self.Alive and Player.Character == character and root.Parent then pcall(self.Teleport, self, origin) end
-    end)
     return loadedPlot
 end
 function H:FindMill(token, plot)
+    local cached=self.MillCache
+    if self.Config.PerformanceMode and cached and cached.Plot==plot
+        and under(cached.Model,S.Workspace) and owned(cached.Model)
+        and (cached.Model.Name=="Sawmill4L" or value(cached.Model,"ItemName")=="Sawmill4L")
+        and livePart(cached.Inlet) and under(cached.Inlet,cached.Model) then
+        local settings=cached.Model:FindFirstChild("Settings")
+        local x,z=value(settings,"DimX"),value(settings,"DimZ")
+        if finite(x) and finite(z) and x>0 and z>0 then
+            self.SelectedMill=cached.Model
+            return cached.Model,cached.Inlet
+        end
+    end
     local deadline=os.clock()+math.min(90,self.Config.LoadTimeout)
     self:SetStage("Selecting your sawmill",0.46,"Looking for an owned Sawmill4L")
     repeat
@@ -1141,6 +1235,7 @@ function H:FindMill(token, plot)
         end
         if selected then
             self.SelectedMill=selected
+            self.MillCache={Model=selected,Inlet=selectedInlet,Plot=plot}
             self:Log("Sawmill selected automatically - "..selected:GetFullName(),"INFO","Sawmill selected")
             return selected,selectedInlet
         end
@@ -1153,7 +1248,15 @@ function H:AxeStats(tool, kind, inverse)
     local name = value(tool, "ToolName")
     local module = definitions and name and definitions:FindFirstChild("AxeClass_" .. tostring(name))
     if not module or not module:IsA("ModuleScript") then return end
-    local ok, stats = pcall(function() return require(module).new() end)
+    self.AxeStatsCache=self.AxeStatsCache or setmetatable({},{__mode="k"})
+    local cached=self.AxeStatsCache[module]
+    local ok,stats
+    if self.Config.PerformanceMode and cached and os.clock()-cached.At<10 then
+        ok,stats=true,cached.Stats
+    else
+        ok,stats=pcall(function() return require(module).new() end)
+        if ok and type(stats)=="table" then self.AxeStatsCache[module]={Stats=stats,At=os.clock()} end
+    end
     if not ok or type(stats) ~= "table" then return end
     stats = table.clone(stats)
     local special = stats.SpecialTrees and stats.SpecialTrees[kind]
@@ -1187,7 +1290,7 @@ function H:EnsureAxe(kind, token)
     assert(tool, "No compatible axe in your Backpack or character - equip an axe and retry")
     local _, humanoid = self:Character()
     self:SetStage("Equipping inventory axe", 0.23, tostring(value(tool, "ToolName") or tool.Name))
-    humanoid:EquipTool(tool)
+    if tool.Parent~=Player.Character then humanoid:EquipTool(tool) end
     local deadline = os.clock() + 3
     while tool.Parent ~= Player.Character do
         assert(os.clock() < deadline, "Inventory axe could not be equipped")
@@ -1231,7 +1334,9 @@ function H:Scan(token)
         return a.Volume>b.Volume
     end)
     self.Counts = counts
-    if self.UI then
+    local signature=string.format("%d:%.2f:%d:%.2f",counts.Spooky,counts.SpookyVolume,counts.SpookyNeon,counts.SpookyNeonVolume)
+    if self.UI and signature~=self.LastScanCardSignature then
+        self.LastScanCardSignature=signature
         self.UI.Spooky:Set(counts.Spooky,string.format("%.0f studs3",counts.SpookyVolume))
         self.UI.Neon:Set(counts.SpookyNeon,string.format("%.0f studs3",counts.SpookyNeonVolume))
     end
@@ -1239,14 +1344,18 @@ function H:Scan(token)
 end
 function H:ScanReady(token)
     local started, stableSince = os.clock(), os.clock()
-    local previous, previousRegions, previousCount, previousVolume
+    local previous, previousRegions, previousCount, previousMatches
     self:SetStage("Scanning trees", 0.04)
     repeat
         token:Check()
         if game:IsLoaded() then
             local matches, regions, snapshot, ready = self:Scan(token)
-            local volume = self.Counts.SpookyVolume + self.Counts.SpookyNeonVolume
-            local changed = not previous or regions ~= previousRegions or #matches ~= previousCount or volume ~= previousVolume
+            local matched={}
+            for _,entry in ipairs(matches) do matched[entry.Model]=true end
+            local changed = not previous or regions ~= previousRegions or #matches ~= previousCount
+            if not changed then
+                for model in pairs(matched) do if not previousMatches[model] then changed=true break end end
+            end
             if not changed then
                 for model, kind in pairs(snapshot) do if previous[model] ~= kind then changed = true break end end
                 if not changed then
@@ -1254,7 +1363,7 @@ function H:ScanReady(token)
                 end
             end
             if changed then stableSince = os.clock() end
-            previous, previousRegions, previousCount, previousVolume = snapshot, regions, #matches, volume
+            previous, previousRegions, previousCount, previousMatches = snapshot, regions, #matches, matched
             -- Positive results settle briefly; an empty result needs a longer
             -- quiet window. ScanWait is a deadline, never an unconditional sleep.
             if regions > 0 and ready > 0 and os.clock() - stableSince >= self:AdaptiveWait(#matches > 0 and self.Config.ScanSettle or self.Config.EmptyScanDelay,5) then
@@ -1338,6 +1447,95 @@ function H:SyncPhysics(token,rounds,diagnostic,refresh)
     if refresh then refresh() end
     return diagnostic.SyncReplies
 end
+-- Detect availability without installing hooks or altering game callbacks.
+function H:DetectCapabilities()
+    local available={}
+    local globals={isnetworkowner=isnetworkowner,firetouchinterest=firetouchinterest,
+        hooksignal=hooksignal,restoresignal=restoresignal,setstackhidden=setstackhidden,
+        trampoline_call=trampoline_call,setscriptable=setscriptable,gethiddenproperty=gethiddenproperty,
+        sethiddenproperty=sethiddenproperty,getproperties=getproperties,gethiddenproperties=gethiddenproperties,
+        getpcdprop=getpcdprop,getcallbackmember=getcallbackmember,geteventmember=geteventmember,
+        getrendersteppedlist=getrendersteppedlist}
+    for _,name in ipairs({"isnetworkowner","firetouchinterest","hooksignal","restoresignal",
+        "setstackhidden","trampoline_call","setscriptable","gethiddenproperty","sethiddenproperty",
+        "getproperties","gethiddenproperties","getpcdprop","getcallbackmember","geteventmember","getrendersteppedlist"}) do
+        available[name]=cap(name,globals[name])~=nil or (type(synAPI)=="table" and type(synAPI[name])=="function")
+    end
+    local drawing=Env.Drawing or Drawing
+    local got,new=pcall(function() return drawing and drawing.new end)
+    available["Drawing.new"]=got and type(new)=="function"
+    self.DrawingFactory=available["Drawing.new"] and new or nil
+    local othAPI=Env.oth or oth or (type(synAPI)=="table" and synAPI.oth)
+    for _,name in ipairs({"hook","is_hooked","get_hook","replace_hook","get_root_callback","get_original_thread","is_hook_thread"}) do
+        local ok,fn=pcall(function() return othAPI and othAPI[name] end)
+        available["oth."..name]=ok and type(fn)=="function"
+    end
+    self.Capabilities=available
+    return available
+end
+
+-- Retrying a single idempotent step preserves the current tree and position.
+-- Modwood is deliberately excluded: its destructive sequence runs once only.
+function H:LocalStep(work,label,token,callback)
+    work.LocalAttempts=work.LocalAttempts or {}
+    local lastError
+    for attempt=1,2 do
+        token:Check()
+        work.Step=label
+        work.LocalAttempts[label]=(work.LocalAttempts[label] or 0)+1
+        local scope=self:Token(token)
+        local result=table.pack(pcall(callback,scope))
+        scope:Clean()
+        if result[1] then
+            work.LastCompletedStep=label
+            return table.unpack(result,2,result.n)
+        end
+        lastError=result[2]
+        if lastError==CANCEL then error(CANCEL,0) end
+        token:Check()
+        if self.ServerExitReason or attempt==2 then break end
+        local _,humanoid=self:Character()
+        humanoid.Sit=false
+        self.RemoteCache={} self.MillCache=nil self.PlotCache=nil
+        self:Log("Retrying "..label.." at the current task - "..cleanError(lastError),"WARNING")
+        self:SetStage("Retrying "..label,self.Progress)
+        token:Sleep(0.35)
+    end
+    error(lastError,0)
+end
+
+function H:PositionForChop(model,trunk,token,side)
+    token:Check()
+    assert(livePart(trunk) and under(trunk,model),"The trunk changed before repositioning")
+    local character,humanoid,root=self:Character()
+    local point=trunk.CFrame:PointToWorldSpace(Vector3.new(0,-trunk.Size.Y/2+0.3,0))
+    local directions={Vector3.new(1,0,0),Vector3.new(0,0,1),Vector3.new(-1,0,0),Vector3.new(0,0,-1)}
+    local parameters=RaycastParams.new()
+    parameters.FilterType=Enum.RaycastFilterType.Exclude
+    local ignore={model}
+    for _,other in ipairs(S.Players:GetPlayers()) do if other.Character then ignore[#ignore+1]=other.Character end end
+    parameters.FilterDescendantsInstances=ignore
+    parameters.RespectCanCollide=true
+    local start=side or 1
+    for offset=0,3 do
+        local direction=directions[(start+offset-1)%4+1]
+        local radius=math.clamp(math.max(trunk.Size.X,trunk.Size.Z)/2+2.2,3.5,5.5)
+        local near=point+direction*radius
+        local ground=S.Workspace:Raycast(near+Vector3.new(0,10,0),Vector3.new(0,-28,0),parameters)
+        if ground and ground.Normal.Y>0.45 then
+            local position=ground.Position+Vector3.new(0,humanoid.HipHeight+root.Size.Y/2+0.1,0)
+            local obstructed=S.Workspace:Raycast(position,point-position,parameters)
+            if not obstructed and (position-point).Magnitude<=9 then
+                humanoid.Sit=false
+                self:Teleport(CFrame.lookAt(position,Vector3.new(point.X,position.Y,point.Z)))
+                token:Sleep(self.Config.FastHarvest and 0.08 or 0.2)
+                return true
+            end
+        end
+    end
+    return false
+end
+
 function H:AttemptChop(model,tool,stats,token,section,height)
     token:Check()
     assert(model and under(model,S.Workspace),"The cut target is no longer in the world")
@@ -1354,7 +1552,11 @@ function H:AttemptChop(model,tool,stats,token,section,height)
     assert(tool and tool.Parent==Player.Character,"The selected axe is not equipped")
     local _,_,avatar=self:Character()
     local inverse=value(tool,"ToolName")=="InverseAxe" and stats.Damage<=0
-    local point=inverse and section.CFrame:PointToWorldSpace(Vector3.new(0,-section.Size.Y/2+height,0)) or section.Position
+    local standing=self:IsStandingTree(model)
+    local point=(inverse or standing) and section.CFrame:PointToWorldSpace(Vector3.new(0,-section.Size.Y/2+height,0)) or section.Position
+    if standing and (avatar.Position-point).Magnitude>7 then
+        self:PositionForChop(model,section,token,1)
+    end
     local stand=point+(inverse and Vector3.new(4,2,0) or Vector3.new(0,0,5))
     if inverse then
         local parameters=RaycastParams.new()
@@ -1720,6 +1922,12 @@ function H:Chop(entry, tool, stats, token, checkpoint)
         if checkpoint then checkpoint.Cut=cut end
     end
     self.LastCut=cut
+    cut.LastEvidenceAt=os.clock()
+    cut.LastPositionAt=os.clock()
+    cut.Repositions=cut.Repositions or 0
+    local _,initialOwnerField=self:TreeOwner(tree)
+    cut.LastInteraction=initialOwnerField and value(initialOwnerField,"LastInteraction")
+    cut.LastOwner=self:TreeOwner(tree)
     local deadline=os.clock()+self.Config.ChopTimeout
     local nextStrike, nextPosition, nextStatus=0,0,os.clock()+5
     local detachedAt
@@ -1736,7 +1944,12 @@ function H:Chop(entry, tool, stats, token, checkpoint)
         local rootCut=tree:FindFirstChild("RootCut")~=nil
         local detached=rootCut or not tree.Parent or not trunk.Parent
         if detached and not detachedAt then detachedAt=os.clock() end
-        local owner=self:TreeOwner(tree)
+        local owner,ownerField=self:TreeOwner(tree)
+        local interaction=ownerField and value(ownerField,"LastInteraction")
+        if owner~=cut.LastOwner or (interaction~=nil and interaction~=cut.LastInteraction) then
+            cut.LastEvidenceAt=os.clock()
+            cut.LastOwner=owner cut.LastInteraction=interaction
+        end
         assert(owner==nil or owner==Player,"Another player now owns the selected tree")
         if not detached and (owner==nil or owner==Player) then
             local event=tree:FindFirstChild("CutEvent")
@@ -1749,13 +1962,28 @@ function H:Chop(entry, tool, stats, token, checkpoint)
                 token:Sleep(0.25)
                 assert(tool.Parent==Player.Character,"The selected axe could not be re-equipped")
             end
-            -- The source approaches the section center. The payload height is
-            -- measured from the bottom independently of the avatar's position.
+            -- Re-approach the same base cut when replication shows no activity.
+            -- Ownership/LastInteraction are observations, not damage receipts.
             if os.clock()>=nextPosition then
-                local stand=trunk.Position+Vector3.new(5,0,0)
                 local _,_,avatar=self:Character()
-                local moved=(avatar.Position-trunk.Position).Magnitude>10
-                if moved then self:Teleport(CFrame.lookAt(stand,trunk.Position)) end
+                local base=trunk.CFrame:PointToWorldSpace(Vector3.new(0,-trunk.Size.Y/2+0.3,0))
+                local quiet=cut.Strikes>=3 and (os.clock()-cut.LastEvidenceAt>=math.max(3,stats.SwingCooldown*4)
+                    or os.clock()-cut.LastPositionAt>=math.max(8,stats.SwingCooldown*10))
+                local needPosition=not cut.Synchronized or (avatar.Position-base).Magnitude>7 or quiet
+                local moved=false
+                if needPosition then
+                    moved=self:PositionForChop(tree,trunk,token,cut.Repositions%4+1)
+                    if moved then
+                        cut.Repositions=cut.Repositions+1
+                        cut.LastEvidenceAt=os.clock()
+                        cut.LastPositionAt=os.clock()
+                        if quiet then
+                            self:Log("Cut reposition - felling remains unconfirmed; retrying the same trunk","DEBUG")
+                            local _,humanoid=self:Character()
+                            humanoid:EquipTool(tool)
+                        end
+                    end
+                end
                 if not cut.Synchronized or moved then
                     if self.Config.FastHarvest then
                         -- Send the first targeted strike after one scheduler frame,
@@ -1791,9 +2019,9 @@ function H:Chop(entry, tool, stats, token, checkpoint)
             owner==Player and "LocalPlayer" or "Unowned",cut.Candidates or 0)
         local _,_,avatar=self:Character()
         local distance=trunk.Parent and (avatar.Position-trunk.Position).Magnitude or -1
-        self.CutDiagnostic=string.format("Cut diagnostic - %s\n%s\naxe=%s; damage=%.3f; cooldown=%.3f; centerDistance=%.2f; equipped=%s",
+        self.CutDiagnostic=string.format("Cut diagnostic - %s\n%s\naxe=%s; damage=%.3f; cooldown=%.3f; centerDistance=%.2f; equipped=%s; repositions=%d; interaction=%s",
             cut.Kind,cut.Status,tostring(value(tool,"ToolName") or tool.Name),stats.Damage,stats.SwingCooldown,
-            distance,tostring(tool.Parent==Player.Character))
+            distance,tostring(tool.Parent==Player.Character),cut.Repositions,tostring(cut.LastInteraction))
         if os.clock()>=nextStatus then self:Log("Cut progress - "..cut.Status,"DEBUG") nextStatus=os.clock()+10 end
         -- Poll independently from the axe cooldown so delayed ownership fields
         -- and model reparenting are observed before another strike is sent.
@@ -2094,6 +2322,27 @@ function H:BuildReport()
         self.Stats.StandardFinds,self.Stats.StandardScans,tostring(self.Config.AdaptiveTiming),
         self.ServerRTT and string.format("%.3fs",self.ServerRTT) or "Not measured"))
     table.insert(lines,"Targets: "..self.Config.TargetSpecies.."; growth: "..tostring(self.Config.GrowSinister).."; auto rejoin: "..tostring(self.Config.AutoRejoin))
+    local capabilities=self:DetectCapabilities()
+    local names={}
+    for name in pairs(capabilities) do names[#names+1]=name end
+    table.sort(names)
+    local capabilityLines={"Executor APIs (presence only, not proof of functionality):"}
+    for _,name in ipairs(names) do capabilityLines[#capabilityLines+1]=name..": "..(capabilities[name] and "Available" or "Missing") end
+    capabilityLines[#capabilityLines+1]="Markers: "..tostring(self.MarkerBackend or "Not initialized")
+    capabilityLines[#capabilityLines+1]="Touch argument mode: "..tostring(self.TouchArgumentMode or "Not selected")
+    capabilityLines[#capabilityLines+1]="Hooks, stack masking and hidden-property writes: not installed"
+    table.insert(lines,table.concat(capabilityLines,"\n"))
+    table.insert(lines,string.format("Performance mode: %s; server prefetch: %s\nLast server lookup: %s; candidate cache hits: %d\nSearch budget: %.0fs; maximum pages: %d",
+        tostring(self.Config.PerformanceMode),tostring(self.Config.PrefetchServers),
+        self.LastServerSearchSeconds and string.format("%.2fs",self.LastServerSearchSeconds) or "Not measured",
+        self.ServerCacheHits or 0,self.Config.ServerSearchBudget,self.Config.PublicPageLimit))
+    if self.ServerSearchDiagnostic then table.insert(lines,"Last server lookup note: "..self.ServerSearchDiagnostic) end
+    local timings={}
+    for stage,seconds in pairs(self.StageTimes or {}) do timings[#timings+1]={Stage=stage,Seconds=seconds} end
+    table.sort(timings,function(a,b) return a.Seconds>b.Seconds end)
+    for index=1,math.min(5,#timings) do
+        table.insert(lines,string.format("Time in %s: %.2fs",timings[index].Stage,timings[index].Seconds))
+    end
     if self.Growth then
         table.insert(lines,string.format("Sinister growth: %s; volume: %.3f; gain: %.3f; elapsed: %.0fs; stable: %.0fs; owner: %s",
             self.Growth.Status,self.Growth.Volume,self.Growth.Gain,self.Growth.Elapsed,self.Growth.StableFor,self.Growth.Ownership))
@@ -2121,6 +2370,7 @@ function H:BuildReport()
     end
     for index,work in ipairs(self.PendingWood) do
         table.insert(lines,"Task "..index.." - "..tostring(work.Kind).." - "..tostring(work.Reason or "In progress"))
+        table.insert(lines,"Current step: "..tostring(work.Step or "Unknown").."; last completed: "..tostring(work.LastCompletedStep or "None"))
         if work.ModwoodAttempted then table.insert(lines,"Modwood attempts: 1 / 1") end
         if work.Modwood then table.insert(lines,"Modwood phase: "..work.Modwood.Phase) end
         if work.Classic then
@@ -2164,20 +2414,16 @@ function H:AcquireWood(model,part,token,diagnostic,finished)
         if os.clock()-lastDrag>=0.15 then
             drag:FireServer(model) lastDrag=os.clock() diagnostic.LastDrag=lastDrag
         end
-        if networkOwner and not confirmed then
-            for _,candidate in ipairs(model:GetDescendants()) do
-                if candidate:IsA("BasePart") and not candidate.Anchored then
-                    local ok,result=pcall(networkOwner,candidate)
-                    if not ok then networkOwner=nil break end
-                    if result==true then confirmed=true break end
-                end
-            end
+        if networkOwner then
+            local ok,result=pcall(networkOwner,part)
+            if not ok then networkOwner=nil confirmed=false
+            else confirmed=result==true end
         end
         diagnostic.NetworkStatus=confirmed and "Executor confirmed" or "Unconfirmed - synchronizing"
     end
     refresh()
     if complete then return false end
-    self:SyncPhysics(token,4,diagnostic,refresh)
+    self:SyncPhysics(token,confirmed and 1 or 4,diagnostic,refresh)
     if complete then return false end
     diagnostic.NetworkStatus=confirmed and "Executor confirmed" or "Ancestor synchronization - result pending"
     return true
@@ -2370,29 +2616,119 @@ function H:ClearOfLava(position,radius)
 end
 function H:MarkModwood(root,leaf,parent,token)
     if not self.Config.ModwoodHighlights then return end
-    local effects={}
-    token:Finally(function()
-        for _,effect in ipairs(effects) do pcall(effect.Destroy,effect) end
-    end)
-    local ok=pcall(function()
-        for _,entry in ipairs({{leaf,"MidnightSawmillSection",Color3.fromRGB(74,124,255)},
-            {parent,"MidnightBurnSection",Color3.fromRGB(75,220,145)},
-            {root,"MidnightTrunkSection",Color3.fromRGB(245,185,70)}}) do
-            local highlight=Instance.new("Highlight")
-            table.insert(effects,highlight)
-            highlight.Name=entry[2]
-            highlight.Adornee=entry[1]
-            highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
-            highlight.FillColor=entry[3] highlight.OutlineColor=entry[3]
-            highlight.FillTransparency=0.75 highlight.OutlineTransparency=0.1
-            highlight.Parent=entry[1]
+    self:DetectCapabilities()
+    local factory=self.DrawingFactory
+    local effects,groups={},{}
+    local connection
+    local closed=false
+    local entries={{leaf,Color3.fromRGB(74,124,255)},
+        {parent,Color3.fromRGB(75,220,145)},{root,Color3.fromRGB(245,185,70)}}
+    local function clearDrawings()
+        for _,line in ipairs(effects) do
+            local ok=pcall(function() line:Remove() end)
+            if not ok then pcall(function() line:Destroy() end) end
+        end
+        table.clear(effects)
+    end
+    local fallback={}
+    local function nativeFallback()
+        if closed or #fallback>0 then return end
+        for _,entry in ipairs(entries) do
+            if livePart(entry[1]) then
+                local box=Instance.new("SelectionBox")
+                box.Name="MidnightModwoodWireframe"
+                box.Adornee=entry[1]
+                box.Color3=entry[2]
+                box.SurfaceTransparency=1
+                box.LineThickness=0.035
+                box.Parent=entry[1]
+                fallback[#fallback+1]=box
+            end
+        end
+        self.MarkerBackend="Native wireframe"
+    end
+    local function cleanup()
+        if closed then return end
+        closed=true
+        if connection then connection:Disconnect() connection=nil end
+        clearDrawings()
+        for _,box in ipairs(fallback) do box:Destroy() end
+        table.clear(fallback)
+    end
+    token:Finally(cleanup)
+    if not factory then nativeFallback() return end
+    local created=pcall(function()
+        for _,entry in ipairs(entries) do
+            local group={Part=entry[1],Lines={}}
+            groups[#groups+1]=group
+            for _=1,12 do
+                local line=factory("Line")
+                effects[#effects+1]=line
+                group.Lines[#group.Lines+1]=line
+                line.Visible=false
+                line.Color=entry[2]
+                line.Thickness=1.6
+                line.Transparency=0.95
+                pcall(function() line.ZIndex=3 end)
+            end
         end
     end)
-    if not ok then
-        for _,effect in ipairs(effects) do pcall(effect.Destroy,effect) end
-        self:Log("Modwood highlights unavailable - continuing without markers","DEBUG")
+    if not created then clearDrawings() nativeFallback() return end
+    self.MarkerBackend="Drawing.new projected 3D wireframe"
+    local corners={Vector3.new(-1,-1,-1),Vector3.new(1,-1,-1),Vector3.new(1,1,-1),Vector3.new(-1,1,-1),
+        Vector3.new(-1,-1,1),Vector3.new(1,-1,1),Vector3.new(1,1,1),Vector3.new(-1,1,1)}
+    local edges={{1,2},{2,3},{3,4},{4,1},{5,6},{6,7},{7,8},{8,5},{1,5},{2,6},{3,7},{4,8}}
+    local function render()
+        local camera=S.Workspace.CurrentCamera
+        for _,group in ipairs(groups) do
+            local part=group.Part
+            local show=camera and livePart(part) and not self.Config.NoRender
+                and self.Config.ModwoodHighlights and self.Running
+            local points={}
+            if show then
+                for index,corner in ipairs(corners) do
+                    points[index]=part.CFrame:PointToWorldSpace(corner*(part.Size*0.5+Vector3.new(0.025,0.025,0.025)))
+                end
+            end
+            for index,edge in ipairs(edges) do
+                local line=group.Lines[index]
+                line.Visible=false
+                if show then
+                    local a,b=points[edge[1]],points[edge[2]]
+                    local da=-camera.CFrame:PointToObjectSpace(a).Z
+                    local db=-camera.CFrame:PointToObjectSpace(b).Z
+                    if da>0.05 or db>0.05 then
+                        if da<=0.05 then a=a:Lerp(b,(0.05-da)/(db-da))
+                        elseif db<=0.05 then b=b:Lerp(a,(0.05-db)/(da-db)) end
+                        local pa=camera:WorldToViewportPoint(a)
+                        local pb=camera:WorldToViewportPoint(b)
+                        local limit=math.max(camera.ViewportSize.X,camera.ViewportSize.Y)*8
+                        if math.abs(pa.X)<limit and math.abs(pa.Y)<limit and math.abs(pb.X)<limit and math.abs(pb.Y)<limit then
+                            line.From=Vector2.new(pa.X,pa.Y)
+                            line.To=Vector2.new(pb.X,pb.Y)
+                            line.Visible=true
+                        end
+                    end
+                end
+            end
+        end
     end
+    local nextFrame=0
+    connection=S.RunService.RenderStepped:Connect(function()
+        if closed then return end
+        if not self.Alive or token.Generation~=self.Generation then cleanup() return end
+        if os.clock()<nextFrame then return end
+        nextFrame=os.clock()+1/30
+        local ok=pcall(render)
+        if not ok then
+            if connection then connection:Disconnect() connection=nil end
+            clearDrawings()
+            pcall(nativeFallback)
+            self:Log("Drawing overlay unavailable - using native wireframe","DEBUG")
+        end
+    end)
 end
+
 function H:HoldIgnitionWood(log,parent,token,state)
     local pivot=log:GetPivot()
     local parentContainer=parent.Parent
@@ -2462,6 +2798,23 @@ function H:Modwood(log, mill, inlet, token, checkpoint)
     local persisted,problem=self:Persist(false)
     if not persisted then self:Log(problem,"WARNING") end
     return result
+end
+-- Legacy clients accept 0/1; the supplied API also documents a boolean form.
+-- Prefer the known numeric form and switch only if the executor rejects it.
+function H:TouchWoodLava(touch,wood,lava,beginContact)
+    if not livePart(wood) or not livePart(lava) then
+        if not beginContact then return true end
+        return false,"Touch parts are unavailable"
+    end
+    local mode=self.TouchArgumentMode or "Numeric"
+    local argument
+    if mode=="Boolean" then argument=beginContact else argument=beginContact and 0 or 1 end
+    local ok,reason=pcall(touch,wood,lava,argument)
+    if not ok and mode=="Numeric" and beginContact then
+        ok,reason=pcall(touch,wood,lava,true)
+        if ok then self.TouchArgumentMode="Boolean" end
+    elseif ok then self.TouchArgumentMode=mode end
+    return ok,reason
 end
 function H:PerformModwood(log,mill,inlet,token,checkpoint)
     checkpoint=checkpoint or {}
@@ -2590,7 +2943,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local function endContact()
         if not contactActive then return true end
         contactActive=false
-        return pcall(touch,lava,parent,1)
+        return self:TouchWoodLava(touch,parent,lava,false)
     end
     token:Finally(endContact)
     while not state.IgnitionObserved do
@@ -2601,7 +2954,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         standBy(parent)
         drag:FireServer(log)
         contactActive=true
-        local pressed,pressError=pcall(touch,lava,parent,0)
+        local pressed,pressError=self:TouchWoodLava(touch,parent,lava,true)
         -- Let one short physics interval elapse, but release even if cancelled.
         local waited,waitError=pcall(function() token:Sleep(0.04) end)
         local released,releaseError=endContact()
@@ -2852,6 +3205,7 @@ function H:Deliver(planks, center, token, checkpoint)
     end
 end
 function H:SaveSlot(token)
+    self:StartServerPrefetch(token)
     self:SetStage("Saving slot " .. self.Config.Slot, 0.94, "Waiting for confirmation before leaving")
     local knownSlot = self:KnownSlot()
     local receipt = self.LoadReceipt
@@ -2872,13 +3226,32 @@ function H:SaveSlot(token)
     while value(Player,"CurrentlySavingOrLoading") == true do
         assert(os.clock() < deadline, "Save completion timed out") token:Sleep(0.3)
     end
-    token:Sleep(2)
+    token:Sleep(self.Config.PerformanceMode and self:AdaptiveWait(0.25,2) or 2)
+    -- Keep the explicit server acknowledgement and recheck a late busy update.
+    while value(Player,"CurrentlySavingOrLoading")==true do
+        assert(os.clock()<deadline,"Save completion timed out") token:Sleep(0.1)
+    end
     self.UnsavedDelivery=false
 end
 -- Only the per-account client key is stored here. The Discord token stays in Cloudflare.
 function H:PersistBotState()
-    local target=self.PendingTeleportTarget
-    return self:Persist(target~=nil,target)
+    if not self.Config.PerformanceMode then
+        local target=self.PendingTeleportTarget
+        return self:Persist(target~=nil,target)
+    end
+    -- Critical transitions still call Persist synchronously. Only routine bot
+    -- status updates share one short write window.
+    if not self.BotPersistWorker then
+        self.BotPersistWorker=task.delay(0.35,function()
+            self.BotPersistWorker=nil
+            if self.Alive then
+                local target=self.PendingTeleportTarget
+                local ok,reason=self:Persist(target~=nil,target)
+                if not ok then self:Log(reason,"WARNING") end
+            end
+        end)
+    end
+    return true
 end
 function H:BotSnapshot(event)
     local counts=self.Counts or {}
@@ -3009,46 +3382,90 @@ function H:NotifyBot(title,description,token,receipt)
     return true
 end
 
-function H:PublicServers(token)
-    assert(type(Request) == "function", "An HTTP request function is required for server search")
-    local cursor, servers, ids, cursors = nil, {}, {}, {}
-    for _ = 1, 10 do
-        local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
-        if cursor then url = url .. "&cursor=" .. S.HttpService:UrlEncode(cursor) end
-        local response, lastError
-        for attempt = 1, 3 do
-            local ok, result = pcall(function()
-                return token:Await(function()
-                    local sent, r = pcall(Request,{Url=url,Method="GET"})
-                    assert(sent and type(r)=="table","Server-list transport failed") return r
-                end,self.Config.ServerSearchTimeout)
-            end)
-            if not ok and result == CANCEL then error(CANCEL, 0) end
-            token:Check()
-            local code = ok and tonumber(result.StatusCode or result.Status)
-            if code == 200 then response = result break end
-            lastError = code and ("Server list HTTP "..code) or "Server-list connection failed"
-            if code and code ~= 429 and code < 500 then error(lastError,0) end
-            if attempt < 3 then token:Sleep(attempt*2) end
+function H:EligibleServers(candidates)
+    local result,seen={},{}
+    for _,id in ipairs(candidates or {}) do
+        if serverID(id) and not seen[id] and not self:IsServerExcluded(id)
+            and (not self.FailedServers[id] or self.FailedServers[id]<=os.time()) then
+            seen[id]=true result[#result+1]=id
         end
-        assert(response, lastError)
-        local data = S.HttpService:JSONDecode(response.Body)
-        assert(type(data)=="table" and type(data.data)=="table","Unexpected server-list response")
-        for _, server in ipairs(data.data) do
-            if type(server)=="table" and type(server.id)=="string" and server.id~="" and server.id~=game.JobId
-                and not ids[server.id] and finite(server.playing) and finite(server.maxPlayers)
-                and server.playing>=0 and server.playing<server.maxPlayers and not self:IsServerExcluded(server.id)
-                and (not self.FailedServers[server.id] or self.FailedServers[server.id]<=os.time()) then
-                ids[server.id]=true table.insert(servers,server.id)
+    end
+    return result
+end
+
+function H:PublicServers(token)
+    assert(type(Request)=="function","An HTTP request function is required for server search")
+    local deadline=os.clock()+self.Config.ServerSearchBudget
+    local cursor=self.PublicCursorUntil and self.PublicCursorUntil>os.time() and self.PublicCursor or nil
+    local servers,ids,cursors={},{},{}
+    local resetCursor=false
+    for _=1,self.Config.PublicPageLimit do
+        token:Check()
+        if os.clock()>=deadline then break end
+        local cooldown=(self.PublicRetryAt or 0)-os.clock()
+        if cooldown>0 then
+            if cooldown>=deadline-os.clock() then break end
+            token:Sleep(cooldown)
+        end
+        local base="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
+        local url=base..(cursor and "&cursor="..S.HttpService:UrlEncode(cursor) or "")
+        local response,lastError
+        for attempt=1,3 do
+            local remaining=deadline-os.clock()
+            if remaining<=0 then break end
+            local ok,result=pcall(function()
+                return token:Await(function()
+                    local sent,r=pcall(Request,{Url=url,Method="GET"})
+                    assert(sent and type(r)=="table","Server-list transport failed")
+                    return r
+                end,math.min(self.Config.ServerSearchTimeout,remaining))
+            end)
+            if not ok and result==CANCEL then error(CANCEL,0) end
+            token:Check()
+            local code=ok and tonumber(result.StatusCode or result.Status)
+            if code==200 then response=result self.PublicFailures=0 break end
+            lastError=code and ("Server list HTTP "..code) or "Server-list connection failed"
+            if code==400 and cursor and not resetCursor then
+                cursor=nil self.PublicCursor=nil self.PublicCursorUntil=nil
+                resetCursor=true url=base
+            else
+                if code and code~=429 and code<500 then error(lastError,0) end
+                self.PublicFailures=math.min((self.PublicFailures or 0)+1,6)
+                local delay=math.min(20,2^(self.PublicFailures-1))+math.random()*0.25
+                if code==429 then
+                    local headers=result.Headers or result.headers
+                    local retry=type(headers)=="table" and tonumber(headers["Retry-After"] or headers["retry-after"])
+                    delay=math.max(delay,finite(retry) and math.clamp(retry,1,300) or 10)
+                end
+                self.PublicRetryAt=os.clock()+delay
+                if attempt<3 and delay<deadline-os.clock() then token:Sleep(delay) else break end
             end
         end
-        if #servers > 0 or type(data.nextPageCursor)~="string" or data.nextPageCursor==""
-            or cursors[data.nextPageCursor] then break end
-        cursor=data.nextPageCursor cursors[cursor]=true token:Sleep(0.2)
+        if not response then self.ServerSearchDiagnostic=lastError or "Server search budget reached" break end
+        assert(type(response.Body)=="string" and #response.Body<2000000,"Server-list body is invalid")
+        local decoded,data=pcall(S.HttpService.JSONDecode,S.HttpService,response.Body)
+        assert(decoded and type(data)=="table" and type(data.data)=="table","Unexpected server-list response")
+        for _,server in ipairs(data.data) do
+            if type(server)=="table" and serverID(server.id) and not ids[server.id]
+                and finite(server.playing) and finite(server.maxPlayers)
+                and server.playing>=0 and server.playing<server.maxPlayers
+                and not self:IsServerExcluded(server.id)
+                and (not self.FailedServers[server.id] or self.FailedServers[server.id]<=os.time()) then
+                ids[server.id]=true servers[#servers+1]=server.id
+            end
+        end
+        local nextCursor=type(data.nextPageCursor)=="string" and #data.nextPageCursor<=2048
+            and data.nextPageCursor~="" and data.nextPageCursor or nil
+        self.PublicCursor=nextCursor
+        self.PublicCursorUntil=nextCursor and os.time()+180 or nil
+        if #servers>0 or not nextCursor or cursors[nextCursor] then break end
+        cursors[nextCursor]=true cursor=nextCursor
+        token:Sleep(self.Config.PerformanceMode and 0.03 or 0.2)
     end
     for i=#servers,2,-1 do local j=math.random(i) servers[i],servers[j]=servers[j],servers[i] end
     return servers
 end
+
 -- The tracker supplies observation history, never a claimed server creation date.
 -- A failed read cannot block harvesting or disable the ordinary Roblox search.
 function H:TrackerServers(token)
@@ -3110,32 +3527,133 @@ function H:TrackerServers(token)
         #result,duration(data.generatedAt-ordered[1].firstSeen))
     return result
 end
+function H:SearchServers(token)
+    token:Check()
+    local useTracker=self.Config.TrackerEnabled and self.Config.TrackerURL~=""
+        and os.clock()>=(self.TrackerRetryAt or 0)
+    if not useTracker then
+        return self:PublicServers(token),"Standard"
+    end
+    -- Both operations are reads. Preserve tracker preference, but overlap the
+    -- standard fallback so a failed tracker does not add two network waits.
+    local trackerScope=self:Token(token)
+    local publicScope=self:Token(token)
+    local trackerResult,publicResult
+    local publicWorker
+    local trackerWorker=task.spawn(function()
+        trackerResult=table.pack(pcall(self.TrackerServers,self,trackerScope))
+    end)
+    local cleaned=false
+    local function clean()
+        if cleaned then return end
+        cleaned=true
+        for _,thread in pairs({trackerWorker,publicWorker}) do
+            if coroutine.status(thread)~="dead" then pcall(task.cancel,thread) end
+        end
+        trackerScope:Clean() publicScope:Clean()
+    end
+    token:Finally(clean)
+    local hedgeAt=os.clock()+0.6
+    while not trackerResult do
+        token:Check()
+        if self.Config.PerformanceMode and not publicWorker and os.clock()>=hedgeAt then
+            publicWorker=task.spawn(function()
+                publicResult=table.pack(pcall(self.PublicServers,self,publicScope))
+            end)
+        end
+        token:Sleep(0.05)
+    end
+    if trackerResult[1] and type(trackerResult[2])=="table" and #trackerResult[2]>0 then
+        self.TrackerRetryAt=nil self.TrackerFallbackLogged=false
+        local result=trackerResult[2]
+        clean()
+        return result,"Oldest observed"
+    end
+    if trackerResult[2]==CANCEL then clean() error(CANCEL,0) end
+    self.TrackerStatus=trackerResult[1] and (trackerResult[3] or "No eligible tracked server")
+        or "Tracker request failed or timed out"
+    self.TrackerRetryAt=os.clock()+self.Config.TrackerBackoff
+    if not self.TrackerFallbackLogged then
+        self:Log(self.TrackerStatus.." - using standard search","WARNING")
+        self.TrackerFallbackLogged=true
+    end
+    if not publicWorker then
+        publicWorker=task.spawn(function()
+            publicResult=table.pack(pcall(self.PublicServers,self,publicScope))
+        end)
+    end
+    while not publicResult do token:Sleep(0.05) end
+    clean()
+    if not publicResult[1] then error(publicResult[2],0) end
+    return publicResult[2],"Standard"
+end
+
+function H:StartServerPrefetch(token)
+    if not self.Config.PrefetchServers then return end
+    local cached=self.ServerCandidateCache
+    if cached and os.clock()<cached.Until and #self:EligibleServers(cached.Servers)>0 then return end
+    local previous=self.ServerPrefetch
+    if previous and not previous.Done and not previous.Cancelled then return previous end
+    if previous and previous.Done and os.clock()-(previous.Finished or 0)<2 then return previous end
+    local state={Scope=self:Token(token),Started=os.clock()}
+    self.ServerPrefetch=state
+    token:Finally(function()
+        if not state.Done then
+            state.Cancelled=true
+            if state.Worker and coroutine.status(state.Worker)~="dead" then pcall(task.cancel,state.Worker) end
+            state.Scope:Clean()
+            if self.ServerPrefetch==state then self.ServerPrefetch=nil end
+        end
+    end)
+    state.Worker=task.spawn(function()
+        local result=table.pack(pcall(self.SearchServers,self,state.Scope))
+        state.Scope:Clean()
+        if state.Cancelled then return end
+        state.Done=true state.Finished=os.clock()
+        self.LastServerSearchSeconds=state.Finished-state.Started
+        if result[1] then
+            state.Servers=self:EligibleServers(result[2]) state.Source=result[3]
+            if #state.Servers>0 then
+                self.ServerCandidateCache={Servers=state.Servers,Source=state.Source,
+                    Until=os.clock()+self.Config.CandidateCacheSeconds}
+            end
+        else
+            -- Request exceptions may include headers; never log their raw value.
+            state.Failed=true
+            self.ServerSearchDiagnostic="Background server lookup failed"
+        end
+    end)
+    return state
+end
+
 function H:Servers(token)
     token:Check()
-    if self.Config.TrackerEnabled and self.Config.TrackerURL~="" then
-        if os.clock()>=(self.TrackerRetryAt or 0) then
-            local ok,result,reason=pcall(self.TrackerServers,self,token)
-            if not ok and result==CANCEL then error(CANCEL,0) end
-            token:Check()
-            if ok and type(result)=="table" and #result>0 then
-                if self.ServerSource~="Oldest observed" then self:Log("Using oldest observed servers") end
-                self.TrackerRetryAt=nil self.TrackerFallbackLogged=false self.ServerSource="Oldest observed"
-                self:Log(self.TrackerStatus,"DEBUG")
-                return result
-            end
-            -- Never log a raw HTTP exception: some clients include headers in it.
-            self.TrackerStatus=ok and (reason or "No candidate") or "Tracker request failed or timed out"
-            self.TrackerRetryAt=os.clock()+self.Config.TrackerBackoff
-            if not self.TrackerFallbackLogged then
-                self:Log(self.TrackerStatus.." - using standard search","WARNING")
-                self.TrackerFallbackLogged=true
-            end
+    local cached=self.ServerCandidateCache
+    if cached and os.clock()<cached.Until then
+        local eligible=self:EligibleServers(cached.Servers)
+        if #eligible>0 then
+            self.ServerSource=cached.Source
+            self.ServerCacheHits=(self.ServerCacheHits or 0)+1
+            return eligible
         end
-    else
-        self.TrackerStatus=self.Config.TrackerEnabled and "Not configured" or "Disabled"
     end
-    self.ServerSource="Standard"
-    return self:PublicServers(token)
+    local state=self:StartServerPrefetch(token)
+    if state then
+        while not state.Done and not state.Cancelled do token:Sleep(0.05) end
+        token:Check()
+        if state.Done and state.Servers then
+            self.ServerSource=state.Source
+            return self:EligibleServers(state.Servers)
+        end
+        return {}
+    end
+    local started=os.clock()
+    local servers,source=self:SearchServers(token)
+    self.LastServerSearchSeconds=os.clock()-started
+    self.ServerSource=source
+    servers=self:EligibleServers(servers)
+    self.ServerCandidateCache={Servers=servers,Source=source,Until=os.clock()+self.Config.CandidateCacheSeconds}
+    return servers
 end
 function H:Bootstrap()
     assert(type(Queue)=="function", "queue_on_teleport unavailable - automatic continuation is not supported")
@@ -3256,11 +3774,8 @@ function H:Hop(token)
     self:RememberServer(game.JobId)
     local stored, storeError = self:Persist(false) assert(stored, storeError)
     local leaveAt = os.clock() + self.Config.HopDelay
+    self:StartServerPrefetch(token)
     self:SetStage("Next server",0.98,"Preparing the next server")
-    repeat
-        if self.UI then self.UI.Progress:SetText("Next server","Joining in "..math.ceil(math.max(0,leaveAt-os.clock())).."s") end
-        token:Sleep(math.min(1, math.max(0,leaveAt-os.clock())))
-    until os.clock()>=leaveAt
     local servers
     for round=1,3 do
         self:SetStage("Finding another server",0.98,"History: "..#self.ServerHistory.." / 1000")
@@ -3272,6 +3787,10 @@ function H:Hop(token)
         end
     end
     assert(#servers>0,"No eligible server available - recent-server history was preserved")
+    -- Candidate lookup runs during the requested delay, not after it.
+    if os.clock()<leaveAt then token:Sleep(leaveAt-os.clock()) end
+    servers=self:EligibleServers(servers)
+    assert(#servers>0,"Server candidates expired - refreshing on the next attempt")
     for i=1,math.min(#servers,8) do
         token:Check()
         local id=servers[i]
@@ -3289,7 +3808,17 @@ function H:Hop(token)
         while not attempt.Error and os.clock()<deadline do token:Sleep(0.2) end
         self.HopAttempt=nil
         if not attempt.Error then self.HopUncertain=true error("Teleport outcome unknown - no second request sent",0) end
-        self:Log(attempt.Error,"WARNING") token:Sleep(self.Config.HopDelay)
+        self:Log(attempt.Error,"WARNING")
+        local pause=self.Config.HopDelay
+        if attempt.FailureKind=="GameFull" or attempt.FailureKind=="GameEnded" then
+            self.FailedServers[id]=os.time()+60
+            pause=self.Config.PerformanceMode and 0.2 or pause
+        elseif attempt.FailureKind=="Flooded" then
+            pause=math.max(pause,10)
+        elseif self.Config.PerformanceMode then
+            pause=math.max(0.5,pause)
+        end
+        token:Sleep(pause)
     end
     error("No server could be joined",0)
 end
@@ -3302,7 +3831,13 @@ function H:Run(token)
     end
     assert(game.PlaceId==13822889,"This script targets Lumber Tycoon 2 (13822889)")
     assert(not S.Workspace.StreamingEnabled,"Streaming is enabled - a complete tree scan cannot be confirmed")
-    self:WaitForGame(token)
+    self:StartServerPrefetch(token)
+    if #self.PendingWood==0 then
+        self:WaitForGame(token)
+    else
+        token.Character=self:Character()
+        self:SetStage("Resuming current task",self.Progress)
+    end
     self:Bootstrap()
     local resuming = #self.PendingWood>0
     if self.Dirty and not resuming then
@@ -3389,7 +3924,10 @@ function H:Run(token)
                     self:LinkHarvestProgress(work)
                     cutStarted=true self.Dirty=true
                     local target=work.Cut and {Model=work.Cut.Tree,Trunk=work.Cut.Trunk,Kind=work.Kind} or entry
-                    log=self:Chop(target,tool,stats,scope,work)
+                    log=self:LocalStep(work,"cutting",scope,function(step)
+                        local freshTool,freshStats=self:EnsureAxe(entry.Kind,step)
+                        return self:Chop(target,freshTool,freshStats,step,work)
+                    end)
                     if self.GrowthTarget==entry.Model then self.GrowthTarget=nil end
                     work.Log=log self.Stats.Trees=self.Stats.Trees+1
                 end
@@ -3397,10 +3935,17 @@ function H:Run(token)
                 self:UpdateHarvestProgress(0.25)
                 if not work.Planks then
                     if not work.Modwood then
-                        self:BringTreeToBase(log,plot,scope)
-                        work.AtBase=true
+                        if not (work.AtBase and log and log.Parent and owned(log)
+                            and (log:GetPivot().Position-center.Position).Magnitude<120) then
+                            self:LocalStep(work,"wood transport",scope,function(step)
+                                self:BringTreeToBase(log,plot,step)
+                            end)
+                            work.AtBase=true
+                        end
                         self:UpdateHarvestProgress(0.35)
-                        mill,inlet=self:FindMill(scope,plot)
+                        mill,inlet=self:LocalStep(work,"sawmill selection",scope,function(step)
+                            return self:FindMill(step,plot)
+                        end)
                         self:UpdateHarvestProgress(0.38)
                         local supported, reason=self:WaitForModwood(log,scope)
                         if not supported then
@@ -3421,8 +3966,15 @@ function H:Run(token)
                 self:UpdateHarvestProgress(0.85)
                 assert(owned(plot) and self:Plot()==plot,"Plot ownership changed before delivery")
                 self:SetStage("Delivering planks",0.86,"Center of your plot")
-                self:Deliver(work.Planks,center,scope,work)
-                self:SaveSlot(scope)
+                if not work.Saved then
+                    self:LocalStep(work,"plank delivery",scope,function(step)
+                        self:Deliver(work.Planks,center,step,work)
+                    end)
+                    self:LocalStep(work,"slot saving",scope,function(step)
+                        self:SaveSlot(step)
+                    end)
+                    work.Saved=true
+                end
                 self:UpdateHarvestProgress(1,"Saved")
                 self:RecordHarvest(work)
                 return true
@@ -3542,11 +4094,11 @@ function H:Start()
             if result and (not self.LastFailure or self.LastFailure.Reason~=cleanError(result)) then self:RecordFailure(self.Stage,cleanError(result)) end
             if not self.LastFailure then self:RecordFailure(self.Stage,"Retry pending") end
             self:Log("Recovery - "..self.LastFailure.Reason,"DEBUG")
-            self:SetStage("Reconnecting",self.Progress)
+            self:SetStage(self.HopUncertain and "Waiting for teleport" or "Resuming current task",self.Progress)
             -- Preserve the continuation ticket while an uncertain teleport settles.
             self.Watchdog=false
             token.Deadline=os.clock()+210
-            local waited,err=pcall(token.Sleep,token,self.HopUncertain and 180 or 5)
+            local waited,err=pcall(token.Sleep,token,self.HopUncertain and 180 or 0.75)
             if not waited then result=err break end
             if self.HopUncertain then
                 self.HopUncertain=false self.PendingTeleportTarget=nil self.HopAttempt=nil
@@ -3579,6 +4131,7 @@ end
 function H:Destroy()
     if not self.Alive then return end
     self:Stop() self.Alive=false
+    if self.BotPersistWorker then pcall(task.cancel,self.BotPersistWorker) self.BotPersistWorker=nil end
     if self.RenderDisabled then
         pcall(function() S.RunService:Set3dRenderingEnabled(true) end)
         self.RenderDisabled=false
@@ -3662,6 +4215,10 @@ local function apply(key,newValue,control)
         return
     end
     H.Config=candidate
+    if key:sub(1,7)=="Tracker" or key=="VisitCooldownHours" or key=="HarvestCooldownHours"
+        or key=="PrefetchServers" or key=="PerformanceMode" or key=="CandidateCacheSeconds" then
+        H.ServerCandidateCache=nil H.ServerPrefetch=nil
+    end
     if key=="BotKey" or key=="BotURL" then H.BotCommandVersion=0 H.BotWake=true end
     if key:sub(1,7)=="Tracker" then H.TrackerRetryAt=nil H.TrackerFallbackLogged=false end
     if controls.ScanWait then controls.ScanWait:Set(tostring(candidate.ScanWait),true) end
@@ -3703,7 +4260,7 @@ local botToggle
 botToggle=botSection:Toggle({Title="Connect to Discord",Default=H.Config.BotEnabled,
     Callback=function(v) apply("BotEnabled",v,botToggle) H.BotWake=true end})
 botSection:Button({Title="Reconnect bot",Callback=function() H.BotWake=true H:StartBot() end})
-for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"No render","NoRender"},{"Fast harvest","FastHarvest"},{"Auto rejoin","AutoRejoin"},{"Modwood highlights","ModwoodHighlights"}}) do
+for _,entry in ipairs({{"Full harvest","FullCycle"},{"Anti-AFK","AntiAfk"},{"No render","NoRender"},{"Fast harvest","FastHarvest"},{"Auto rejoin","AutoRejoin"},{"Modwood 3D markers","ModwoodHighlights"}}) do
     local title,key=entry[1],entry[2]
     local toggle
     toggle=settings:Toggle({Title=title,Default=H.Config[key],Callback=function(v) apply(key,v,toggle) end})
@@ -3734,6 +4291,23 @@ local adaptiveToggle
 adaptiveToggle=finder:Toggle({Title="Adaptive server timing",Default=H.Config.AdaptiveTiming,
     Callback=function(v) apply("AdaptiveTiming",v,adaptiveToggle) end})
 local advanced=settings:Section({Title="Advanced",Collapsible=true,Collapsed=true})
+local performance=settings:Section({Title="Performance",Collapsible=true,Collapsed=false})
+for _,entry in ipairs({{"Performance mode","PerformanceMode"},{"Prepare next server","PrefetchServers"}}) do
+    local title,key=entry[1],entry[2]
+    local toggle
+    toggle=performance:Toggle({Title=title,Default=H.Config[key],Callback=function(v) apply(key,v,toggle) end})
+    controls[key]=toggle
+end
+textSetting(performance,"Server cache lifetime (seconds)","CandidateCacheSeconds",true)
+textSetting(performance,"Search budget (seconds)","ServerSearchBudget",true)
+textSetting(performance,"Maximum server pages","PublicPageLimit",true)
+performance:Button({Title="Clear search cache",Callback=function()
+    if H.Busy then H:Log("Stop the hunt before clearing search cache","WARNING") return end
+    H.ServerCandidateCache=nil H.ServerPrefetch=nil
+    H.PublicCursor=nil H.PublicCursorUntil=nil
+    H:Persist(false)
+    H:Log("Search cache cleared - server history retained")
+end})
 textSetting(advanced,"Script URL","ScriptURL",false)
 for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},{"Rejoin retry delay (seconds)","RejoinDelay"},
     {"Tracker timeout (seconds)","TrackerTimeout"},{"Tracker retry (seconds)","TrackerBackoff"},
@@ -3747,12 +4321,13 @@ for _,entry in ipairs({{"Hop delay (seconds)","HopDelay"},{"Rejoin retry delay (
     textSetting(advanced,entry[1],entry[2],true)
 end
 settings:Button({Title="Reset window position",Callback=function() Window:SetPosition({X=0.5,Y=0.5}) end})
-H:Connect(S.TeleportService.TeleportInitFailed,function(player,_,message,placeId,options)
+H:Connect(S.TeleportService.TeleportInitFailed,function(player,result,message,placeId,options)
     if player~=Player or placeId~=game.PlaceId then return end
     if H.RejoinAttempt then H.RejoinAttempt.Error="Rejoin failed - "..tostring(message):sub(1,160) return end
     if not H.HopAttempt then return end
     local id=options and options.ServerInstanceId
     if id and id~="" and id~=H.HopAttempt.Id then return end
+    H.HopAttempt.FailureKind=result and result.Name or "Unknown"
     H.HopAttempt.Error="Teleport failed - "..tostring(message):sub(1,160)
 end)
 local rejoinHookOK=pcall(function()
@@ -3761,6 +4336,7 @@ end)
 if not rejoinHookOK then H:Log("Disconnect detection is unavailable in this executor","WARNING") end
 if H.ConfigWarning then H:Log(H.ConfigWarning,"WARNING") end
 H:Log("Ready")
+H:DetectCapabilities()
 H:SetAntiAfk(H.Config.AntiAfk)
 if H.Config.NoRender and not H:SetNoRender(true) then
     H.Config.NoRender=false
