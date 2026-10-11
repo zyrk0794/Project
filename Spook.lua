@@ -1,6 +1,6 @@
 --[[
-    Midnight Spooky Hunter 1.10.3 - Lumber Tycoon 2
-    October 10, 2026. Client script using Midnight UI Library 2.4.0 or newer.
+    Midnight Spooky Hunter 1.10.4 - Lumber Tycoon 2
+    October 11, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
@@ -62,7 +62,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 12, ServerRetryDelay = 5, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.10.3", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.10.4", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -640,6 +640,89 @@ function H:Token(parent)
     if parent then parent:Finally(function() token:Clean() end) end
     return token
 end
+-- Standing trees can live in nested/custom TreeRegion models. Branch models
+-- in the supplied SuperTree module inherit their ancestor tree's Owner.
+function H:TreeContext(model)
+    if not model or not under(model,S.Workspace) then return nil,nil,nil end
+    local ownerField,ownerModel,event
+    local current=model
+    while current and current~=S.Workspace do
+        local field=current:FindFirstChild("Owner")
+        local cut=current:FindFirstChild("CutEvent")
+        if not event and cut then event=cut end
+        if field and field:IsA("ObjectValue") and (current==model or current:FindFirstChild("TreeClass") or cut) then
+            ownerField,ownerModel=field,current
+            break
+        end
+        if current~=model and current.Name=="TreeRegion" and not current:FindFirstChild("TreeClass") then break end
+        current=current.Parent
+    end
+    return ownerField,ownerModel,event
+end
+function H:TreeOwner(model)
+    local field=self:TreeContext(model)
+    return field and field.Value or nil,field
+end
+function H:TreeTrunk(model)
+    -- A nested branch can also have ID=1. Prefer the root tree's direct section.
+    for _,part in ipairs(model:GetChildren()) do
+        if part:IsA("BasePart") and part.Name=="WoodSection" and tonumber(value(part,"ID"))==1 then return part end
+    end
+    return nil
+end
+function H:IsStandingTree(model)
+    if not model or not model:IsA("Model") or not under(model,S.Workspace) or model:FindFirstChild("RootCut") then return false end
+    for _,name in ipairs({"LogModels","PlayerModels"}) do
+        local excluded=S.Workspace:FindFirstChild(name)
+        if excluded and under(model,excluded) then return false end
+    end
+    local trunk=self:TreeTrunk(model)
+    return trunk~=nil and trunk.Anchored and model:FindFirstChild("CutEvent")~=nil
+end
+function H:EnsureTreeIndex(token)
+    if self.TreeIndexReady then return end
+    if not self.TreeIndex then
+        self.TreeIndex={}
+        local function add(object)
+            if object.Name=="TreeClass" and object:IsA("StringValue") and object.Parent and object.Parent:IsA("Model") then
+                self.TreeIndex[object.Parent]=object
+            end
+        end
+        self:Connect(S.Workspace.DescendantAdded,add)
+        self:Connect(S.Workspace.DescendantRemoving,function(object)
+            if object.Name=="TreeClass" and object.Parent and self.TreeIndex[object.Parent]==object then self.TreeIndex[object.Parent]=nil end
+        end)
+        self.TreeIndexAdd=add
+    end
+    for index,object in ipairs(S.Workspace:GetDescendants()) do
+        self.TreeIndexAdd(object)
+        if index%512==0 then token:Sleep(0.001) end
+    end
+    self.TreeIndexReady=true
+end
+function H:StandingTrees(token)
+    self:EnsureTreeIndex(token)
+    local models,regions,seen={},{},{}
+    for model,field in pairs(self.TreeIndex) do
+        if not under(model,S.Workspace) or field.Parent~=model then
+            self.TreeIndex[model]=nil
+        elseif self:IsStandingTree(model) then
+            local _,root=self:TreeContext(model)
+            -- Do not count an inherited branch again as a separate tree.
+            root=root or model
+            if not seen[root] and self:IsStandingTree(root) then
+                seen[root]=true table.insert(models,root)
+                local region=root
+                while region.Parent and region.Name~="TreeRegion" and region.Parent~=S.Workspace do region=region.Parent end
+                regions[region]=true
+            end
+        end
+    end
+    local count=0
+    for _ in pairs(regions) do count=count+1 end
+    return models,count
+end
+
 function H:WaitForGame(token)
     self:SetStage("Loading game",0.01)
     local deadline=os.clock()+self.Config.LoadTimeout
@@ -665,15 +748,8 @@ function H:WaitForGame(token)
             local saves=need(S.ReplicatedStorage,"LoadSaveRequests")
             need(saves,"RequestLoad") need(saves,"RequestSave")
         end
-        local regions,trees=0,0
-        for _,region in ipairs(S.Workspace:GetChildren()) do
-            if region.Name=="TreeRegion" then
-                regions=regions+1
-                for _,model in ipairs(region:GetChildren()) do
-                    if model:FindFirstChild("TreeClass") and model:FindFirstChild("Owner") and model:FindFirstChild("WoodSection",true) then trees=trees+1 end
-                end
-            end
-        end
+        local loadedTrees,regions=self:StandingTrees(token)
+        local trees=#loadedTrees
         if regions==0 or trees==0 then table.insert(missing,"Tree regions") end
         local signature={regions,trees}
         for _,object in ipairs(refs) do table.insert(signature,object) end
@@ -1114,36 +1190,24 @@ function H:Scan(token)
     local regions, inspected, ready = 0, 0, 0
     local snapshot, budgetStart = {}, os.clock()
     token:Check()
-    for _, region in ipairs(S.Workspace:GetChildren()) do
-        if region.Name == "TreeRegion" then
-            regions = regions + 1
-            for _, model in ipairs(region:GetChildren()) do
-                local kind = value(model,"TreeClass")
-                if kind then ready = ready + 1 snapshot[model] = kind end
-                local ownerField = rare(kind) and model:FindFirstChild("Owner")
-                if model:IsA("Model") and self:WantsTree(kind) and ownerField and ownerField:IsA("ObjectValue")
-                    and (ownerField.Value == nil or (model==self.GrowthTarget and ownerField.Value==Player))
-                    and model:FindFirstChild("CutEvent") and not model:FindFirstChild("RootCut") then
-                    local trunk, volume = nil, 0
-                    for _, section in ipairs(model:GetDescendants()) do
-                        if section:IsA("BasePart") and section.Name == "WoodSection" then
-                            volume = volume + section.Size.X * section.Size.Y * section.Size.Z
-                            if tonumber(value(section,"ID")) == 1 then trunk = section end
-                        end
-                    end
-                    if volume<MIN_TREE_VOLUME then counts.IgnoredSmall=counts.IgnoredSmall+1 end
-                    if trunk and self:EligibleVolume(kind,volume) then
-                        table.insert(matches, { Model = model, Trunk = trunk, Kind = kind, Volume = volume,
-                            GrowthClaimed=model==self.GrowthTarget and ownerField.Value==Player })
-                        counts[kind] = counts[kind] + 1 counts[kind .. "Volume"] = counts[kind .. "Volume"] + volume
-                    end
-                end
-                inspected = inspected + 1
-                if inspected % 64 == 0 and os.clock() - budgetStart >= 0.004 then
-                    token:Sleep(0.001) budgetStart = os.clock()
-                end
+    local trees
+    trees,regions=self:StandingTrees(token)
+    for _,model in ipairs(trees) do
+        local kind=value(model,"TreeClass")
+        if kind then ready=ready+1 snapshot[model]=kind end
+        local ownerField=self:TreeContext(model)
+        if self:WantsTree(kind) and ownerField
+            and (ownerField.Value==nil or (model==self.GrowthTarget and ownerField.Value==Player)) then
+            local trunk,volume=self:TreeTrunk(model),self:WoodVolume(model)
+            if not self:EligibleVolume(kind,volume) then counts.IgnoredSmall=counts.IgnoredSmall+1 end
+            if trunk and self:EligibleVolume(kind,volume) then
+                table.insert(matches,{Model=model,Trunk=trunk,Kind=kind,Volume=volume,
+                    GrowthClaimed=model==self.GrowthTarget and ownerField.Value==Player})
+                counts[kind]=counts[kind]+1 counts[kind.."Volume"]=counts[kind.."Volume"]+volume
             end
         end
+        inspected=inspected+1
+        if inspected%64==0 and os.clock()-budgetStart>=0.004 then token:Sleep(0.001) budgetStart=os.clock() end
     end
     table.sort(matches, function(a,b)
         if self.Config.GrowSinister and a.Kind~=b.Kind then return a.Kind=="SpookyNeon" end
@@ -1265,22 +1329,36 @@ function H:AttemptChop(model,tool,stats,token,section,height)
     assert(livePart(section) and under(section,model) and section.Size.Y>height+0.001,"No live section above the cut height")
     local id=tonumber(value(section,"ID"))
     assert(id,"The cut section has no valid ID")
-    local owner=value(model,"Owner")
+    local owner=self:TreeOwner(model)
     assert(owner==nil or owner==Player,"The cut target belongs to another player")
-    local event=model:FindFirstChild("CutEvent")
+    local _,_,event=self:TreeContext(model)
     if not event and model.Parent then event=model.Parent:FindFirstChild("CutEvent") end
     assert(event,"The cut target has no CutEvent")
     assert(tool and tool.Parent==Player.Character,"The selected axe is not equipped")
     local _,_,avatar=self:Character()
-    local stand=section.Position+Vector3.new(0,0,5)
-    if (avatar.Position-section.Position).Magnitude>10 then
-        self:Teleport(CFrame.lookAt(stand,section.Position))
+    local inverse=value(tool,"ToolName")=="InverseAxe" and stats.Damage<=0
+    local point=inverse and section.CFrame:PointToWorldSpace(Vector3.new(0,-section.Size.Y/2+height,0)) or section.Position
+    local stand=point+(inverse and Vector3.new(4,2,0) or Vector3.new(0,0,5))
+    if inverse then
+        local parameters=RaycastParams.new()
+        parameters.FilterType=Enum.RaycastFilterType.Exclude
+        parameters.FilterDescendantsInstances={model,Player.Character}
+        parameters.RespectCanCollide=true
+        local hit=S.Workspace:Raycast(stand+Vector3.new(0,12,0),Vector3.new(0,-35,0),parameters)
+        if hit then
+            local _,humanoid=self:Character()
+            stand=Vector3.new(stand.X,hit.Position.Y+humanoid.HipHeight+avatar.Size.Y/2+0.1,stand.Z)
+        end
+    end
+    if (avatar.Position-point).Magnitude>(inverse and 7 or 10) then
+        self:Teleport(CFrame.lookAt(stand,point))
         token:Sleep(0.25)
     end
     token:Check()
     assert(livePart(section) and under(section,model) and section.Size.Y>height+0.001,"The cut section changed during approach")
     assert(tonumber(value(section,"ID"))==id,"The cut section ID changed during approach")
-    assert(value(model,"Owner")==nil or owned(model),"The cut target changed owner during approach")
+    local latestOwner=self:TreeOwner(model)
+    assert(latestOwner==nil or latestOwner==Player,"The cut target changed owner during approach")
     assert(tool.Parent==Player.Character and event.Parent,"The axe or CutEvent changed during approach")
     self:FireAxe(self:Remote("Interaction","RemoteProxy"),event,{tool=tool,sectionId=id,height=height,
         faceVector=Vector3.new(1,0,0),hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
@@ -1331,26 +1409,46 @@ function H:WaitForSinisterGrowth(entry, token, parentToken)
     local lastChange, lastVolume = started, entry.Volume
     local nextSample, nextStrike, nextNotice = 0, 0, started + self.Config.GrowthNotifySeconds
     local unownedSince = started
+    local ownershipWarned=false
+    local lastOwnership=nil
+    local lastOwnerField=nil
     local samples = 0
     local observedGrowth = false
     while os.clock() - started < self.Config.GrowthMaxWait do
         token:Check()
         local tree = entry.Model
-        assert(tree and under(tree, S.Workspace) and tree.Parent.Name == "TreeRegion"
-            and not tree:FindFirstChild("RootCut"), "Growth target was removed or cut")
+        assert(self:IsStandingTree(tree), "Growth target was removed, detached or cut")
         assert(value(tree, "TreeClass") == entry.Kind, "Growth target class changed")
-        local owner = value(tree, "Owner")
-        assert(owner == nil or owner == Player, "Growth target belongs to another player")
+        local owner,ownerField = self:TreeOwner(tree)
+        growth.OwnerPath=ownerField and ownerField:GetFullName() or "Owner not replicated"
+        growth.OwnerValue=owner==Player and "LocalPlayer" or owner and owner:GetFullName() or "Unowned"
+        local lastInteraction=ownerField and value(ownerField,"LastInteraction") or nil
+        growth.LastInteraction=finite(lastInteraction) and lastInteraction or nil
+        if ownerField~=lastOwnerField then
+            self:Log("Growth owner source - "..growth.OwnerPath,"DEBUG")
+            lastOwnerField=ownerField
+        end
+        assert(owner == nil or owner == Player, "Growth target belongs to another player - "..growth.OwnerPath)
         if owner == Player then
             unownedSince = nil
             entry.GrowthClaimed = true
             growth.Ownership = "Confirmed"
+            if lastOwnership~="Confirmed" then
+                self.LastConfirmedMilestone="Sinister ownership confirmed"
+                self:NotifyBot("Sinister ownership confirmed",string.format("Owner.Value matches your player - %.2f studs3. Growth monitoring continues.",growth.Volume),token)
+            end
+            ownershipWarned=false
         else
             unownedSince = unownedSince or os.clock()
-            growth.Ownership = "Pending"
-            assert(os.clock() - unownedSince < 30, "InverseAxe ownership was not confirmed within 30 seconds")
+            growth.Ownership = ownerField and "Unconfirmed" or "Owner unavailable"
+            if os.clock()-unownedSince>=30 and not ownershipWarned then
+                ownershipWarned=true
+                self:NotifyBot("Sinister claim pending","Owner is not confirmed yet. Continuing InverseAxe hits and growth observation. Source: "..growth.OwnerPath,token)
+                self:Log("Sinister owner pending - continuing observation, no server hop","WARNING")
+            end
         end
-        local trunk = self:LowestSection(tree)
+        lastOwnership=growth.Ownership
+        local trunk = self:TreeTrunk(tree)
         assert(livePart(trunk) and tonumber(value(trunk, "ID")) == 1, "Growing trunk is unavailable")
         entry.Trunk = trunk
         if tool.Parent ~= Player.Character then
@@ -1380,7 +1478,7 @@ function H:WaitForSinisterGrowth(entry, token, parentToken)
             end
             growth.Volume, growth.Gain = current, current - growth.Initial
             growth.Elapsed, growth.StableFor = os.clock() - started, os.clock() - lastChange
-            growth.Status = "Observing"
+            growth.Status = owner==Player and "Observing" or "Claiming"
             samples = samples + 1
             self:UpdateHarvestProgress(0, string.format("Sinister %.2f studs3 - unchanged %ds / %ds",
                 current, math.floor(growth.StableFor), self.Config.GrowthStableSeconds))
@@ -1407,7 +1505,7 @@ function H:WaitForSinisterGrowth(entry, token, parentToken)
         end
         token:Sleep(0.1)
     end
-    error("Sinister growth time limit reached - stable growth was not confirmed", 0)
+    error("Sinister growth time limit reached - owner: "..growth.Ownership.." - "..(growth.OwnerPath or "Unknown owner path").." - stable owned growth was not confirmed", 0)
 end
 
 function H:Chop(entry, tool, stats, token, checkpoint)
@@ -1416,7 +1514,7 @@ function H:Chop(entry, tool, stats, token, checkpoint)
     local logs=S.Workspace:FindFirstChild("LogModels") assert(logs,"LogModels missing")
     local cut=checkpoint and checkpoint.Cut
     if not cut then
-        assert(tree.Parent and trunk.Parent and (value(tree,"Owner")==nil or (entry.GrowthClaimed and owned(tree))),"The selected tree is no longer available")
+        assert(tree.Parent and trunk.Parent and (self:TreeOwner(tree)==nil or (entry.GrowthClaimed and self:TreeOwner(tree)==Player)),"The selected tree is no longer available")
         cut={Tree=tree,Trunk=trunk,Kind=entry.Kind,Origin=trunk.Position,Radius=math.max(80,trunk.Size.Y),
             Previous={},Strikes=0,Started=os.clock()}
         for _, model in ipairs(logs:GetChildren()) do cut.Previous[model]=true end
@@ -1439,7 +1537,7 @@ function H:Chop(entry, tool, stats, token, checkpoint)
         local rootCut=tree:FindFirstChild("RootCut")~=nil
         local detached=rootCut or not tree.Parent or not trunk.Parent
         if detached and not detachedAt then detachedAt=os.clock() end
-        local owner=value(tree,"Owner")
+        local owner=self:TreeOwner(tree)
         assert(owner==nil or owner==Player,"Another player now owns the selected tree")
         if not detached and (owner==nil or owner==Player) then
             local event=tree:FindFirstChild("CutEvent")
@@ -1800,6 +1898,8 @@ function H:BuildReport()
     if self.Growth then
         table.insert(lines,string.format("Sinister growth: %s; volume: %.3f; gain: %.3f; elapsed: %.0fs; stable: %.0fs; owner: %s",
             self.Growth.Status,self.Growth.Volume,self.Growth.Gain,self.Growth.Elapsed,self.Growth.StableFor,self.Growth.Ownership))
+        table.insert(lines,"Growth owner path: "..tostring(self.Growth.OwnerPath).."\nOwner value: "..tostring(self.Growth.OwnerValue)
+            .."\nLastInteraction: "..tostring(self.Growth.LastInteraction).."\nInverseAxe requests: "..tostring(self.Growth.Hits))
     end
     if self.LastFailure then
         table.insert(lines,"Failure code: "..(self.LastFailure.Code or "Unavailable")
@@ -3059,7 +3159,7 @@ function H:Run(token)
     local processed, skipped = 0, 0
     for index,entry in ipairs(entries) do
         token:Check()
-        if entry.Work or (entry.Model.Parent and (value(entry.Model,"Owner")==nil or (entry.GrowthClaimed and owned(entry.Model)))
+        if entry.Work or (entry.Model.Parent and (self:TreeOwner(entry.Model)==nil or (entry.GrowthClaimed and self:TreeOwner(entry.Model)==Player))
             and not entry.Model:FindFirstChild("RootCut") and self:EligibleVolume(entry.Kind,self:WoodVolume(entry.Model))) then
             self:SelectHarvestProgress(entry)
             local scope=self:Token(token)
@@ -3283,6 +3383,7 @@ function H:Destroy()
     if self.BotRequestThread then pcall(task.cancel,self.BotRequestThread) self.BotRequestThread=nil end
     if self.BotLoop then pcall(task.cancel,self.BotLoop) self.BotLoop=nil end
     for _,c in ipairs(self.Connections) do c:Disconnect() end
+    if self.TreeIndex then table.clear(self.TreeIndex) end
     if self.ProgressTween then self.ProgressTween:Cancel() end
     if self.StageTween then self.StageTween:Cancel() end
     for _,animation in pairs(self.Motion or {}) do animation:Cancel() end
