@@ -1,9 +1,12 @@
 --[[
-    Midnight Spooky Hunter 1.14.1 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.14.2 - Lumber Tycoon 2
     October 12, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.14.2: persistent tracker pagination, bounded immediate page continuation,
+    precise empty-pool diagnostics. Modwood remains unchanged.
 
     1.14.1: lag-tolerant ignition window, latched transient fire detection,
     bounded replication grace and immediate contact stop after ignition.
@@ -140,7 +143,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.14.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.14.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -241,7 +244,7 @@ function H:EnsureServerCycle()
         or now<self.ServerCycle.StartedAt then
         self.ServerCycle={StartedAt=now,Visited={}}
         self.OldServerBatch=nil
-        self.TrackerSuppressed=nil
+        self.TrackerSuppressed=nil self.TrackerCursor=nil
         self.ServerCandidateCache=nil
         self.TrackerRetryAt=nil
         self.TrackerEmptyUntil=nil
@@ -414,6 +417,12 @@ if restored then
             if serverID(id) and finite(stamp) and stamp>=cycle.StartedAt and stamp<=os.time() then
                 H.ServerCycle.Visited[id]=stamp count=count+1
             end
+        end
+        local bookmark=restored.TrackerCursor
+        if type(bookmark)=="table" and bookmark.URL==H.Config.TrackerURL and type(bookmark.After)=="table"
+            and serverID(bookmark.After.id) and finite(bookmark.After.firstSeen)
+            and bookmark.After.firstSeen>0 and bookmark.After.firstSeen<=os.time() then
+            H.TrackerCursor={URL=bookmark.URL,After={id=bookmark.After.id,firstSeen=bookmark.After.firstSeen}}
         end
         local batch=restored.OldServerBatch
         if type(batch)=="table" and batch.URL==H.Config.TrackerURL and type(batch.Entries)=="table"
@@ -739,7 +748,7 @@ function H:Persist(resume, target)
         if untilTime > os.time() then failed[id] = untilTime else self.FailedServers[id] = nil end
     end
     local data = { Schema = 2, Version = self.Version, TimingRevision = 1, GrowthTimingRevision = 1, PerformanceRevision = 1,
-        ServerCycle=self:EnsureServerCycle(),OldServerBatch=self.OldServerBatch,TrackerSuppressed=self.TrackerSuppressed,
+        ServerCycle=self:EnsureServerCycle(),OldServerBatch=self.OldServerBatch,TrackerSuppressed=self.TrackerSuppressed,TrackerCursor=self.TrackerCursor,
         PublicCursor=self.PublicCursor,PublicCursorUntil=self.PublicCursorUntil,
         WindowPosition = self.WindowPosition, Config = self.Config, ServerHistory = table.clone(self.ServerHistory),
         VisitRecords=self.VisitRecords, CurrentServer=game.JobId, ArrivalSource=self.ArrivalSource, LastScannedServer=self.LastScannedServer, TargetSource=self.ServerSource, BotQueue=self.BotQueue or {}, BotDesired=self.BotDesired, BotCommandVersion=self.BotCommandVersion or 0, FailedServers = failed, Stats = self.Stats, LastCountedServer = self.LastCountedServer,
@@ -3819,85 +3828,123 @@ function H:TrackerServers(token)
     if type(Request)~="function" then return nil,"HTTP request function unavailable" end
     if not trackerURL(self.Config.TrackerURL) then return nil,"Invalid Worker URL" end
     if not trackerKey(self.Config.TrackerToken) then return nil,"Tracker key missing or invalid" end
-    local exclusions,seen={},{}
-    local function exclude(id)
-        if #exclusions<1250 and serverID(id) and not seen[id] then
-            seen[id]=true table.insert(exclusions,id)
+    local bookmark=self.TrackerCursor
+    local cursor=bookmark and bookmark.URL==self.Config.TrackerURL and bookmark.After or nil
+    local deadline=os.clock()+self.Config.ServerSearchBudget
+    local rewound=false
+    for page=1,4 do
+        token:Check()
+        if os.clock()>=deadline then return nil,"Continuing oldest-server pagination" end
+        local exclusions,seen={},{}
+        local function exclude(id)
+            if #exclusions<1250 and serverID(id) and not seen[id] then
+                seen[id]=true exclusions[#exclusions+1]=id
+            end
         end
-    end
-    exclude(game.JobId)
-    for id,untilTime in pairs(self.FailedServers) do if untilTime>os.time() then exclude(id) end end
-    -- A separate six-hour cycle survives hops and never relies on a 50-item list.
-    -- Send exclusions matching the last batch first; the Worker accepts 1250 IDs.
-    for _,entry in ipairs(self.OldServerBatch and self.OldServerBatch.Entries or {}) do
-        if self:IsServerExcluded(entry.id) then exclude(entry.id) end
-    end
-    for _,id in ipairs(self.TrackerSuppressed or {}) do exclude(id) end
-    local visits={}
-    for id,stamp in pairs(self:EnsureServerCycle().Visited) do visits[#visits+1]={Id=id,Stamp=stamp} end
-    table.sort(visits,function(a,b) return a.Stamp>b.Stamp end)
-    for _,entry in ipairs(visits) do exclude(entry.Id) end
-    local body=S.HttpService:JSONEncode({placeId=game.PlaceId,exclude=exclusions,limit=100,
-        maxSeenAgeSeconds=math.floor(self.Config.TrackerFreshness*60),
-        minObservedAgeSeconds=math.floor(self.Config.TrackerMinAge*60)})
-    local response=token:Await(function()
-        local sent,result=pcall(Request,{Url=self.Config.TrackerURL.."/v1/servers",Method="POST",
-            Headers={["Content-Type"]="application/json",["Authorization"]="Bearer "..self.Config.TrackerToken},Body=body})
-        assert(sent and type(result)=="table","Tracker connection failed")
-        return result
-    end,self.Config.TrackerTimeout)
-    local code=tonumber(response.StatusCode or response.Status)
-    if code==401 then return nil,"Tracker key rejected" end
-    if code==503 then return nil,"Tracker warming up or unavailable" end
-    if code~=200 then return nil,"Tracker HTTP "..tostring(code or "unavailable") end
-    if type(response.Body)~="string" or #response.Body>65536 then return nil,"Invalid tracker response" end
-    local decoded,data=pcall(S.HttpService.JSONDecode,S.HttpService,response.Body)
-    if not decoded or type(data)~="table" or data.schema~=1 or data.placeId~=game.PlaceId
-        or data.ageKind~="observed_minimum" or data.stale~=false or type(data.servers)~="table"
-        or #data.servers>100 or not finite(data.generatedAt) or not finite(data.lastScanAt)
-        or math.abs(os.time()-data.generatedAt)>120 or data.lastScanAt>data.generatedAt
-        or data.generatedAt-data.lastScanAt>900 then return nil,"Tracker data is stale or invalid" end
-    local ordered,accepted={},{}
-    local suppressed={}
-    for _,entry in ipairs(data.servers) do
-        if type(entry)=="table" and serverID(entry.id) and self:IsServerExcluded(entry.id) then
-            suppressed[#suppressed+1]=entry.id
+        exclude(game.JobId)
+        for id,untilTime in pairs(self.FailedServers) do if untilTime>os.time() then exclude(id) end end
+        for _,entry in ipairs(self.OldServerBatch and self.OldServerBatch.Entries or {}) do
+            if self:IsServerExcluded(entry.id) then exclude(entry.id) end
         end
-        if type(entry)=="table" and serverID(entry.id) and entry.id~=game.JobId
-            and not accepted[entry.id] and not self:IsServerExcluded(entry.id)
-            and (not self.FailedServers[entry.id] or self.FailedServers[entry.id]<=os.time())
-            and finite(entry.firstSeen) and finite(entry.lastSeen) and entry.firstSeen>0
-            and entry.firstSeen<=entry.lastSeen and entry.lastSeen<=data.generatedAt
-            and data.generatedAt-entry.lastSeen<=self.Config.TrackerFreshness*60
-            and data.generatedAt-entry.firstSeen>=self.Config.TrackerMinAge*60
-            and finite(entry.playing) and finite(entry.maxPlayers)
-            and entry.playing>=0 and entry.playing<entry.maxPlayers then
-            accepted[entry.id]=true table.insert(ordered,entry)
+        -- Suppress returned historical IDs before recent visits. Pagination
+        -- makes the 1250-ID HTTP limit independent of the six-hour history size.
+        for _,id in ipairs(self.TrackerSuppressed or {}) do
+            if self:IsServerExcluded(id) then exclude(id) end
         end
-    end
-    table.sort(ordered,function(a,b)
-        if a.firstSeen~=b.firstSeen then return a.firstSeen<b.firstSeen end
-        if a.lastSeen~=b.lastSeen then return a.lastSeen>b.lastSeen end
-        return a.id<b.id
-    end)
-    local result={}
-    for _,entry in ipairs(ordered) do table.insert(result,entry.id) end
-    if #suppressed>0 then
-        local seenSuppressed={}
-        for _,id in ipairs(suppressed) do seenSuppressed[id]=true end
+        local visits={}
+        for id,stamp in pairs(self:EnsureServerCycle().Visited) do visits[#visits+1]={Id=id,Stamp=stamp} end
+        table.sort(visits,function(a,b) return a.Stamp>b.Stamp end)
+        for _,entry in ipairs(visits) do exclude(entry.Id) end
+        local body=S.HttpService:JSONEncode({placeId=game.PlaceId,exclude=exclusions,limit=100,after=cursor,
+            maxSeenAgeSeconds=math.floor(self.Config.TrackerFreshness*60),
+            minObservedAgeSeconds=math.floor(self.Config.TrackerMinAge*60)})
+        local response=token:Await(function()
+            local sent,result=pcall(Request,{Url=self.Config.TrackerURL.."/v1/servers",Method="POST",
+                Headers={["Content-Type"]="application/json",["Authorization"]="Bearer "..self.Config.TrackerToken},Body=body})
+            assert(sent and type(result)=="table","Tracker connection failed")
+            return result
+        end,math.min(self.Config.TrackerTimeout,math.max(0.1,deadline-os.clock())))
+        local code=tonumber(response.StatusCode or response.Status)
+        if code==401 then return nil,"Tracker key rejected" end
+        if code==503 then return nil,"Tracker warming up or unavailable" end
+        if code~=200 then return nil,"Tracker HTTP "..tostring(code or "unavailable") end
+        if type(response.Body)~="string" or #response.Body>65536 then return nil,"Invalid tracker response" end
+        local decoded,data=pcall(S.HttpService.JSONDecode,S.HttpService,response.Body)
+        if not decoded or type(data)~="table" or data.schema~=1 or data.placeId~=game.PlaceId
+            or data.ageKind~="observed_minimum" or data.stale~=false or type(data.servers)~="table"
+            or #data.servers>100 or not finite(data.generatedAt) or not finite(data.lastScanAt)
+            or math.abs(os.time()-data.generatedAt)>120 or data.lastScanAt>data.generatedAt
+            or data.generatedAt-data.lastScanAt>900 then return nil,"Tracker data is stale or invalid" end
+        local paginated=data.paginationVersion==1
+        local nextCursor=data.nextCursor
+        if paginated and data.hasMore==true then
+            if type(nextCursor)~="table" or not serverID(nextCursor.id) or not finite(nextCursor.firstSeen)
+                or nextCursor.firstSeen<=0 or nextCursor.firstSeen>data.generatedAt
+                or (cursor and nextCursor.firstSeen==cursor.firstSeen and nextCursor.id==cursor.id) then
+                return nil,"Invalid tracker pagination cursor"
+            end
+        else nextCursor=nil end
+        local ordered,accepted,suppressed={},{},{}
+        for _,entry in ipairs(data.servers) do
+            if type(entry)=="table" and serverID(entry.id) and self:IsServerExcluded(entry.id) then
+                suppressed[#suppressed+1]=entry.id
+            end
+            if type(entry)=="table" and serverID(entry.id) and entry.id~=game.JobId
+                and not accepted[entry.id] and not self:IsServerExcluded(entry.id)
+                and (not self.FailedServers[entry.id] or self.FailedServers[entry.id]<=os.time())
+                and finite(entry.firstSeen) and finite(entry.lastSeen) and entry.firstSeen>0
+                and entry.firstSeen<=entry.lastSeen and entry.lastSeen<=data.generatedAt
+                and data.generatedAt-entry.lastSeen<=self.Config.TrackerFreshness*60
+                and data.generatedAt-entry.firstSeen>=self.Config.TrackerMinAge*60
+                and finite(entry.playing) and finite(entry.maxPlayers)
+                and entry.playing>=0 and entry.playing<entry.maxPlayers then
+                accepted[entry.id]=true ordered[#ordered+1]=entry
+            end
+        end
+        local suppressionSet={}
+        for _,id in ipairs(suppressed) do suppressionSet[id]=true end
         for _,id in ipairs(self.TrackerSuppressed or {}) do
             if #suppressed>=1150 then break end
-            if not seenSuppressed[id] then
-                seenSuppressed[id]=true suppressed[#suppressed+1]=id
+            if not suppressionSet[id] and self:IsServerExcluded(id) then
+                suppressionSet[id]=true suppressed[#suppressed+1]=id
             end
         end
         self.TrackerSuppressed=suppressed
+        table.sort(ordered,function(a,b)
+            return a.firstSeen==b.firstSeen and a.id<b.id or a.firstSeen<b.firstSeen
+        end)
+        self.TrackerCursor=nextCursor and {URL=self.Config.TrackerURL,After=nextCursor} or nil
+        self.OldServerBatch={URL=self.Config.TrackerURL,FetchedAt=os.time(),Entries=ordered}
+        local filters=type(data.filters)=="table" and data.filters or {}
+        self.ServerSearchDiagnostic=string.format(
+            "Tracker %s - tracked=%d; stale=%d; full=%d; below minimum age=%d; excluded=%d; eligible=%d; page=%d; more=%s",
+            tostring(data.version or "unknown"),tonumber(data.tracked) or 0,tonumber(filters.stale) or 0,
+            tonumber(filters.full) or 0,tonumber(filters.tooYoung) or 0,tonumber(filters.excluded) or 0,
+            tonumber(data.eligible) or 0,page,tostring(nextCursor~=nil))
+        if #ordered>0 then
+            local result={}
+            for _,entry in ipairs(ordered) do result[#result+1]=entry.id end
+            self.TrackerStatus=string.format("Ready - %d oldest-observed candidates",#result)
+            return result
+        end
+        if paginated and nextCursor then
+            cursor=nextCursor -- Continue immediately past rejected/visited pages.
+        elseif paginated and cursor and not rewound and (tonumber(data.eligible) or 0)>0 then
+            cursor=nil rewound=true -- Pick up refreshed/added records before the bookmark.
+        elseif not paginated and #suppressed>0 and page<4 and #exclusions<1250 then
+            cursor=nil -- Compatibility with Worker 1.0.2, until it is updated.
+        else
+            if not paginated and #suppressed>0 then return nil,"Tracker pagination update required - install Worker 1.0.3" end
+            if (tonumber(filters.tooYoung) or 0)>0 and (tonumber(data.eligible) or 0)==0 then
+                return nil,"No tracked server meets the minimum observed age"
+            end
+            if (tonumber(data.tracked) or 0)>0 and finite(data.freshTracked) and data.freshTracked==0 then
+                return nil,"Tracked servers need a fresh scan"
+            end
+            return nil,"No eligible observed server"
+        end
     end
-    self.OldServerBatch={URL=self.Config.TrackerURL,FetchedAt=os.time(),Entries=ordered}
-    if #result==0 then return nil,"No eligible observed server" end
-    self.TrackerStatus=string.format("Ready - %d candidates - first observed at least %s ago",
-        #result,duration(data.generatedAt-ordered[1].firstSeen))
-    return result
+    return nil,"Continuing oldest-server pagination"
 end
 function H:SearchServers(token)
     token:Check()
@@ -3953,12 +4000,14 @@ function H:SearchServers(token)
     self.TrackerStatus=trackerResult[1] and (trackerResult[3] or "No eligible tracked server")
         or "Tracker request failed or timed out"
     self.TrackerFailures=math.min((self.TrackerFailures or 0)+1,5)
-    local retry=self.TrackerStatus=="No eligible observed server" and 15
+    local retry=self.TrackerStatus=="Continuing oldest-server pagination" and 1
+        or self.TrackerStatus=="No eligible observed server" and 15
         or math.min(self.Config.TrackerBackoff,5*2^(self.TrackerFailures-1))
     if self.TrackerStatus=="Tracker key rejected" or self.TrackerStatus=="Tracker key missing or invalid"
         or self.TrackerStatus=="Invalid Worker URL" then retry=self.Config.TrackerBackoff end
     self.TrackerRetryAt=os.clock()+retry
-    if not self.TrackerFallbackLogged then
+    if not self.TrackerFallbackLogged or self.LastTrackerWarning~=self.TrackerStatus then
+        self.LastTrackerWarning=self.TrackerStatus
         self:Log(self.TrackerStatus..(self.Config.TrackerAllowFallback and " - using standard search" or " - oldest-server search will retry"),"WARNING")
         self.TrackerFallbackLogged=true
     end
@@ -4788,7 +4837,7 @@ local function apply(key,newValue,control)
     if key=="BotKey" or key=="BotURL" then H.BotCommandVersion=0 H.BotWake=true end
     if key:sub(1,7)=="Tracker" then
         H.TrackerRetryAt=nil H.TrackerFallbackLogged=false H.TrackerFailures=0
-        H.OldServerBatch=nil H.TrackerSuppressed=nil
+        H.OldServerBatch=nil H.TrackerSuppressed=nil H.TrackerCursor=nil
         H.ServerSearchRevision=(H.ServerSearchRevision or 0)+1
     end
     if controls.ScanWait then controls.ScanWait:Set(tostring(candidate.ScanWait),true) end
@@ -4878,7 +4927,7 @@ textSetting(performance,"Maximum server pages","PublicPageLimit",true)
 performance:Button({Title="Clear search cache",Callback=function()
     if H.Busy then H:Log("Stop the hunt before clearing search cache","WARNING") return end
     H.ServerCandidateCache=nil H.ServerPrefetch=nil
-    H.OldServerBatch=nil H.TrackerSuppressed=nil H.TrackerRetryAt=nil
+    H.OldServerBatch=nil H.TrackerSuppressed=nil H.TrackerCursor=nil H.TrackerRetryAt=nil
     H.ServerSearchRevision=(H.ServerSearchRevision or 0)+1
     H.PublicCursor=nil H.PublicCursorUntil=nil
     H:Persist(false)
