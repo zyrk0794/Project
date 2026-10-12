@@ -1,9 +1,12 @@
 --[[
-    Midnight Spooky Hunter 1.14.0 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.14.1 - Lumber Tycoon 2
     October 12, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.14.1: lag-tolerant ignition window, latched transient fire detection,
+    bounded replication grace and immediate contact stop after ignition.
 
     1.14.0: integrates the user-validated Midnight Modwood Trial sequence;
     event-invalidated tree index, preparation pipeline and precomputed approaches.
@@ -137,7 +140,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.14.0", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.14.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -3096,6 +3099,9 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             string.format("Sections: root=%s; burn=%s; retained=%s",tostring(state.RootID),tostring(state.ParentID),tostring(state.LeafID)),
             string.format("Touch pairs=%d; fire=%s; detached=%s; feed pulses=%d; root strikes=%d",
                 state.TouchPairs,tostring(state.IgnitionObserved==true),tostring(state.ParentSeparated==true),state.FeedFrames,state.Strikes or 0),
+            string.format("Ignition: elapsed=%.2fs; budget=%.2fs; grace=%.2fs; RTT=%.2fs; target changed=%s",
+                state.IgnitionSeconds or 0,state.IgnitionBudget or 0,state.IgnitionGrace or 0,
+                state.IgnitionRTT or 0,tostring(state.IgnitionTargetChanged==true)),
             "Control: "..(state.NetworkStatus or "Not checked"),
             "Elapsed: "..string.format("%.2fs",os.clock()-(state.Started or os.clock()))},"\n")
     end
@@ -3157,19 +3163,57 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local extentY=math.abs(future.RightVector.Y)*size.X/2+math.abs(future.UpVector.Y)*size.Y/2+math.abs(future.LookVector.Y)*size.Z/2
     target=target+Vector3.new(0,math.max(0,lava.Position.Y+6-(future.Position.Y-extentY)),0)
     state.BurnTarget=target
-    local observing=true
-    local fireConnection=parent.DescendantAdded:Connect(function(child)
-        if observing and child.Name=="LavaFire" then state.IgnitionObserved=true state.Phase="Ignited" end
-    end)
-    token:Finally(function() observing=false fireConnection:Disconnect() end)
+    local observing,contactActive,endContact=true,false,nil
+    local fireNames,fireConnections={},{}
     assert(not parent:FindFirstChild("LavaFire",true),"Burn parent was already ignited before this attempt")
+    local function observeFire(child)
+        if not observing or state.IgnitionObserved or child.Name~="LavaFire" then return end
+        state.IgnitionObserved=true state.IgnitionAt=os.clock() state.Phase="Ignited"
+        -- Latch before releasing: the effect may disappear in the same frame.
+        if endContact and contactActive then
+            local ok,released=pcall(endContact)
+            if not ok or not released then state.ContactReleasePending=true end
+        end
+    end
+    local function watchFire(child)
+        observeFire(child)
+        if not observing or state.IgnitionObserved or fireNames[child] then return end
+        -- Some clients replicate the instance before its final name.
+        fireNames[child]=child:GetPropertyChangedSignal("Name"):Connect(function() observeFire(child) end)
+    end
+    fireConnections[1]=parent.DescendantAdded:Connect(watchFire)
+    fireConnections[2]=parent.DescendantRemoving:Connect(function(child)
+        observeFire(child)
+        if fireNames[child] then fireNames[child]:Disconnect() fireNames[child]=nil end
+    end)
+    for _,child in ipairs(parent:GetDescendants()) do watchFire(child) end
+    local function stopFireObservation()
+        observing=false
+        for _,connection in ipairs(fireConnections) do connection:Disconnect() end
+        for child,connection in pairs(fireNames) do connection:Disconnect() fireNames[child]=nil end
+    end
+    token:Finally(stopFireObservation)
+    local function fireConfirmed()
+        if state.IgnitionObserved then return true end
+        local effect=parent:FindFirstChild("LavaFire",true)
+        if effect then observeFire(effect) end
+        return state.IgnitionObserved==true
+    end
     local tool,stats=self:EnsureAxe(state.Kind,token)
     -- One bounded synchronization, with observable stage results as the authority.
     placeAvatar(CFrame.new(root.Position+Vector3.new(5,3,0)))
     local ping=S.ReplicatedStorage:FindFirstChild("TestPing")
     local replied,worker=false,nil
     if ping and ping:IsA("RemoteFunction") then
-        worker=task.spawn(function() local ok=pcall(ping.InvokeServer,ping) replied=ok end)
+        worker=task.spawn(function()
+            local started=os.clock()
+            local ok=pcall(ping.InvokeServer,ping)
+            if ok then
+                state.SyncRTT=os.clock()-started
+                self:ObserveLatency(state.SyncRTT)
+            end
+            replied=ok
+        end)
     end
     local function stopPing() if worker and coroutine.status(worker)~="dead" then pcall(task.cancel,worker) end end
     token:Finally(stopPing)
@@ -3190,29 +3234,79 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     for part in pairs(collisions) do if livePart(part) then part.CanCollide=false end end
     self:SetStage("Modwood - igniting selected section",0.52)
     placeAvatar(CFrame.new(target.Position+Vector3.new(8,12,0)))
-    local contactActive=false
-    local function endContact()
+    endContact=function()
         if not contactActive then return true end
-        contactActive=false return self:TouchWoodLava(touch,parent,lava,false)
+        local ok,reason=self:TouchWoodLava(touch,parent,lava,false)
+        if ok then contactActive=false state.ContactReleasePending=nil end
+        return ok,reason
     end
-    token:Finally(endContact)
-    local deadline=os.clock()+math.min(self.Config.BurnTimeout,8)
-    repeat
+    token:Finally(function()
+        local ok=endContact()
+        if not ok then endContact() end
+    end)
+    local rtt=math.clamp(math.max(self.ServerRTT or 0,state.SyncRTT or 0),0,15)
+    local ignitionStart=os.clock()
+    local ignitionBudget=math.clamp(self.Config.BurnTimeout+math.max(0,rtt-0.12)*6,10,120)
+    local deadline=ignitionStart+ignitionBudget
+    state.IgnitionBudget=ignitionBudget state.IgnitionRTT=rtt
+    local holdSeconds=math.clamp(0.035+rtt*0.04,0.035,0.15)
+    local pulseInterval=math.clamp(0.18+rtt*0.25,0.18,0.85)
+    local loggedSlow=false
+    while not fireConfirmed() and os.clock()<deadline do
         checkMill()
-        assert(livePart(parent) and under(parent,log) and owned(log),"Burn target changed before ignition")
-        moveModel(parent,target) drag:FireServer(log)
+        -- Recheck before every movement and contact. A delayed event received
+        -- during a wait must never cause another full-tree lava transfer.
+        if fireConfirmed() then break end
+        if not livePart(parent) or not under(parent,log) then
+            state.IgnitionTargetChanged=true break
+        end
+        assert(owned(log),"Burn target ownership changed before ignition")
+        assert(livePart(lava) and lava.CanTouch and lava:FindFirstChildWhichIsA("TouchTransmitter"),
+            "Recorded lava touch handler became unavailable")
+        moveModel(parent,target)
+        if fireConfirmed() then break end
+        drag:FireServer(log)
+        if fireConfirmed() then break end
         contactActive=true
         local pressed,problem=self:TouchWoodLava(touch,parent,lava,true)
-        token:Sleep(0.035)
+        local contactUntil=os.clock()+holdSeconds
+        while not fireConfirmed() and os.clock()<contactUntil do token:Sleep(0.015) end
         local released,releaseProblem=endContact()
+        if not released then released,releaseProblem=endContact() end
         assert(pressed and released,"Lava contact failed - "..tostring(problem or releaseProblem))
         state.TouchPairs=state.TouchPairs+1
-        if parent:FindFirstChild("LavaFire",true) then state.IgnitionObserved=true end
-        if state.IgnitionObserved then break end
-        token:Sleep(0.18)
-    until os.clock()>=deadline
-    assert(state.IgnitionObserved,"No LavaFire observed on the selected burn section")
-    endContact() observing=false fireConnection:Disconnect()
+        if fireConfirmed() then break end
+        if not loggedSlow and os.clock()-ignitionStart>=8 then
+            loggedSlow=true
+            self:Log("Ignition response delayed - holding the same target above lava","DEBUG")
+        end
+        local nextPulse=math.min(deadline,os.clock()+pulseInterval)
+        while not fireConfirmed() and os.clock()<nextPulse do token:Sleep(0.03) end
+    end
+    endContact()
+    if not fireConfirmed() then
+        -- Stop generating contacts while late server replication is arriving.
+        -- Keep the observer and avatar support alive; never infer fire from a ping.
+        local grace=math.clamp(1.5+rtt*3,1.5,10)
+        local graceUntil=os.clock()+grace
+        state.IgnitionGrace=grace
+        while not fireConfirmed() and os.clock()<graceUntil do
+            checkMill()
+            assert(owned(log),"Wood ownership changed while awaiting ignition")
+            if livePart(parent) and under(parent,log) then
+                if (parent.Position-target.Position).Magnitude>1.5 then moveModel(parent,target) end
+                drag:FireServer(log)
+            end
+            token:Sleep(0.12)
+        end
+    end
+    state.IgnitionSeconds=os.clock()-ignitionStart
+    assert(fireConfirmed(),string.format(
+        "Ignition not confirmed after %.1fs - %d contacts, RTT %.2fs; no second Modwood attempt",
+        state.IgnitionSeconds,state.TouchPairs,rtt))
+    local released,releaseProblem=endContact()
+    assert(released,"Lava contact release failed - "..tostring(releaseProblem))
+    stopFireObservation()
     local fire=parent:FindFirstChild("LavaFire",true)
     if fire then fire:Destroy() end
     snapshot("Ignition confirmed") self:UpdateHarvestProgress(0.50)
@@ -3222,9 +3316,10 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     moveModel(root,state.WorkFrame)
     restoreCollisions()
     self:WaitResult(token,function() return not connected(parent,root) and not connected(parent,leaf) end,
-        3,"Burned section is still connected - disposal blocked",0.05)
+        math.clamp(math.max(3,1+rtt*4,(state.IgnitionSeconds or 0)*0.5),3,20),
+        "Burned section is still connected - disposal blocked",0.05)
     self:SetStage("Modwood - removing detached section",0.60)
-    deadline=os.clock()+7
+    deadline=os.clock()+math.clamp(math.max(7,3+rtt*4,(state.IgnitionSeconds or 0)*0.5),7,30)
     while livePart(parent) and under(parent,log) do
         checkMill()
         assert(not connected(parent,root) and not connected(parent,leaf),"Burned section reconnected")
