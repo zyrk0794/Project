@@ -1,9 +1,12 @@
 --[[
-    Midnight Spooky Hunter 1.14.3 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.14.4 - Lumber Tycoon 2
     October 13, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.14.4: single ignition-position controller, timed stability recovery,
+    spaced corrections and contact gating; target-owner evidence in reports.
 
     1.14.3: 60 studs3 minimum; dry-area, selected-section synthetic ignition;
     bounded touch pulses, foreign-owner/fire guards and base-aligned root cuts.
@@ -147,7 +150,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.14.3", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.14.4", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -810,19 +813,23 @@ function H:WaitResult(token,predicate,timeout,message,interval)
 end
 function H:CheckTargetOwner(entry)
     if not entry then return end
-    local models={}
-    if entry.Model then models[entry.Model]=true end
+    local target=entry.Model
+    -- Follow the original trunk when it becomes a loose log. An old standing
+    -- tree or a higher ancestor is not the owner of the newly moved section.
     local current=entry.Trunk and entry.Trunk.Parent
     while current and current~=S.Workspace do
-        if current:FindFirstChild("TreeClass") then models[current]=true end
+        if current:FindFirstChild("TreeClass") then target=current break end
         current=current.Parent
     end
-    for model in pairs(models) do
-        local owner=self:TreeOwner(model)
-        if owner and owner~=Player then
-            self.ServerExitReason="Target claimed by another player - "..owner.Name
-            error(self.ServerExitReason,0)
-        end
+    local owner,field=self:TreeOwner(target)
+    if owner and owner~=Player then
+        local path=field and field:GetFullName() or "Owner field unavailable"
+        self.TargetOwnerDiagnostic=string.format("Target: %s\nOwner field: %s\nOwner: %s (%s)\nStage: %s",
+            target and target:GetFullName() or "Unavailable",path,owner.Name,
+            owner:IsA("Player") and tostring(owner.UserId) or "unknown",tostring(self.Stage))
+        self.ServerExitReason="Target claimed by another player - "..owner.Name
+        self:Log("Target unavailable - "..path.." = "..owner.Name,"DEBUG")
+        error(self.ServerExitReason,0)
     end
 end
 function H:Token(parent)
@@ -2626,6 +2633,7 @@ function H:BuildReport()
         table.insert(lines,"Growth owner path: "..tostring(self.Growth.OwnerPath).."\nOwner value: "..tostring(self.Growth.OwnerValue)
             .."\nLastInteraction: "..tostring(self.Growth.LastInteraction).."\nInverseAxe requests: "..tostring(self.Growth.Hits))
     end
+    if self.TargetOwnerDiagnostic then table.insert(lines,"Target ownership evidence\n"..self.TargetOwnerDiagnostic) end
     if self.LastFailure then
         table.insert(lines,"Failure code: "..(self.LastFailure.Code or "Unavailable")
             .."\nLast confirmed: "..(self.LastFailure.LastConfirmed or "Unavailable")
@@ -2986,15 +2994,26 @@ function H:MarkModwood(root,leaf,parent,token)
     end)
 end
 
-function H:HoldIgnitionWood(log,parent,token,state)
-    local pivot=log:GetPivot()
+function H:HoldIgnitionWood(log,parent,token,state,followAvatar)
+    local target=parent.CFrame
     local parentContainer=parent.Parent
     local active,connection=true,nil
-    local corrections,nextDrag=0,0
+    local corrections,nextDrag,nextSample,nextCorrection,nextFollow=0,0,0,0,0
+    local stableSince,unstableSince,lastPosition=nil,os.clock(),parent.Position
     local drag=self:Remote("Interaction","ClientIsDragging")
+    local networkOwner=cap("isnetworkowner",isnetworkowner)
+    local rtt=math.clamp(math.max(self.ServerRTT or 0,state.SyncRTT or 0),0,15)
+    local correctionInterval=math.clamp(0.35+rtt*0.5,0.35,2)
+    local settlingTime=math.clamp(0.35+rtt*0.5,0.35,1.5)
+    local instabilityBudget=math.clamp(10+rtt*4,10,35)
+    local parts={}
+    for _,part in ipairs(log:GetDescendants()) do
+        if part:IsA("BasePart") then parts[#parts+1]=part end
+    end
+    state.HoldReady=false state.HoldDrift=0 state.HoldPhysics="Unknown"
     local function release()
         if not active then return end
-        active=false
+        active=false state.HoldReady=false
         if connection then connection:Disconnect() connection=nil end
     end
     token:Finally(release)
@@ -3005,24 +3024,67 @@ function H:HoldIgnitionWood(log,parent,token,state)
             or state.ParentSeparated or state.IgnitionObserved then release() return end
         local ok,reason=pcall(function()
             assert(owned(log) and under(parent,log),"Wood ownership changed during ignition")
+            -- One controller owns all pre-ignition corrections. Do not anchor server wood.
+            for _,part in ipairs(parts) do
+                if livePart(part) and under(part,log) and not part.Anchored then
+                    part.AssemblyLinearVelocity=Vector3.zero
+                    part.AssemblyAngularVelocity=Vector3.zero
+                end
+            end
+            local now=os.clock()
+            if now>=nextDrag then drag:FireServer(log) nextDrag=now+0.25 end
+            if now<nextSample then return end
+            nextSample=now+0.1
             local bounds,size=log:GetBoundingBox()
             assert(self:ClearOfLava(bounds.Position,size.Magnitude*0.5+4),"Wood approached physical lava during ignition")
-            local drift=(log:GetPivot().Position-pivot.Position).Magnitude
-            if drift>1.5 then
-                corrections=corrections+1
-                assert(corrections<=3,"Wood repeatedly moved away during ignition")
-                log:PivotTo(pivot)
-                state.IgnitionCorrections=corrections
+            local physics
+            if networkOwner then
+                local checked,result=pcall(networkOwner,parent)
+                if checked and type(result)=="boolean" then physics=result end
             end
-            self:DampWood(log)
-            if os.clock()>=nextDrag then drag:FireServer(log) nextDrag=os.clock()+0.25 end
+            state.HoldPhysics=physics==true and "Confirmed" or physics==false and "Reacquiring" or "Unavailable"
+            local current=parent.CFrame
+            local drift=(current.Position-target.Position).Magnitude
+            local movement=(current.Position-lastPosition).Magnitude
+            lastPosition=current.Position
+            local _,angle=target:ToObjectSpace(current):ToAxisAngle()
+            state.HoldDrift=drift state.HoldMovement=movement
+            if followAvatar and now>=nextFollow then
+                nextFollow=now+0.4
+                followAvatar(parent)
+            end
+            local settled=drift<=1.5 and math.abs(angle)<=math.rad(8) and movement<=0.6 and physics~=false
+            if settled then
+                stableSince=stableSince or now
+                state.HoldReady=now-stableSince>=settlingTime
+                if state.HoldReady then unstableSince=nil end
+            else
+                stableSince=nil state.HoldReady=false
+                unstableSince=unstableSince or now
+                -- Do not fight a remote physics owner every frame. Retry a position
+                -- correction only after a replication interval, then observe again.
+                if physics~=false and now>=nextCorrection and (drift>1.5 or math.abs(angle)>math.rad(8)) then
+                    if followAvatar then followAvatar(parent,target) end
+                    local delta=target*current:Inverse()
+                    log:PivotTo(delta*log:GetPivot())
+                    corrections=corrections+1 state.IgnitionCorrections=corrections
+                    nextCorrection=now+correctionInterval
+                end
+            end
+            state.HoldUnstableSeconds=unstableSince and now-unstableSince or 0
+            assert(state.HoldUnstableSeconds<instabilityBudget,string.format(
+                "Wood did not settle for %.1fs - drift %.2f studs, physics %s",
+                state.HoldUnstableSeconds,drift,state.HoldPhysics))
         end)
         if not ok then
             token.ModwoodFailure="Modwood - "..cleanError(reason)
             release()
         end
     end)
-    return release
+    local function ready()
+        return active and state.HoldReady==true and not token.ModwoodFailure
+    end
+    return release,ready
 end
 
 function H:Modwood(log, mill, inlet, token, checkpoint)
@@ -3094,7 +3156,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local lava=self:FindLava(token)
     local originalPrimary=log.PrimaryPart
     local character,humanoid,avatar=self:Character()
-    local state={Phase="Prepared",SourceRevision="Hunter-1.14.3-dry-area-ignition",Log=log,Mill=mill,Inlet=inlet,
+    local state={Phase="Prepared",SourceRevision="Hunter-1.14.4-stable-dry-ignition",Log=log,Mill=mill,Inlet=inlet,
         Root=root,Leaf=leaf,Parent=parent,ParentContainer=parent.Parent,Kind=value(log,"TreeClass"),
         InputVolume=inputVolume,IgnitionMode="Synthetic only - dry work area",OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
         LavaPath=lava:GetFullName(),IgnitionCorrections=0,RootID=value(root,"ID"),LeafID=value(leaf,"ID"),ParentID=value(parent,"ID")}
@@ -3128,6 +3190,9 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
                 state.IgnitionSeconds or 0,state.IgnitionBudget or 0,state.IgnitionGrace or 0,
                 state.IgnitionRTT or 0,tostring(state.IgnitionTargetChanged==true)),
             "Control: "..(state.NetworkStatus or "Not checked"),
+            string.format("Hold: ready=%s; physics=%s; drift=%.2f; movement=%.2f; corrections=%d; unstable=%.2fs",
+                tostring(state.HoldReady),state.HoldPhysics or "Unknown",state.HoldDrift or 0,
+                state.HoldMovement or 0,state.IgnitionCorrections or 0,state.HoldUnstableSeconds or 0),
             string.format("Root cut distance: %.2f; touch cap: %d",state.CutDistance or 0,state.MaxTouchPairs or 0),
             "Elapsed: "..string.format("%.2fs",os.clock()-(state.Started or os.clock()))},"\n")
     end
@@ -3318,7 +3383,12 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local target=parent.CFrame
     state.BurnTarget=target
     placeAvatar(CFrame.new(parent.Position+Vector3.new(5,3,0)))
-    local releaseHold=self:HoldIgnitionWood(log,parent,token,state)
+    local releaseHold,ignitionReady=self:HoldIgnitionWood(log,parent,token,state,function(section,destination)
+        local point=destination and destination.Position or section.Position
+        if livePart(section) and (avatar.Position-point).Magnitude>9 then
+            placeAvatar(CFrame.new(point+Vector3.new(5,3,0)))
+        end
+    end)
     endContact=function()
         if not contactActive then return true end
         local ok,reason=self:TouchWoodLava(touch,parent,lava,false)
@@ -3352,14 +3422,17 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             "Recorded lava touch handler became unavailable")
         local currentBounds,currentSize=log:GetBoundingBox()
         assert(self:ClearOfLava(currentBounds.Position,currentSize.Magnitude*0.5+4),"Physical lava proximity detected - synthetic contact blocked")
-        if (parent.Position-target.Position).Magnitude>1.5 then moveModel(parent,target) end
-        if fireConfirmed() then break end
-        drag:FireServer(log)
-        if fireConfirmed() then break end
+        while not ignitionReady() and not fireConfirmed() and os.clock()<deadline do
+            checkMill()
+            token:Sleep(0.05)
+        end
+        if fireConfirmed() or os.clock()>=deadline then break end
+        checkMill()
+        if not ignitionReady() then continue end
         contactActive=true
         local pressed,problem=self:TouchWoodLava(touch,parent,lava,true)
         local contactUntil=os.clock()+holdSeconds
-        while not fireConfirmed() and os.clock()<contactUntil do token:Sleep(0.015) end
+        while not fireConfirmed() and ignitionReady() and os.clock()<contactUntil do token:Sleep(0.015) end
         local released,releaseProblem=endContact()
         if not released then released,releaseProblem=endContact() end
         assert(pressed and released,"Lava contact failed - "..tostring(problem or releaseProblem))
@@ -3382,10 +3455,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         while not fireConfirmed() and os.clock()<graceUntil do
             checkMill()
             assert(owned(log),"Wood ownership changed while awaiting ignition")
-            if livePart(parent) and under(parent,log) then
-                if (parent.Position-target.Position).Magnitude>1.5 then moveModel(parent,target) end
-                drag:FireServer(log)
-            end
+            -- The position controller continues alone while late fire events arrive.
+            -- Never add a second pivot writer here.
             token:Sleep(0.12)
         end
     end
