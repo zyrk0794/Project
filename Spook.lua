@@ -1,9 +1,12 @@
 --[[
-    Midnight Spooky Hunter 1.14.4 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.14.5 - Lumber Tycoon 2
     October 13, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.14.5: live target validation, bounded event-cache lifetime, stale task
+    pruning, persistent retry budgets and progress-aware recovery backoff.
 
     1.14.4: single ignition-position controller, timed stability recovery,
     spaced corrections and contact gating; target-owner evidence in reports.
@@ -43,7 +46,7 @@
     10. Handle full servers quickly and throttle flooded teleports.
     11. Sample latency without blocking world readiness.
     12. Budget initial tree indexing by elapsed CPU time.
-    13. Reuse standing-tree enumeration for at most 0.15 seconds.
+    13. Reuse standing-tree enumeration for at most 0.5 seconds.
     14. Do not restart scan stability just because wood is growing.
     15. Update scan cards only when their displayed data changes.
     16. Validate and reuse remote, plot, sawmill and axe-stat caches.
@@ -150,7 +153,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.14.4", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.14.5", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -543,7 +546,8 @@ local stageTitles = {
     ["Modwood - triggering conversion"]="Processing wood",
     ["Modwood - waiting for sawmill output"]="Waiting for planks",
     ["Finding another server"]="Finding a server", ["Joining another server"]="Joining server",
-    ["Resuming unfinished wood"]="Resuming harvest",
+    ["Resuming unfinished wood"]="Recovering harvest",
+    ["Checking remaining wood"]="Checking wood",
 }
 local function shortError(message)
     message=cleanError(message)
@@ -598,10 +602,15 @@ function H:RenderProgress(detail)
         caption=string.format("Tree %d / %d",current.Index,#batch.Items)
         if current.Detail and current.Detail~="" then caption=caption.." - "..current.Detail end
     end
-    self.UI.Progress:SetText(stageTitles[self.Stage] or uiText(self.Stage),caption)
+    local title=stageTitles[self.Stage] or uiText(self.Stage)
+    local signature=table.concat({title,caption,tostring(travelStages[self.Stage]==true),string.format("%.3f",self.Progress)},"|")
+    if self.LastProgressRender==signature then return end
+    self.LastProgressRender=signature
+    self.UI.Progress:SetText(title,caption)
     if travelStages[self.Stage] then
         self.UI.Progress:SetIndeterminate(true)
     else
+        self.UI.Progress:SetIndeterminate(false)
         self.UI.Progress:Set(self.Progress*100,true)
     end
 end
@@ -788,8 +797,9 @@ function H:Checkpoint(key)
 end
 function H:ObserveProgress()
     for _,work in ipairs(self.PendingWood) do
-        local prefix=tostring(work)
-        if work.Log then self:Checkpoint(prefix..":felled") end
+        if type(work)=="table" then
+            local prefix=tostring(work)
+        if work.Log and under(work.Log,S.Workspace) and owned(work.Log) then self:Checkpoint(prefix..":felled") end
         if work.AtBase then self:Checkpoint(prefix..":base") end
         if work.Modwood then self:Checkpoint(prefix..":modwood:"..work.Modwood.Phase) end
         if work.Classic then
@@ -799,6 +809,7 @@ function H:ObserveProgress()
             end
         end
         for plank in pairs(work.Delivered or {}) do self:Checkpoint(prefix..":delivered:"..tostring(plank)) end
+        end
     end
 end
 function H:WaitResult(token,predicate,timeout,message,interval)
@@ -920,8 +931,10 @@ function H:IsStandingTree(model)
         local excluded=S.Workspace:FindFirstChild(name)
         if excluded and under(model,excluded) then return false end
     end
+    local field=model:FindFirstChild("TreeClass")
     local trunk=self:TreeTrunk(model)
-    return trunk~=nil and trunk.Anchored and model:FindFirstChild("CutEvent")~=nil
+    return field~=nil and field:IsA("StringValue") and livePart(trunk)
+        and trunk.Anchored and trunk.Size.Y>0 and model:FindFirstChild("CutEvent")~=nil
 end
 function H:EnsureTreeIndex(token)
     if self.TreeIndexReady then return end
@@ -941,10 +954,11 @@ function H:EnsureTreeIndex(token)
             self.TreeWatchers[model]=nil self.TreeIndex[model]=nil
             invalidate()
         end
+        self.RemoveTreeIndex=remove
         local function add(object)
             if object.Name~="TreeClass" or not object:IsA("StringValue") then return end
             local model=object.Parent
-            if not model or not model:IsA("Model") or self.TreeIndex[model]==object then return end
+            if not model or not model:IsA("Model") or not under(model,S.Workspace) or self.TreeIndex[model]==object then return end
             if self.TreeWatchers[model] then remove(model) end
             self.TreeIndex[model]=object
             local record={Connections={},Parts={},Metadata={},Volume=nil}
@@ -954,7 +968,7 @@ function H:EnsureTreeIndex(token)
                 record.Connections[#record.Connections+1]=signal:Connect(callback)
             end
             local function watchPart(part)
-                if part:IsA("ValueBase") and (part.Name=="ID" or part.Name=="ParentID") and not record.Metadata[part] then
+                if part:IsA("ValueBase") and (part.Name=="ID" or part.Name=="ParentID" or part.Name=="Owner") and not record.Metadata[part] then
                     record.Metadata[part]=part:GetPropertyChangedSignal("Value"):Connect(dirty)
                 end
                 if part:IsA("BasePart") and part.Name=="WoodSection" and not record.Parts[part] then
@@ -965,10 +979,18 @@ function H:EnsureTreeIndex(token)
                 end
             end
             connect(object:GetPropertyChangedSignal("Value"),dirty)
-            connect(model.AncestryChanged,invalidate)
+            connect(model.AncestryChanged,function()
+                if not under(model,S.Workspace) then remove(model) else invalidate() end
+            end)
+            connect(object.AncestryChanged,function()
+                if object.Parent~=model and self.TreeIndex[model]==object then remove(model) end
+            end)
+            connect(object:GetPropertyChangedSignal("Name"),function()
+                if object.Name~="TreeClass" then remove(model) end
+            end)
             connect(model.DescendantAdded,function(child)
                 watchPart(child)
-                if child.Name=="WoodSection" or child.Name=="ID" or child.Name=="CutEvent" or child.Name=="RootCut" then dirty() end
+                if child.Name=="WoodSection" or child.Name=="ID" or child.Name=="Owner" or child.Name=="CutEvent" or child.Name=="RootCut" then dirty() end
             end)
             connect(model.DescendantRemoving,function(child)
                 if record.Metadata[child] then record.Metadata[child]:Disconnect() record.Metadata[child]=nil end
@@ -976,7 +998,7 @@ function H:EnsureTreeIndex(token)
                     for _,connection in ipairs(record.Parts[child]) do connection:Disconnect() end
                     record.Parts[child]=nil
                 end
-                if child.Name=="WoodSection" or child.Name=="ID" or child.Name=="CutEvent" or child.Name=="RootCut" then dirty() end
+                if child.Name=="WoodSection" or child.Name=="ID" or child.Name=="Owner" or child.Name=="CutEvent" or child.Name=="RootCut" then dirty() end
             end)
             for _,part in ipairs(model:GetDescendants()) do watchPart(part) end
             dirty()
@@ -997,13 +1019,13 @@ end
 function H:StandingTrees(token)
     self:EnsureTreeIndex(token)
     local cached=self.StandingCache
-    if cached then
+    if cached and os.clock()-cached.At<0.5 then
         return cached.Models,cached.Regions
     end
     local models,regions,seen={},{},{}
     for model,field in pairs(self.TreeIndex) do
-        if not under(model,S.Workspace) or field.Parent~=model then
-            self.TreeIndex[model]=nil
+        if not under(model,S.Workspace) or field.Parent~=model or field.Name~="TreeClass" then
+            self.RemoveTreeIndex(model)
         elseif self:IsStandingTree(model) then
             local _,root=self:TreeContext(model)
             -- Do not count an inherited branch again as a separate tree.
@@ -1578,17 +1600,18 @@ function H:Scan(token)
     local trees
     trees,regions=self:StandingTrees(token)
     ready=#trees
-    snapshot=self.StandingCache.Snapshot
-    for _,model in ipairs(self.StandingCache.Rare) do
+    local cache=self.StandingCache
+    snapshot=cache.Snapshot
+    for _,model in ipairs(cache.Rare) do
         local kind=value(model,"TreeClass")
         local ownerField=self:TreeContext(model)
-        if self:WantsTree(kind) and ownerField
+        if self:IsStandingTree(model) and self:WantsTree(kind) and ownerField
             and (ownerField.Value==nil or (model==self.GrowthTarget and ownerField.Value==Player)) then
             local record=self.TreeWatchers[model]
             local volume=record and record.Volume
-            if not volume then
+            if not volume or os.clock()-(record and record.VolumeAt or 0)>0.5 then
                 volume=self:WoodVolume(model)
-                if record then record.Volume=volume end
+                if record then record.Volume=volume record.VolumeAt=os.clock() end
             end
             local trunk=self:TreeTrunk(model)
             if not self:EligibleVolume(kind,volume) then counts.IgnoredSmall=counts.IgnoredSmall+1 end
@@ -1641,8 +1664,13 @@ function H:ScanReady(token)
             if regions > 0 and ready > 0 and os.clock() - stableSince >= self:AdaptiveWait(#matches > 0 and self.Config.ScanSettle or self.Config.EmptyScanDelay,5) then
                 self:Log(string.format("Scan complete - %.2fs / %d trees checked", os.clock()-started, ready),"DEBUG")
                 if self.Counts.IgnoredSmall>0 then self:Log("Trees below "..MIN_TREE_VOLUME.." studs3 ignored - "..self.Counts.IgnoredSmall,"DEBUG") end
-                self:RecordScan(#matches)
-                return matches
+                local verified=self:VerifyTargets(matches)
+                if #verified~=#matches then
+                    previous=nil stableSince=os.clock()
+                else
+                    self:RecordScan(#verified)
+                    return verified
+                end
             end
         else stableSince = os.clock() end
         assert(os.clock()-started < self.Config.ScanWait, "World scan did not stabilize - staying in this server")
@@ -1650,6 +1678,10 @@ function H:ScanReady(token)
     until false
 end
 function H:FindFelledLog(cut)
+    if type(cut)~="table" or typeof(cut.Tree)~="Instance" or typeof(cut.Trunk)~="Instance"
+        or typeof(cut.Origin)~="Vector3" then return nil end
+    cut.Previous=cut.Previous or {}
+    cut.Radius=finite(cut.Radius) and cut.Radius or 80
     local logs=S.Workspace:FindFirstChild("LogModels")
     local matches, identities={},{}
     local candidates=logs and logs:GetChildren() or {}
@@ -1754,6 +1786,10 @@ function H:LocalStep(work,label,token,callback)
     for attempt=1,2 do
         token:Check()
         work.Step=label
+        if (work.LocalAttempts[label] or 0)>=4 then
+            self.ServerExitReason="Recovery budget exhausted - "..label
+            error(self.ServerExitReason,0)
+        end
         work.LocalAttempts[label]=(work.LocalAttempts[label] or 0)+1
         local scope=self:Token(token)
         local result=table.pack(pcall(callback,scope))
@@ -2204,7 +2240,7 @@ function H:Chop(entry, tool, stats, token, checkpoint)
     local logs=S.Workspace:FindFirstChild("LogModels") assert(logs,"LogModels missing")
     local cut=checkpoint and checkpoint.Cut
     if not cut then
-        assert(tree.Parent and trunk.Parent and (self:TreeOwner(tree)==nil or (entry.GrowthClaimed and self:TreeOwner(tree)==Player)),"The selected tree is no longer available")
+        assert(self:IsStandingTree(tree) and livePart(trunk) and under(trunk,tree) and (self:TreeOwner(tree)==nil or (entry.GrowthClaimed and self:TreeOwner(tree)==Player)),"The selected tree is no longer available")
         cut={Tree=tree,Trunk=trunk,Kind=entry.Kind,Origin=trunk.Position,Radius=math.max(80,trunk.Size.Y),
             Previous={},Strikes=0,Started=os.clock()}
         for _, model in ipairs(logs:GetChildren()) do cut.Previous[model]=true end
@@ -2606,6 +2642,9 @@ function H:BuildReport()
         self.Stats.StandardFinds,self.Stats.StandardScans,tostring(self.Config.AdaptiveTiming),
         self.ServerRTT and string.format("%.3fs",self.ServerRTT) or "Not measured"))
     table.insert(lines,"Targets: "..self.Config.TargetSpecies.."; growth: "..tostring(self.Config.GrowSinister).."; auto rejoin: "..tostring(self.Config.AutoRejoin))
+    table.insert(lines,string.format("Live validation: rejected targets=%d; pruned tasks=%d; recovery attempts=%d\nLast discarded task: %s",
+        self.RejectedTargets or 0,self.PrunedTasks or 0,self.RecoveryState and self.RecoveryState.Attempts or 0,
+        self.LastPrunedTask or "None"))
     local capabilities=self:DetectCapabilities()
     local names={}
     for name in pairs(capabilities) do names[#names+1]=name end
@@ -4598,7 +4637,138 @@ function H:Hop(token)
     end
     error("No server could be joined",0)
 end
+-- Rebuild candidate entries from current instances, never from the scan card or old volume.
+function H:VerifyTargets(entries)
+    local verified,seen={},{}
+    for _,entry in ipairs(entries) do
+        local model=entry.Model
+        if not seen[model] and self:IsStandingTree(model) then
+            local kind=value(model,"TreeClass")
+            local owner,field=self:TreeOwner(model)
+            local claimed=owner==Player and (entry.GrowthClaimed or model==self.GrowthTarget)
+            if field and self:WantsTree(kind) and (owner==nil or claimed) then
+                local volume=self:WoodVolume(model)
+                if self:EligibleVolume(kind,volume) then
+                    seen[model]=true
+                    entry.Trunk=self:TreeTrunk(model) entry.Kind=kind entry.Volume=volume
+                    entry.GrowthClaimed=claimed
+                    verified[#verified+1]=entry
+                end
+            end
+        end
+    end
+    self.RejectedTargets=(self.RejectedTargets or 0)+#entries-#verified
+    return verified
+end
+function H:ValidatePending(token)
+    local function validWood(model,kind)
+        return typeof(model)=="Instance" and model:IsA("Model") and under(model,S.Workspace)
+            and owned(model) and value(model,"TreeClass")==kind and self:WoodVolume(model)>0
+    end
+    local waiting=false
+    local discarded=false
+    local seen={}
+    for index=#self.PendingWood,1,-1 do
+        token:Check()
+        local work=self.PendingWood[index]
+        local reason
+        if type(work)~="table" then reason="Invalid task record"
+        elseif seen[work] then reason="Duplicate task record"
+        else
+            seen[work]=true
+            if work.Saved then
+                -- Already explicitly saved; only accounting may have been interrupted.
+                self:RecordHarvest(work)
+                reason="Saved task removed from the queue"
+            elseif work.JobId and work.JobId~=game.JobId then reason="Task belongs to a different server"
+            elseif work.Slot and work.Slot~=self.Config.Slot then reason="Task belongs to a different slot"
+            elseif work.Modwood and not work.Planks then
+                return false,"An unfinished Modwood attempt cannot be restarted"
+            else
+                local available=false
+                if work.Planks then
+                    if #work.Planks>0 then
+                        available=true
+                        for _,plank in ipairs(work.Planks) do
+                            if not validWood(plank,work.Kind) then available=false break end
+                        end
+                    end
+                else
+                    if work.Log and under(work.Log,S.Workspace) then
+                        local owner=self:TreeOwner(work.Log)
+                        if owner and owner~=Player then return false,"Remaining wood now belongs to another player" end
+                    end
+                    if not validWood(work.Log,work.Kind) then
+                        work.Log=nil
+                        if work.Cut then work.Log=self:FindFelledLog(work.Cut) end
+                    end
+                    available=validWood(work.Log,work.Kind)
+                    if not available and work.Cut and self:IsStandingTree(work.Cut.Tree)
+                        and livePart(work.Cut.Trunk) and under(work.Cut.Trunk,work.Cut.Tree) then
+                        local owner,field=self:TreeOwner(work.Cut.Tree)
+                        if field and owner and owner~=Player then return false,"Cut target now belongs to another player" end
+                        available=field~=nil and (owner==nil or owner==Player)
+                    end
+                end
+                if available then
+                    work.MissingSince=nil
+                else
+                    work.MissingSince=work.MissingSince or os.clock()
+                    if os.clock()-work.MissingSince>=self:AdaptiveWait(3,8) then
+                        reason="Referenced wood is no longer present or owned"
+                    else waiting=true end
+                end
+            end
+        end
+        if reason then
+            table.remove(self.PendingWood,index)
+            self.PrunedTasks=(self.PrunedTasks or 0)+1
+            self:Log("Task discarded - "..reason,"DEBUG")
+            if type(work)=="table" and not work.Saved then
+                self.AbandonedTasks=(self.AbandonedTasks or 0)+1
+                self.LastPrunedTask=reason
+                discarded=true
+            end
+        end
+    end
+    self.Dirty=#self.PendingWood>0
+    if discarded then
+        self.Counts={Spooky=0,SpookyNeon=0,SpookyVolume=0,SpookyNeonVolume=0,IgnoredSmall=0}
+        self.LastScanCardSignature=nil self.StandingCache=nil
+        if self.UI then
+            self.UI.Spooky:Set(0,"0 studs3") self.UI.Neon:Set(0,"0 studs3")
+        end
+        return false,"Stale harvest task discarded - "..tostring(self.LastPrunedTask)
+    end
+    if waiting then return nil,"Waiting for wood replication" end
+    if #self.PendingWood==0 then
+        self.NeedsAttention=false self.HarvestProgress=nil self.ActiveTarget=nil
+        self.Progress=0 self.StandingCache=nil self.FoundNotified=false
+    end
+    return true
+end
+function H:RecoveryFingerprint()
+    local fields={tostring(self.LastProgressAt or 0)}
+    for _,work in ipairs(self.PendingWood) do
+        if type(work)=="table" then
+        fields[#fields+1]=table.concat({tostring(work),tostring(work.Log),tostring(work.AtBase),
+            tostring(work.Modwood and work.Modwood.Phase),tostring(work.Saved)},"/")
+        end
+    end
+    return table.concat(fields,"|")
+end
 function H:Run(token)
+    self.ActiveTarget=nil
+    if #self.PendingWood>0 then
+        local valid,reason=self:ValidatePending(token)
+        if valid==false then return self:LeaveStalledServer(token,reason) end
+        if valid==nil then
+            self.NeedsAttention=true
+            self:SetStage("Checking remaining wood",self.Progress)
+            token:Sleep(0.5)
+            return reason
+        end
+    end
     if self.ServerExitReason then return self:LeaveStalledServer(token,self.ServerExitReason) end
     for _,work in ipairs(self.PendingWood) do
         if work.Classic then
@@ -4612,13 +4782,13 @@ function H:Run(token)
         self:WaitForGame(token)
     else
         token.Character=self:Character()
-        self:SetStage("Resuming current task",self.Progress)
+        self:SetStage("Checking remaining wood",self.Progress)
     end
     self:Bootstrap()
     local resuming = #self.PendingWood>0
     if self.Dirty and not resuming then
-        self.NeedsAttention=true
-        return "An interrupted cut needs inspection before another hunt can start"
+        self.Dirty=false self.NeedsAttention=false
+        self.HarvestProgress=nil self.ActiveTarget=nil self.StandingCache=nil
     end
     self:RememberServer(game.JobId)
     if self.LastCountedServer~=game.JobId then
@@ -4630,8 +4800,7 @@ function H:Run(token)
     if resuming then
         local receipt=self.LoadReceipt
         if not receipt or receipt.Slot~=self.Config.Slot or receipt.JobId~=game.JobId or receipt.Plot~=self:Plot() then
-            self.NeedsAttention=true
-            return "The saved task no longer matches the loaded plot"
+            return self:LeaveStalledServer(token,"The saved task no longer matches the loaded plot")
         end
         plot=receipt.Plot
         token.Character=self:Character()
@@ -4654,6 +4823,8 @@ function H:Run(token)
             self.FoundNotified=true
         end
         if not self.Config.FullCycle then return "Found - search paused in this server" end
+        entries=self:VerifyTargets(entries)
+        if #entries==0 then self:SetStage("Trees no longer available",0.1) return self:Hop(token) end
         self.CanRecover=false
         self.ActiveTarget=entries[1]
         self:CheckTargetOwner(self.ActiveTarget)
@@ -4673,8 +4844,7 @@ function H:Run(token)
     for index,entry in ipairs(entries) do
         self.ActiveTarget=not entry.Work and entry or nil
         token:Check()
-        if entry.Work or (entry.Model.Parent and (self:TreeOwner(entry.Model)==nil or (entry.GrowthClaimed and self:TreeOwner(entry.Model)==Player))
-            and not entry.Model:FindFirstChild("RootCut") and self:EligibleVolume(entry.Kind,self:WoodVolume(entry.Model))) then
+        if entry.Work or #self:VerifyTargets({entry})>0 then
             self:SelectHarvestProgress(entry)
             local scope=self:Token(token)
             local work=entry.Work
@@ -4698,7 +4868,7 @@ function H:Run(token)
                     self:UpdateHarvestProgress(0.02)
                     self:SetStage("Cutting "..entry.Kind,0.3,string.format("Tree %d / %d",index,#entries))
                     if not work then
-                        work={Kind=entry.Kind,TreeVolume=self:WoodVolume(entry.Model),Reason="Cut started"}
+                        work={Kind=entry.Kind,JobId=game.JobId,Slot=self.Config.Slot,CreatedAt=os.clock(),TreeVolume=self:WoodVolume(entry.Model),Reason="Cut started"}
                         table.insert(self.PendingWood,work)
                     end
                     self:LinkHarvestProgress(work)
@@ -4804,15 +4974,15 @@ function H:Run(token)
     end
     if self.Dirty then
         self.NeedsAttention=true
-        self:Log("Resuming unfinished wood automatically","INFO")
+        self:Log("Harvest has unfinished tasks - validating before retry","DEBUG")
         local atBase, unconfirmed=0,0
         for _,work in ipairs(self.PendingWood) do
             if work.AtBase then atBase=atBase+1 end
             if not work.Log and not work.Planks then unconfirmed=unconfirmed+1 end
         end
         if unconfirmed>0 then return "Cut not confirmed - Retry checks the same tree; no delivery confirmed" end
-        if atBase==#self.PendingWood then return "Wood remains at your base - Retry resumes the recorded tasks" end
-        return "Wood remains in this server - Retry resumes the recorded tasks"
+        if atBase==#self.PendingWood then return "Wood remains at your base - recovery is bounded" end
+        return "Wood remains in this server - recovery is bounded"
     end
     if self.NeedsAttention then return "Equip a compatible inventory axe, then retry" end
     if processed>0 then
@@ -4851,6 +5021,7 @@ function H:Start()
     if self.Busy or self.Rejoining or not self.Alive then return end
     self.Running=true self.Busy=true self.NeedsAttention=false self.HopUncertain=false
     self.LastProgressAt=os.clock() self.ProgressKeys={} self.Watchdog=true
+    self.RecoveryState=nil
     self.Abandoning=self.Abandoning==true
     if self.UI then self.UI.Start.Text="Hunting..." end
     self.Worker=task.defer(function()
@@ -4870,16 +5041,35 @@ function H:Start()
                 ok,result=pcall(self.Run,self,token)
             end
             token:Clean() token.Character=nil
+            self.ActiveTarget=nil
             if result==CANCEL or not self.Alive or not self.Running then break end
             if ok and not self.NeedsAttention and not self.Config.FullCycle and not self.ServerExitReason then break end
             if result and (not self.LastFailure or self.LastFailure.Reason~=cleanError(result)) then self:RecordFailure(self.Stage,cleanError(result)) end
             if not self.LastFailure then self:RecordFailure(self.Stage,"Retry pending") end
-            self:Log("Recovery - "..self.LastFailure.Reason,"DEBUG")
-            self:SetStage(self.HopUncertain and "Waiting for teleport" or "Resuming current task",self.Progress)
-            -- Preserve the continuation ticket while an uncertain teleport settles.
+            local fingerprint=self:RecoveryFingerprint()
+            local recovery=self.RecoveryState
+            if not recovery or recovery.Fingerprint~=fingerprint then
+                recovery={Fingerprint=fingerprint,Attempts=0,Started=os.clock()}
+                self.RecoveryState=recovery
+            end
+            recovery.Attempts=recovery.Attempts+1
+            recovery.Reason=self.LastFailure.Reason
+            local searching=self.Abandoning or self.AwaitingServer or self.HopUncertain
+            if not searching and not self.ServerExitReason and
+                (recovery.Attempts>=4 or os.clock()-recovery.Started>=45) then
+                self.ServerExitReason="No confirmed progress after bounded recovery - "..recovery.Reason
+                self.ActiveTarget=nil
+            end
+            if recovery.Attempts==1 or self.ServerExitReason then
+                self:Log("Recovery - "..recovery.Reason,"DEBUG")
+            end
             self.Watchdog=false
             token.Deadline=os.clock()+210
-            local retryDelay=self.ServerExitReason and not self.HopUncertain and 0 or (self.HopUncertain and 180 or 0.75)
+            local retryDelay=self.ServerExitReason and not self.HopUncertain and 0
+                or (self.HopUncertain and 180 or math.min(8,2^(recovery.Attempts-1)))
+            if self.HopUncertain then self:SetStage("Waiting for teleport",self.Progress)
+            elseif self.ServerExitReason then self:SetStage("Changing server",self.Progress)
+            elseif not searching then self:SetStage("Checking remaining wood",self.Progress) end
             if self.AwaitingServer and not self.HopUncertain and self.Config.TrackerEnabled
                 and not self.Config.TrackerAllowFallback then
                 retryDelay=math.max(retryDelay,math.min(30,(self.TrackerRetryAt or 0)-os.clock()))
