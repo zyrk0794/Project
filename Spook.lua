@@ -1,9 +1,13 @@
 --[[
-    Midnight Spooky Hunter 1.15.2 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.15.3 - Lumber Tycoon 2
     October 14, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.15.3: remove the pre-ignition settlement gate added in 1.15.2.
+    The sawmill-side location is a work destination, not a physics test.
+    Preserve that return destination through the trial ignition sequence.
 
     1.15.2: stage wood and player beside the selected sawmill;
     restore independent feed/cut cadence; detached burn cleanup has a
@@ -165,7 +169,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.15.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.15.3", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -3207,7 +3211,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local lava=self:FindLava(token)
     local originalPrimary=log.PrimaryPart
     local character,humanoid,avatar=self:Character()
-    local state={Phase="Prepared",SourceRevision="Hunter-1.15.2-CaptureTrial-0.3.0",Log=log,Mill=mill,Inlet=inlet,
+    local state={Phase="Prepared",SourceRevision="Hunter-1.15.3-CaptureTrial-0.3.0",Log=log,Mill=mill,Inlet=inlet,
         Root=root,Leaf=leaf,Parent=parent,ParentContainer=parent.Parent,Kind=value(log,"TreeClass"),
         InputVolume=inputVolume,IgnitionMode="Captured root round trip - paired synthetic contact",
         WorkFrame=root.CFrame,OriginalRootSize=root.Size,DiscardedParts={},CutPlacements=0,InletCorrections=0,OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
@@ -3371,27 +3375,13 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         drag:FireServer(log)
         token:Sleep(0.15)
         moveModel(root,best)
+        -- Keep the intended return location, even if replication moves the
+        -- unanchored tree during synchronization. No settlement gate here.
         state.WorkFrame=best
-        positionForCut()
-        local placementDeadline=os.clock()+5
-        local stableAt
-        repeat
-            checkMill()
-            if (root.Position-best.Position).Magnitude>2 then
-                stableAt=nil drag:FireServer(log) moveModel(root,best)
-            else
-                stableAt=stableAt or os.clock()
-                self:DampWood(log)
-            end
-            if stableAt and os.clock()-stableAt>=0.3 then break end
-            token:Sleep(0.1)
-        until os.clock()>=placementDeadline
-        assert(stableAt and os.clock()-stableAt>=0.3,"Wood did not settle beside the selected sawmill")
-        state.WorkFrame=root.CFrame
         for part in pairs(initialFrames) do if livePart(part) then initialFrames[part]=part.CFrame end end
         positionForCut()
         state.CutPlacements=1
-        snapshot("Player and wood positioned beside sawmill")
+        snapshot("Sawmill-side work destination set - starting trial sequence")
     end
     local observing,contactActive,endContact=true,false,nil
     local fireNames,fireConnections={},{}
