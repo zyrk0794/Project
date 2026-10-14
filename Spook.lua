@@ -1,9 +1,12 @@
 --[[
-    Midnight Spooky Hunter 1.15.3 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.15.4 - Lumber Tycoon 2
     October 14, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.15.4: stop feeding when the root cut is confirmed, matching Trial 0.3.0.
+    Output observation never repositions or damps the sawmill input.
 
     1.15.3: remove the pre-ignition settlement gate added in 1.15.2.
     The sawmill-side location is a work destination, not a physics test.
@@ -169,7 +172,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.15.3", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.15.4", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -3211,7 +3214,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local lava=self:FindLava(token)
     local originalPrimary=log.PrimaryPart
     local character,humanoid,avatar=self:Character()
-    local state={Phase="Prepared",SourceRevision="Hunter-1.15.3-CaptureTrial-0.3.0",Log=log,Mill=mill,Inlet=inlet,
+    local state={Phase="Prepared",SourceRevision="Hunter-1.15.4-CaptureTrial-0.3.0",Log=log,Mill=mill,Inlet=inlet,
         Root=root,Leaf=leaf,Parent=parent,ParentContainer=parent.Parent,Kind=value(log,"TreeClass"),
         InputVolume=inputVolume,IgnitionMode="Captured root round trip - paired synthetic contact",
         WorkFrame=root.CFrame,OriginalRootSize=root.Size,DiscardedParts={},CutPlacements=0,InletCorrections=0,OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
@@ -3632,6 +3635,13 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     -- Match the working trial: feed at 4 Hz and strike on the axe cooldown.
     -- Local overlap is diagnostic only, never a prerequisite for cutting.
     local function feedLeaf()
+        -- One-way handoff: after the cut, the mill controls the input.
+        -- Never reset its position or velocity while output is emerging.
+        if state.Phase~="Feeding" or state.FeedStopped then return end
+        if root.Size.Y<rootHeight-0.1 or state.Transformed then
+            state.FeedStopped=true
+            return
+        end
         checkMill()
         if not livePart(leaf) then state.InletInside=false return end
         local container=leaf:FindFirstAncestorOfClass("Model")
@@ -3687,8 +3697,9 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         token:Sleep(0.03)
     until os.clock()>=deadline
     assert(state.Phase=="Output","Root cut was not confirmed before timeout")
+    state.FeedStopped=true
     self:UpdateHarvestProgress(0.70)
-    snapshot("Root cut confirmed - inlet monitored until consumption")
+    snapshot("Root cut confirmed - feeding stopped; observing output")
     self:SetStage("Modwood - waiting for sawmill output",0.78,"Waiting for finished planks")
     local deadline=os.clock()+self:AdaptiveWait(self.Config.MillTimeout,180)
     local stableSince, outputVolume, outputParts, outputDimensions
@@ -3728,8 +3739,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     end
     repeat
         checkMill() trackReplacement()
-        -- Maintain the detached input after the root cut until consumption.
-        if livePart(leaf) then feedLeaf() end
+        -- Trial 0.3.0 stops feeding here. Observe without moving or
+        -- damping the retained section; let the mill draw it through.
         for _,section in ipairs(state.TransformedSections or {}) do
             if section~=parent then expectedSections[section]=true end
         end
@@ -3789,7 +3800,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             snapshot("Finished output confirmed")
             return state.Outputs
         end
-        token:Sleep(livePart(leaf) and 0.03 or 0.08)
+        token:Sleep(0.15)
     until os.clock()>=deadline
     error("Modwood - whole-tree conversion or finished output not confirmed; wood left in this server",0)
 end
