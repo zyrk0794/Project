@@ -1,9 +1,17 @@
 --[[
-    Midnight Spooky Hunter 1.14.5 - Lumber Tycoon 2
-    October 13, 2026. Client script using Midnight UI Library 2.4.0 or newer.
+    Midnight Spooky Hunter 1.15.1 - Lumber Tycoon 2
+    October 14, 2026. Client script using Midnight UI Library 2.4.0 or newer.
     Chop and Modwood adapted from the user-supplied Ancestor script.
     Modwood runs once per tree. Failed attempts leave for another server.
     Use the companion loader or set Script URL for continuation after a hop.
+
+    1.15.1: source matched to the attached Capture Trial 0.3.0;
+    recheck inlet after every cut-position/equip yield, latch fast removal
+    at the inlet and keep result confirmation independent from placement.
+
+    1.15.0: integrates the user-validated Capture Trial 0.3.0 Modwood;
+    wood-only ignition round trip, grounded cut placement, verified inlet
+    positioning maintained through consumption, isolated offcut cleanup.
 
     1.14.5: live target validation, bounded event-cache lifetime, stale task
     pruning, persistent retry budgets and progress-aware recovery backoff.
@@ -153,7 +161,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, BurnTimeout = 40, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.14.5", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.15.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -3189,15 +3197,16 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local inputVolume=self:WoodVolume(log)
     assert(finite(inputVolume) and inputVolume>=MIN_TREE_VOLUME,"Modwood requires at least 60 studs3 of felled wood")
     local root,leaf,parent,reason=self:ModwoodParts(log)
-    self:CaptureModwood(log,mill,reason or "Dry-area ignition selection")
+    self:CaptureModwood(log,mill,reason or "Capture Trial 0.3.0 selection")
     assert(root,reason)
     assert(not root.Anchored and root.Size.Y>0.4,"Root is anchored or too short")
     local lava=self:FindLava(token)
     local originalPrimary=log.PrimaryPart
     local character,humanoid,avatar=self:Character()
-    local state={Phase="Prepared",SourceRevision="Hunter-1.14.4-stable-dry-ignition",Log=log,Mill=mill,Inlet=inlet,
+    local state={Phase="Prepared",SourceRevision="Hunter-1.15.1-CaptureTrial-0.3.0",Log=log,Mill=mill,Inlet=inlet,
         Root=root,Leaf=leaf,Parent=parent,ParentContainer=parent.Parent,Kind=value(log,"TreeClass"),
-        InputVolume=inputVolume,IgnitionMode="Synthetic only - dry work area",OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
+        InputVolume=inputVolume,IgnitionMode="Captured root round trip - paired synthetic contact",
+        WorkFrame=root.CFrame,OriginalRootSize=root.Size,DiscardedParts={},CutPlacements=0,InletCorrections=0,OriginalSections={},BeforeOutput={},Outputs={},SeenOutput={},BeforeLogs={},TouchPairs=0,FeedFrames=0,
         LavaPath=lava:GetFullName(),IgnitionCorrections=0,RootID=value(root,"ID"),LeafID=value(leaf,"ID"),ParentID=value(parent,"ID")}
     checkpoint.Modwood=state
     self:MarkModwood(root,leaf,parent,token)
@@ -3229,29 +3238,63 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
                 state.IgnitionSeconds or 0,state.IgnitionBudget or 0,state.IgnitionGrace or 0,
                 state.IgnitionRTT or 0,tostring(state.IgnitionTargetChanged==true)),
             "Control: "..(state.NetworkStatus or "Not checked"),
-            string.format("Hold: ready=%s; physics=%s; drift=%.2f; movement=%.2f; corrections=%d; unstable=%.2fs",
-                tostring(state.HoldReady),state.HoldPhysics or "Unknown",state.HoldDrift or 0,
-                state.HoldMovement or 0,state.IgnitionCorrections or 0,state.HoldUnstableSeconds or 0),
+            string.format("Inlet: inside=%s; confirmed=%s; center error=%.3f; corrections=%d; offcut moved=%s",
+                tostring(state.InletInside==true),tostring(state.InletEverConfirmed==true),
+                state.InletCenterError or 0,state.InletCorrections or 0,tostring(state.ScrapMoved==true)),
+            string.format("Inlet receipt: placement=%s; removal at inlet=%s; observer=%s",
+                tostring(state.InletPlacementSent==true),tostring(state.InletRemovalObserved==true),
+                state.InletObserverError or "OK"),
             string.format("Root cut distance: %.2f; touch cap: %d",state.CutDistance or 0,state.MaxTouchPairs or 0),
             "Elapsed: "..string.format("%.2fs",os.clock()-(state.Started or os.clock()))},"\n")
     end
     state.Started=os.clock()
     token:Finally(function() snapshot("Task cleanup") end)
-    local hover=self:ModwoodHover(token,state)
-    local function placeAvatar(frame)
-        hover:BeforeMove(frame)
-        avatar.CFrame=frame
-        hover:Hold(frame)
+    -- Avatar stays at the base cut position throughout the wood round trip.
+    -- A bounded reposition is allowed only when the real cut point moves away.
+    local function positionForCut()
+        token:Check()
+        assert(livePart(root),"Modwood root cut point is unavailable")
+        local cutPoint=root.CFrame:PointToWorldSpace(Vector3.new(0,-root.Size.Y/2+0.33,0))
+        local parameters=RaycastParams.new()
+        parameters.FilterType=Enum.RaycastFilterType.Exclude
+        parameters.FilterDescendantsInstances={log,character}
+        parameters.RespectCanCollide=true
+        local radius=math.max(4,math.max(root.Size.X,root.Size.Z)/2+2.5)
+        local best,bestDistance
+        for _,direction in ipairs({Vector3.new(1,0,0),Vector3.new(-1,0,0),Vector3.new(0,0,1),Vector3.new(0,0,-1)}) do
+            local near=cutPoint+direction*radius
+            local hit=S.Workspace:Raycast(near+Vector3.new(0,12,0),Vector3.new(0,-40,0),parameters)
+            if hit and hit.Normal.Y>=0.7 and not hit.Instance.Name:lower():find("lava",1,true) then
+                local height=humanoid.HipHeight+avatar.Size.Y/2
+                if humanoid.RigType==Enum.HumanoidRigType.R6 then height=height+2 end
+                local point=hit.Position+Vector3.new(0,height+0.15,0)
+                if (point-cutPoint).Magnitude<=(state.CutRange or 12)
+                    and point.Y>S.Workspace.FallenPartsDestroyHeight+30 and self:ClearOfLava(point,6) then
+                    local distance=(point-avatar.Position).Magnitude
+                    if not bestDistance or distance<bestDistance then best,bestDistance=point,distance end
+                end
+            end
+        end
+        assert(best,"No supported position beside the Modwood cut - clear the wood placement")
+        humanoid.Sit=false
+        avatar.CFrame=CFrame.lookAt(best,Vector3.new(cutPoint.X,best.Y,cutPoint.Z))
         avatar.AssemblyLinearVelocity=Vector3.zero avatar.AssemblyAngularVelocity=Vector3.zero
+        state.CutPlacements=state.CutPlacements+1
+        token:Sleep(0.12)
     end
     local function restoreCollisions()
-        for part,collision in pairs(collisions) do if livePart(part) then part.CanCollide=collision end end
+        for part,collision in pairs(collisions) do if livePart(part) and not state.DiscardedParts[part] then part.CanCollide=collision end end
     end
     token:Finally(function()
         -- On interruption, only rescue our original sections still above the lava.
         -- Never pull finished planks or a fed section out of the sawmill.
+        if state.Phase=="Igniting" or state.Phase=="Ignited" then
+            if livePart(root) and under(root,log) and owned(log) then
+                log.PrimaryPart=root log:PivotTo(state.WorkFrame) self:DampWood(log)
+            end
+        end
         for part,frame in pairs(initialFrames) do
-            if owned(log) and livePart(part) and under(part,log) and (part.Position-lava.Position).Magnitude<140 then
+            if not state.DiscardedParts[part] and owned(log) and livePart(part) and under(part,log) and (part.Position-lava.Position).Magnitude<140 then
                 part.AssemblyLinearVelocity=Vector3.zero part.AssemblyAngularVelocity=Vector3.zero
                 part.CFrame=frame
             end
@@ -3264,7 +3307,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     local cutEvent=log:FindFirstChild("CutEvent") or log.Parent:FindFirstChild("CutEvent")
     assert(cutEvent,"Felled tree has no cut event")
     local function checkMill()
-        token:Check() hover:Check()
+        token:Check()
+        assert(Player.Character==character and humanoid.Health>0,"Character changed during Modwood")
         if log.Parent then
             local current=value(log,"Owner")
             if current and current~=Player then
@@ -3286,26 +3330,9 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         assert(livePart(pivot) and under(pivot,log) and owned(log),"Transfer pivot disappeared or changed owner")
         log.PrimaryPart=pivot self:DampWood(log) log:PivotTo(frame) self:DampWood(log)
     end
-    -- Plan the work point and lava clearance before any destructive contact.
-    local workPoint=Vector3.new(-1055,291,-458)
-    local parameters=RaycastParams.new()
-    parameters.FilterType=Enum.RaycastFilterType.Exclude
-    parameters.FilterDescendantsInstances={log,character} parameters.RespectCanCollide=true
-    local ground=S.Workspace:Raycast(workPoint+Vector3.new(0,25,0),Vector3.new(0,-90,0),parameters)
-    assert(ground and ground.Normal.Y>0.7 and not ground.Instance.Name:lower():find("lava"),"Recorded work area has no confirmed floor")
-    state.WorkFrame=CFrame.new(workPoint.X,math.max(workPoint.Y,ground.Position.Y+4),workPoint.Z)
-    -- Keep every section on dry ground. CanCollide=false alone cannot prevent Touched.
-    -- Preserve CanTouch and TouchTransmitter: disabling CanTouch can disconnect game events.
-    -- https://create.roblox.com/docs/reference/engine/classes/BasePart#CanTouch
-    -- The selected parent receives only the explicitly paired synthetic contact.
-    local box,size=log:GetBoundingBox()
-    local rootToBox=root.CFrame:ToObjectSpace(box)
-    local plannedBox=state.WorkFrame*rootToBox
-    local bottom=plannedBox.Position.Y-(math.abs(plannedBox.RightVector.Y)*size.X
-        +math.abs(plannedBox.UpVector.Y)*size.Y+math.abs(plannedBox.LookVector.Y)*size.Z)*0.5
-    state.WorkFrame=state.WorkFrame+Vector3.new(0,math.max(0,ground.Position.Y+2-bottom),0)
-    local plannedCenter=(state.WorkFrame*rootToBox).Position
-    assert(self:ClearOfLava(plannedCenter,size.Magnitude*0.5+8),"Dry work area overlaps a lava hazard")
+    -- Capture Trial returns the tree to this exact frame, including rotation.
+    -- No fixed remote work area and no avatar trip to the volcano.
+    assert(self:ClearOfLava(state.WorkFrame.Position,8),"The original wood position is too close to lava")
     local observing,contactActive,endContact=true,false,nil
     local fireNames,fireConnections={},{}
     assert(not parent:FindFirstChild("LavaFire",true),"Burn parent was already ignited before this attempt")
@@ -3348,7 +3375,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         if child.Name~="LavaFire" then return end
         local section=child.Parent
         while section and section~=log and not (section:IsA("BasePart") and section.Name=="WoodSection") do section=section.Parent end
-        if section and section~=log and section~=parent then
+        if section and section~=log and section~=parent and not (state.DiscardingOffcut and section==root) then
             state.OffTargetFire=tostring(value(section,"ID") or section.Name)
             token.ModwoodFailure="Fire detected outside the selected burn section - contacts stopped"
             if endContact then pcall(endContact) end
@@ -3380,7 +3407,8 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     end)
     local tool,stats=self:EnsureAxe(state.Kind,token)
     -- One bounded synchronization, with observable stage results as the authority.
-    placeAvatar(CFrame.new(root.Position+Vector3.new(5,3,0)))
+    state.CutRange=math.clamp(tonumber(value(tool,"Range")) or 10,3,25)+2
+    positionForCut()
     local ping=S.ReplicatedStorage:FindFirstChild("TestPing")
     local replied,worker=false,nil
     if ping and ping:IsA("RemoteFunction") then
@@ -3416,18 +3444,10 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         end
     end
     self:SetStage("Modwood - igniting selected section",0.52)
-    placeAvatar(state.WorkFrame+Vector3.new(5,5,0))
-    moveModel(root,state.WorkFrame)
-    log.PrimaryPart=parent
-    local target=parent.CFrame
+    state.Phase="Igniting"
+    local target=CFrame.new(-1405,343,1371)
     state.BurnTarget=target
-    placeAvatar(CFrame.new(parent.Position+Vector3.new(5,3,0)))
-    local releaseHold,ignitionReady=self:HoldIgnitionWood(log,parent,token,state,function(section,destination)
-        local point=destination and destination.Position or section.Position
-        if livePart(section) and (avatar.Position-point).Magnitude>9 then
-            placeAvatar(CFrame.new(point+Vector3.new(5,3,0)))
-        end
-    end)
+    moveModel(root,target)
     endContact=function()
         if not contactActive then return true end
         local ok,reason=self:TouchWoodLava(touch,parent,lava,false)
@@ -3440,66 +3460,35 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     end)
     local rtt=math.clamp(math.max(self.ServerRTT or 0,state.SyncRTT or 0),0,15)
     local ignitionStart=os.clock()
-    local ignitionBudget=math.clamp(self.Config.BurnTimeout+math.max(0,rtt-0.12)*6,10,120)
+    local ignitionBudget=math.clamp(math.max(12,self.Config.BurnTimeout or 12)+rtt*2,12,40)
     local deadline=ignitionStart+ignitionBudget
     state.IgnitionBudget=ignitionBudget state.IgnitionRTT=rtt
-    local holdSeconds=0.035
-    local pulseInterval=math.clamp(1.25+rtt*2,1.25,8)
-    local maxTouchPairs=3
-    state.MaxTouchPairs=maxTouchPairs
-    local loggedSlow=false
-    while not fireConfirmed() and os.clock()<deadline and state.TouchPairs<maxTouchPairs do
+    state.MaxTouchPairs=math.ceil(ignitionBudget*3)
+    local nextContact,nextHold,nextDrag=0,0,0
+    while not fireConfirmed() and os.clock()<deadline do
         checkMill()
-        -- Recheck before every movement and contact. A delayed event received
-        -- during a wait must never cause another full-tree lava transfer.
         if fireConfirmed() then break end
-        if not livePart(parent) or not under(parent,log) then
-            state.IgnitionTargetChanged=true break
-        end
-        assert(owned(log),"Burn target ownership changed before ignition")
+        assert(livePart(parent) and under(parent,log) and owned(log),"Burn target changed before ignition")
         assert(livePart(lava) and lava.CanTouch and lava:FindFirstChildWhichIsA("TouchTransmitter"),
             "Recorded lava touch handler became unavailable")
-        local currentBounds,currentSize=log:GetBoundingBox()
-        assert(self:ClearOfLava(currentBounds.Position,currentSize.Magnitude*0.5+4),"Physical lava proximity detected - synthetic contact blocked")
-        while not ignitionReady() and not fireConfirmed() and os.clock()<deadline do
-            checkMill()
-            token:Sleep(0.05)
+        local now=os.clock()
+        if now>=nextHold then
+            moveModel(root,target) nextHold=now+0.1
+            state.IgnitionCorrections=state.IgnitionCorrections+1
         end
-        if fireConfirmed() or os.clock()>=deadline then break end
-        checkMill()
-        if not ignitionReady() then continue end
-        contactActive=true
-        local pressed,problem=self:TouchWoodLava(touch,parent,lava,true)
-        local contactUntil=os.clock()+holdSeconds
-        while not fireConfirmed() and ignitionReady() and os.clock()<contactUntil do token:Sleep(0.015) end
-        local released,releaseProblem=endContact()
-        if not released then released,releaseProblem=endContact() end
-        assert(pressed and released,"Lava contact failed - "..tostring(problem or releaseProblem))
-        state.TouchPairs=state.TouchPairs+1
-        if fireConfirmed() then break end
-        if not loggedSlow and os.clock()-ignitionStart>=8 then
-            loggedSlow=true
-            self:Log("Ignition response delayed - wood remains in the dry work area","DEBUG")
+        if now>=nextDrag then drag:FireServer(log) nextDrag=now+0.1 end
+        if now>=nextContact then
+            contactActive=true
+            local pressed,problem=self:TouchWoodLava(touch,parent,lava,true)
+            local released,releaseProblem=endContact()
+            if not released then released,releaseProblem=endContact() end
+            assert(pressed and released,"Lava contact failed - "..tostring(problem or releaseProblem))
+            state.TouchPairs=state.TouchPairs+1
+            nextContact=now+1/3
         end
-        local nextPulse=math.min(deadline,os.clock()+pulseInterval)
-        while not fireConfirmed() and os.clock()<nextPulse do token:Sleep(0.03) end
+        token:Sleep(0.025)
     end
     endContact()
-    if not fireConfirmed() then
-        -- Stop generating contacts while late server replication is arriving.
-        -- Keep the observer and avatar support alive; never infer fire from a ping.
-        local grace=math.clamp(1.5+rtt*3,1.5,10)
-        local graceUntil=math.max(deadline,os.clock()+grace)
-        state.IgnitionGrace=grace
-        while not fireConfirmed() and os.clock()<graceUntil do
-            checkMill()
-            assert(owned(log),"Wood ownership changed while awaiting ignition")
-            -- The position controller continues alone while late fire events arrive.
-            -- Never add a second pivot writer here.
-            token:Sleep(0.12)
-        end
-    end
-    releaseHold()
     state.IgnitionSeconds=os.clock()-ignitionStart
     assert(fireConfirmed(),string.format(
         "Ignition not confirmed after %.1fs - %d contacts, RTT %.2fs; no second Modwood attempt",
@@ -3510,7 +3499,6 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
     snapshot("Ignition confirmed") self:UpdateHarvestProgress(0.50)
     state.Phase="Separating"
     self:SetStage("Modwood - waiting for branch separation",0.57)
-    placeAvatar(state.WorkFrame+Vector3.new(5,8,0))
     moveModel(root,state.WorkFrame)
     restoreCollisions()
     self:WaitResult(token,function() return not connected(parent,root) and not connected(parent,leaf) end,
@@ -3518,11 +3506,14 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         "Burned section is still connected - disposal blocked",0.05)
     self:SetStage("Modwood - removing detached section",0.60)
     deadline=os.clock()+math.clamp(math.max(7,3+rtt*4,(state.IgnitionSeconds or 0)*0.5),7,30)
-    placeAvatar(CFrame.new(parent.Position+Vector3.new(5,4,0)))
     drag:FireServer(log) token:Sleep(math.clamp(0.15+rtt,0.15,1))
     local removalFrame=CFrame.new(1279,49,2328)
     assert(self:ClearOfLava(removalFrame.Position,parent.Size.Magnitude*0.5+4),"Disposal destination overlaps lava")
-    placeAvatar(removalFrame+Vector3.new(5,6,0))
+    -- Matches the tested trial: remove only detached burn-section controllers.
+    -- This local effect removal is not treated as server-side fire extinction.
+    for _,child in ipairs(parent:GetChildren()) do
+        if child.Name=="LavaFire" or child:IsA("BodyVelocity") or child:IsA("BodyAngularVelocity") then child:Destroy() end
+    end
     while livePart(parent) and under(parent,log) do
         checkMill()
         assert(owned(log),"Wood ownership changed before disposal")
@@ -3571,67 +3562,180 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
             end
         end
     end
+    local function inletGeometry()
+        if not leaf or not livePart(inlet) then return false,math.huge end
+        local localCenter=inlet.CFrame:PointToObjectSpace(leaf.Position)
+        local half=inlet.Size*0.5
+        -- Particles can be a very thin trigger. Verify actual volume overlap
+        -- as well as a close center; full containment of a log is impossible
+        -- when the trigger is smaller than the log itself.
+        local projected=worldBoundsSize(inlet.CFrame:ToObjectSpace(leaf.CFrame),leaf.Size)*0.5
+        local reach=half+projected
+        local tolerance=Vector3.new(math.max(0.001,math.min(0.4,reach.X-0.01)),
+            math.max(0.001,math.min(0.4,reach.Y-0.01)),math.max(0.001,math.min(0.4,reach.Z-0.01)))
+        local aligned=math.abs(leaf.CFrame.UpVector:Dot(inlet.CFrame.UpVector))>0.98
+            and math.abs(leaf.CFrame.RightVector:Dot(inlet.CFrame.RightVector))>0.98
+        local inside=math.abs(localCenter.X)<=tolerance.X and math.abs(localCenter.Y)<=tolerance.Y
+            and math.abs(localCenter.Z)<=tolerance.Z and aligned
+        return inside,localCenter.Magnitude
+    end
+    -- This is a local placement/removal receipt, not a server acknowledgement.
+    -- A very fast mill can remove the input before the next polling frame.
+    local removalListener=leaf.AncestryChanged:Connect(function()
+        local ok,problem=pcall(function()
+            if not self.Running or self.Generation~=token.Generation or state.Phase=="Complete" then return end
+            if livePart(leaf) then return end
+            state.InletRemovalAt=os.clock()
+            local inside=inletGeometry()
+            local last=state.LastInletOverlapAt
+            if inside and last and state.InletPlacementSent and
+                os.clock()-last<=math.clamp(0.75+rtt*3,0.75,8) then
+                state.InletRemovalObserved=true
+                state.InletEverConfirmed=true
+            end
+        end)
+        if not ok then state.InletObserverError=cleanError(problem) end
+    end)
+    token:Finally(function() removalListener:Disconnect() end)
+    local function feedLeaf()
+        checkMill()
+        if not livePart(leaf) then state.InletInside=false return false end
+        local container=leaf:FindFirstAncestorOfClass("Model")
+        -- Once it is a plank, no feeding correction may move that output.
+        if container and under(container,playerModels) then return false end
+        local owner=container and value(container,"Owner")
+        assert(not owner or owner==Player,"Retained section was claimed by another player")
+        local kind=container and value(container,"TreeClass")
+        assert(not kind or kind==state.Kind,"Retained section tree class changed")
+        if not container or not under(container,logs) or owner~=Player or not kind then
+            state.InletMetadataSince=state.InletMetadataSince or os.clock()
+            state.InletStableSince=nil state.InletInside=false
+            assert(os.clock()-state.InletMetadataSince<math.clamp(2+rtt*3,3,10),
+                "Retained section metadata did not settle")
+            return false
+        end
+        state.InletMetadataSince=nil
+        if connected(leaf,root) then
+            state.InletInside=false state.InletStableSince=nil
+            leafMissingSince=leafMissingSince or os.clock()
+            assert(os.clock()-leafMissingSince<math.clamp(1+rtt*3,2,8),"Retained section remained connected - feeding blocked")
+            return false
+        end
+        for _,part in ipairs(leaf:GetConnectedParts(true)) do
+            assert(part==leaf or part.Name~="WoodSection","Retained section is joined to another wood section")
+        end
+        leafMissingSince=nil
+        local inside,centerError=inletGeometry()
+        state.InletInside=inside state.InletCenterError=centerError
+        local now=os.clock()
+        leaf.AssemblyLinearVelocity=Vector3.zero leaf.AssemblyAngularVelocity=Vector3.zero
+        if not inside then
+            state.InletStableSince=nil
+            if now>=(state.NextInletCorrection or 0) then
+                drag:FireServer(container)
+                leaf.CFrame=inlet.CFrame
+                state.InletPlacementSent=true
+                local placed=inletGeometry()
+                if placed then state.LastInletOverlapAt=now end
+                state.FeedFrames=state.FeedFrames+1
+                state.InletCorrections=state.InletCorrections+1
+                state.NextInletCorrection=now+0.08
+                state.InletSampleAfter=now+0.04
+            end
+        elseif now>=(state.InletSampleAfter or 0) then
+            state.InletStableSince=state.InletStableSince or now
+            state.LastInletOverlapAt=now
+            state.InletEverConfirmed=true
+        end
+        if now>=nextFeed then drag:FireServer(container) nextFeed=now+0.25 end
+        return inside and state.InletStableSince~=nil and now>=(state.InletSampleAfter or 0)
+    end
     repeat
         checkMill() trackReplacement()
         if root.Size.Y<rootHeight-0.1 or state.Transformed then state.Phase="Output" break end
         assert(livePart(root) and root.Parent==rootParent and owned(log),"Original cut target changed unexpectedly")
-        if os.clock()>=nextFeed then
-            if livePart(leaf) then
-                if connected(leaf,root) then
-                    leafMissingSince=leafMissingSince or os.clock()
-                    assert(os.clock()-leafMissingSince<math.clamp(1+rtt*3,2,8),"Retained section remained connected - feeding blocked")
-                else
-                    leafMissingSince=nil
-                    leaf.AssemblyLinearVelocity=Vector3.zero leaf.AssemblyAngularVelocity=Vector3.zero
-                    leaf.CFrame=inlet.CFrame drag:FireServer(log)
-                    state.FeedFrames=state.FeedFrames+1
-                end
-            else
-                -- The mill can consume the retained section before the root-cut update arrives.
-                -- Keep waiting for the actual root cut; disappearance alone is not success.
-                leafMissingSince=leafMissingSince or os.clock()
-                local outputSeen=false
-                for candidate in pairs(outputCandidates) do
-                    if candidate.Parent and owned(candidate) and value(candidate,"TreeClass")==state.Kind then
-                        local section=candidate:FindFirstChild("WoodSection")
-                        if section and section:IsA("BasePart") and (section.Position-inlet.Position).Magnitude<65 then outputSeen=true break end
-                    end
-                end
-                assert(outputSeen or os.clock()-leafMissingSince<math.clamp(2+rtt*3,3,12),"Retained section disappeared without a matching sawmill result")
-            end
-            nextFeed=os.clock()+0.35
+        local inletReady=feedLeaf()
+        if not livePart(leaf) then
+            leafMissingSince=leafMissingSince or os.clock()
+            assert(state.InletEverConfirmed or os.clock()-leafMissingSince<math.clamp(2+rtt*3,3,12),
+                "Retained section disappeared before inlet placement was observed")
+            -- Consumption alone is not success; the root cut and outputs still
+            -- need their existing independent confirmations.
+            inletReady=state.InletEverConfirmed==true
         end
-        if os.clock()>=nextStrike then
+        if inletReady and os.clock()>=nextStrike then
             if tool.Parent~=character then
                 humanoid:EquipTool(tool)
                 self:WaitResult(token,function() return tool.Parent==character end,2,"Inventory axe was not re-equipped")
             end
-            local cutHeight=math.clamp(0.3,0.1,math.max(0.1,root.Size.Y-0.1))
-            local cutPoint=root.CFrame:PointToWorldSpace(Vector3.new(root.Size.X*0.5,cutHeight-root.Size.Y*0.5,0))
-            local stand=root.CFrame:PointToWorldSpace(Vector3.new(root.Size.X*0.5+3,cutHeight-root.Size.Y*0.5+2.3,0))
-            placeAvatar(CFrame.lookAt(stand,cutPoint))
+            trackReplacement()
+            if root.Size.Y<rootHeight-0.1 or state.Transformed then state.Phase="Output" break end
+            assert(livePart(root) and root.Parent==rootParent and owned(log),"Cut target changed while equipping")
+            local cutHeight=math.clamp(0.33,0.1,math.max(0.1,root.Size.Y-0.1))
+            local cutPoint=root.CFrame:PointToWorldSpace(Vector3.new(0,cutHeight-root.Size.Y*0.5,0))
+            if (avatar.Position-cutPoint).Magnitude>state.CutRange then
+                assert(state.CutPlacements<3,"The Modwood cut position keeps moving")
+                positionForCut()
+            end
+            -- Always refresh just before the strike, including after EquipTool waits.
+            inletReady=feedLeaf() or (not livePart(leaf) and state.InletEverConfirmed==true)
+            if root.Size.Y<rootHeight-0.1 then state.Phase="Output" break end
             cutEvent=log:FindFirstChild("CutEvent") or (log.Parent and log.Parent:FindFirstChild("CutEvent"))
             assert(cutEvent and cutEvent.Parent,"Root cut event disappeared")
             state.CutDistance=(avatar.Position-cutPoint).Magnitude
-            proxy:FireServer(cutEvent,{tool=tool,sectionId=value(root,"ID"),height=cutHeight,faceVector=Vector3.new(1,0,0),
-                hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
-            state.Strikes=(state.Strikes or 0)+1
-            nextStrike=os.clock()+math.max(0.1,stats.SwingCooldown)+0.02
+            if inletReady then
+                proxy:FireServer(cutEvent,{tool=tool,sectionId=value(root,"ID"),height=cutHeight,faceVector=Vector3.new(1,0,0),
+                    hitPoints=stats.Damage,cooldown=stats.SwingCooldown,cuttingClass="Axe"})
+                state.Strikes=(state.Strikes or 0)+1
+                nextStrike=os.clock()+math.max(0.1,stats.SwingCooldown)+0.02
+            end
         end
         token:Sleep(0.03)
     until os.clock()>=deadline
     assert(state.Phase=="Output","Root cut was not confirmed before timeout")
     self:UpdateHarvestProgress(0.70)
-    snapshot("Root cut confirmed - feeding stopped")
-    placeAvatar(inlet.CFrame+Vector3.new(0,6,8))
+    snapshot("Root cut confirmed - inlet monitored until consumption")
     self:SetStage("Modwood - waiting for sawmill output",0.78,"Waiting for finished planks")
     local deadline=os.clock()+self:AdaptiveWait(self.Config.MillTimeout,180)
     local stableSince, outputVolume, outputParts, outputDimensions
     local expectedSections={}
     for _,section in ipairs(state.OriginalSections) do if section~=parent then expectedSections[section]=true end end
     for _,section in ipairs(state.TransformedSections or {}) do if section~=parent then expectedSections[section]=true end end
+    local function discardOffcut()
+        checkMill()
+        if not livePart(root) or not under(root,log) or not owned(log) or root.Anchored
+            or value(root,"ID")~=1 or root.Size.Y>0.41 or root.Size.Y>=state.OriginalRootSize.Y-0.1
+            or math.abs(root.Size.X-state.OriginalRootSize.X)>0.05
+            or math.abs(root.Size.Z-state.OriginalRootSize.Z)>0.05 then return end
+        local function isolated()
+            local count=0
+            for _,part in ipairs(log:GetDescendants()) do
+                if part:IsA("BasePart") and part.Name=="WoodSection" then
+                    if part~=root then return false end
+                    count=count+1
+                end
+            end
+            for _,part in ipairs(root:GetConnectedParts(true)) do
+                if not under(part,log) or (part.Name=="WoodSection" and part~=root) then return false end
+            end
+            return count==1
+        end
+        if not isolated() or not livePart(lava) or (avatar.Position-lava.Position).Magnitude<40 then return end
+        drag:FireServer(log) token:Sleep(0.12)
+        if not livePart(root) or not under(root,log) or not owned(log) or not isolated() then return end
+        state.DiscardingOffcut=true
+        log.PrimaryPart=root self:DampWood(log)
+        log:PivotTo(CFrame.new(lava.Position+Vector3.new(0,0.5,0))*root.CFrame.Rotation)
+        self:DampWood(log)
+        for _,part in ipairs(log:GetDescendants()) do if part:IsA("BasePart") then state.DiscardedParts[part]=true end end
+        state.ScrapMoved=true
+        self:TouchWoodLava(touch,root,lava,true)
+        self:TouchWoodLava(touch,root,lava,false)
+    end
     repeat
         checkMill() trackReplacement()
+        -- Maintain the detached input after the root cut until consumption.
+        if livePart(leaf) then feedLeaf() end
         for _,section in ipairs(state.TransformedSections or {}) do
             if section~=parent then expectedSections[section]=true end
         end
@@ -3647,7 +3751,7 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         local function countRemaining(sections)
             for _, section in ipairs(sections) do
                 local ownerModel=section.Parent and section:FindFirstAncestorOfClass("Model")
-                -- The source strikes at height 0.3. A remaining cut stump is
+                -- The source strikes at height 0.33. A remaining cut stump is
                 -- distinct from a full trunk and cannot be fed as the whole tree.
                 local cutStump=section==root and section.Size.Y<=0.35
                 if livePart(section) and section~=parent and not cutStump and not (ownerModel and state.SeenOutput[ownerModel]) then
@@ -3684,10 +3788,14 @@ function H:PerformModwood(log,mill,inlet,token,checkpoint)
         end
         if #state.Outputs>0 and remaining==0 and volume>0 and stableSince and os.clock()-stableSince>2 then
             self:UpdateHarvestProgress(0.85)
-            hover:Release()
+            local discarded,discardError=pcall(discardOffcut)
+            if not discarded then self:Log("Offcut cleanup skipped - "..cleanError(discardError),"DEBUG") end
+            token:Check()
+            state.Phase="Complete"
+            snapshot("Finished output confirmed")
             return state.Outputs
         end
-        token:Sleep(0.08)
+        token:Sleep(livePart(leaf) and 0.03 or 0.08)
     until os.clock()>=deadline
     error("Modwood - whole-tree conversion or finished output not confirmed; wood left in this server",0)
 end
