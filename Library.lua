@@ -1,6 +1,6 @@
 --[[
     Midnight UI Library
-    Version: 2.5.1
+    Version: 2.5.2
     Credits: Original implementation by OpenAI for this project.
     Date: 2026-10-19
     License: MIT
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.5.1",
+    Version = "2.5.2",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -5940,8 +5940,8 @@ end
 
 -- Midnight Workbench controls. Shared by the library and the compatibility installer.
 do
-    if Midnight.WorkbenchVersion ~= "2.5.1" then
-        Midnight.WorkbenchVersion = "2.5.1"
+    if Midnight.WorkbenchVersion ~= "2.5.2" then
+        Midnight.WorkbenchVersion = "2.5.2"
         local TS = game:GetService("TweenService")
         local RS = game:GetService("RunService")
         local controls = {}
@@ -6055,10 +6055,13 @@ do
                 if not self.Alive or not root.Visible then return end
                 local camera=workspace.CurrentCamera if not camera then return end
                 local view=camera.ViewportSize
-                tip.Position=UDim2.fromOffset(math.clamp(root.AbsolutePosition.X+root.AbsoluteSize.X/2,120,math.max(120,view.X-120)),
-                    math.max(40,root.AbsolutePosition.Y-8))
-                if not tip.Visible then tip.TextTransparency=1 tip.BackgroundTransparency=1 end
-                tip.Visible=true self:Animate(tip,{TextTransparency=0,BackgroundTransparency=0.03})
+                local position=UDim2.fromOffset(math.clamp(root.AbsolutePosition.X+root.AbsoluteSize.X/2,120,math.max(120,view.X-120)),
+                    math.max(40,root.AbsolutePosition.Y-18))
+                if not tip.Visible then
+                    tip.Position=position+UDim2.fromOffset(0,5)
+                    tip.TextTransparency=1 tip.BackgroundTransparency=1
+                end
+                tip.Visible=true self:Animate(tip,{Position=position,TextTransparency=0,BackgroundTransparency=0.03})
             end
             c:Connect(root.MouseEnter,function() c.Over=true c:Paint() c:Animate(scale,{Scale=1.08}) c:ShowTooltip() end)
             c:Connect(root.MouseLeave,function() c.Over=false c:Paint() c:HideTooltip() c:Animate(scale,{Scale=1}) end)
