@@ -1,6 +1,6 @@
 --[[
     Midnight UI Library
-    Version: 2.5.0
+    Version: 2.5.1
     Credits: Original implementation by OpenAI for this project.
     Date: 2026-10-19
     License: MIT
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.5.0",
+    Version = "2.5.1",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -5940,7 +5940,8 @@ end
 
 -- Midnight Workbench controls. Shared by the library and the compatibility installer.
 do
-    if not Midnight.CreateWorkbenchSurface then
+    if Midnight.WorkbenchVersion ~= "2.5.1" then
+        Midnight.WorkbenchVersion = "2.5.1"
         local TS = game:GetService("TweenService")
         local RS = game:GetService("RunService")
         local controls = {}
@@ -6000,13 +6001,17 @@ do
             local surface=create("CanvasGroup","Surface",root,{Position=UDim2.fromOffset(16,16),
                 Size=UDim2.new(1,-32,1,-32),BorderSizePixel=0,ZIndex=2})
             rounded(surface,12)
-            local outline=create("UIStroke","QuietBorder",surface,{Thickness=1,Transparency=0.78})
+            local outline=create("UIStroke","QuietBorder",surface,{Thickness=1,Transparency=0.82})
+            local sheen=create("Frame","MidnightSheen",surface,{Size=UDim2.new(1,-24,0,2),Position=UDim2.fromOffset(12,0),BorderSizePixel=0,BackgroundColor3=Color3.new(1,1,1)})
+            local gradient=create("UIGradient","AccentWash",sheen,{Transparency=NumberSequence.new({
+                NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(0.3,0.25),NumberSequenceKeypoint.new(0.7,0.25),NumberSequenceKeypoint.new(1,1)})})
             c.Surface=surface
             function c:Paint()
                 local t=Midnight.Theme surface.BackgroundColor3=t.Panel or t.Background outline.Color=t.Border or t.Accent
+                gradient.Color=ColorSequence.new(t.Accent,t.Secondary or t.AccentSecondary or t.Accent)
                 for _,halo in ipairs(halos) do halo.BackgroundColor3=t.Accent end
             end
-            c:Paint() return c
+            c:Paint(true) return c
         end
         function Midnight:CreateIconButton(options)
             options=options or {}
@@ -6015,6 +6020,10 @@ do
                 Image="",AutoButtonColor=false,BorderSizePixel=0,Selectable=true,ClipsDescendants=false})
             rounded(root,9)
             local c=controller(root)
+            local wash=create("Frame","ActiveWash",root,{Size=UDim2.fromScale(1,1),BorderSizePixel=0,BackgroundTransparency=1})
+            rounded(wash,9)
+            local washGradient=create("UIGradient","ActiveFalloff",wash,{Rotation=30,
+                Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.2),NumberSequenceKeypoint.new(1,1)})})
             c.Hint=tostring(options.Tooltip or options.Name or "Action") c.Active=options.Active==true
             local asset=Midnight:GetIcon(options.Icon or "package") or Midnight:GetIcon("circle-help")
             local image=create("ImageLabel","ActionIcon",root,{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),
@@ -6028,14 +6037,18 @@ do
                 Size=UDim2.fromOffset(230,36),Text=c.Hint,TextSize=12,Font=Enum.Font.GothamMedium,
                 TextWrapped=true,BorderSizePixel=0,ZIndex=100,BackgroundTransparency=0.03})
             rounded(tip,8) c.Tooltip=tip
-            function c:Paint()
+            function c:Paint(immediate)
                 if not self.Alive then return end
                 local t=Midnight.Theme local panel=t.Panel or t.Background
                 local base=self.Active and panel:Lerp(t.Accent,0.27) or panel:Lerp(t.Accent,self.Over and 0.16 or 0.06)
-                root.BackgroundColor3=base image.ImageColor3=ink(base)
+                if immediate then root.BackgroundColor3=base image.ImageColor3=ink(base)
+                else self:Animate(root,{BackgroundColor3=base}) self:Animate(image,{ImageColor3=ink(base)}) end
+                wash.BackgroundColor3=t.Accent
+                if immediate then wash.BackgroundTransparency=self.Active and 0.78 or 1
+                else self:Animate(wash,{BackgroundTransparency=self.Active and 0.78 or 1}) end
                 tip.BackgroundColor3=panel tip.TextColor3=ink(panel)
             end
-            function c:SetActive(active) self.Active=active==true self:Paint() end
+            function c:SetActive(active) if self.Active==(active==true) then return end self.Active=active==true self:Paint() end
             function c:SetTooltip(text) self.Hint=tostring(text) tip.Text=self.Hint end
             function c:HideTooltip() tip.Visible=false end
             function c:ShowTooltip()
@@ -6044,9 +6057,10 @@ do
                 local view=camera.ViewportSize
                 tip.Position=UDim2.fromOffset(math.clamp(root.AbsolutePosition.X+root.AbsoluteSize.X/2,120,math.max(120,view.X-120)),
                     math.max(40,root.AbsolutePosition.Y-8))
-                tip.Visible=true
+                if not tip.Visible then tip.TextTransparency=1 tip.BackgroundTransparency=1 end
+                tip.Visible=true self:Animate(tip,{TextTransparency=0,BackgroundTransparency=0.03})
             end
-            c:Connect(root.MouseEnter,function() c.Over=true c:Paint() c:ShowTooltip() end)
+            c:Connect(root.MouseEnter,function() c.Over=true c:Paint() c:Animate(scale,{Scale=1.08}) c:ShowTooltip() end)
             c:Connect(root.MouseLeave,function() c.Over=false c:Paint() c:HideTooltip() c:Animate(scale,{Scale=1}) end)
             c:Connect(root.SelectionGained,function() c:ShowTooltip() end)
             c:Connect(root.SelectionLost,function() c:HideTooltip() end)
@@ -6063,13 +6077,13 @@ do
                     if not ok then warn("[Midnight UI] Icon action: "..tostring(err)) end
                 end
             end)
-            c:Paint() return c
+            c:Paint(true) return c
         end
         local lastTheme=Midnight.Theme
         local paintConnection=RS.Heartbeat:Connect(function()
             if lastTheme~=Midnight.Theme then
                 lastTheme=Midnight.Theme
-                for c in pairs(controls) do if c.Alive then c:Paint() end end
+                for c in pairs(controls) do if c.Alive then c:Paint(true) end end
             end
         end)
         local oldDestroy=Midnight.Destroy
