@@ -1,8 +1,8 @@
 --[[
     Midnight UI Library
-    Version: 2.4.1
+    Version: 2.5.0
     Credits: Original implementation by OpenAI for this project.
-    Date: 2026-10-07
+    Date: 2026-10-19
     License: MIT
 
     Client-side Roblox Luau module with optional host capabilities.
@@ -20,7 +20,7 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local Midnight = {
-    Version = "2.4.1",
+    Version = "2.5.0",
     Flags = {},
     Windows = {},
     Visible = true,
@@ -5936,6 +5936,150 @@ function Midnight:Destroy()
     end
     table.clear(FlagOwners)
     table.clear(self.Flags)
+end
+
+-- Midnight Workbench controls. Shared by the library and the compatibility installer.
+do
+    if not Midnight.CreateWorkbenchSurface then
+        local TS = game:GetService("TweenService")
+        local RS = game:GetService("RunService")
+        local controls = {}
+        local function create(class, name, parent, properties)
+            local o = Instance.new(class) o.Name = name
+            for key, val in pairs(properties or {}) do o[key] = val end
+            o.Parent = parent return o
+        end
+        local function rounded(o, radius)
+            create("UICorner", "Corner", o, {CornerRadius=UDim.new(0,radius)})
+        end
+        local function ink(color)
+            local white, black = Color3.fromRGB(244,247,255), Color3.fromRGB(12,16,25)
+            return Midnight:GetContrast(white,color) >= Midnight:GetContrast(black,color) and white or black
+        end
+        local function controller(root)
+            local c = {Root=root, Connections={}, Tweens={}, Alive=true}
+            controls[c] = true
+            function c:Connect(signal, callback)
+                local con = signal:Connect(callback) self.Connections[#self.Connections+1]=con return con
+            end
+            function c:Animate(object, goals)
+                if self.Tweens[object] then self.Tweens[object]:Cancel() end
+                if Midnight.ReducedMotion then
+                    for key,val in pairs(goals) do object[key]=val end
+                else
+                    local t=TS:Create(object,TweenInfo.new(0.18,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),goals)
+                    self.Tweens[object]=t t:Play()
+                end
+            end
+            function c:Destroy(fromSignal)
+                if not self.Alive then return end
+                self.Alive=false controls[self]=nil
+                for _,con in ipairs(self.Connections) do con:Disconnect() end
+                for _,t in pairs(self.Tweens) do t:Cancel() end
+                if self.Tooltip then self.Tooltip:Destroy() end
+                if not fromSignal then self.Root:Destroy() end
+            end
+            c:Connect(root.Destroying,function() c:Destroy(true) end)
+            return c
+        end
+        function Midnight:CreateWorkbenchSurface(options)
+            options=options or {}
+            local root=create("CanvasGroup", options.Name or "WorkbenchSurface", options.Parent, {
+                Position=(options.Position or UDim2.new())-UDim2.fromOffset(16,16),
+                Size=(options.Size or UDim2.fromOffset(600,80))+UDim2.fromOffset(32,32),
+                BackgroundTransparency=1, BorderSizePixel=0})
+            local c=controller(root)
+            local halos={}
+            for i=1,4 do
+                local pad=4*i
+                local halo=create("Frame","SoftGlow"..i,root,{
+                    Position=UDim2.fromOffset(16-pad,16-pad),Size=UDim2.new(1,-32+pad*2,1,-32+pad*2),
+                    BorderSizePixel=0,BackgroundTransparency=0.97+i*0.005,ZIndex=1})
+                rounded(halo,12+pad) halos[#halos+1]=halo
+            end
+            local surface=create("CanvasGroup","Surface",root,{Position=UDim2.fromOffset(16,16),
+                Size=UDim2.new(1,-32,1,-32),BorderSizePixel=0,ZIndex=2})
+            rounded(surface,12)
+            local outline=create("UIStroke","QuietBorder",surface,{Thickness=1,Transparency=0.78})
+            c.Surface=surface
+            function c:Paint()
+                local t=Midnight.Theme surface.BackgroundColor3=t.Panel or t.Background outline.Color=t.Border or t.Accent
+                for _,halo in ipairs(halos) do halo.BackgroundColor3=t.Accent end
+            end
+            c:Paint() return c
+        end
+        function Midnight:CreateIconButton(options)
+            options=options or {}
+            local root=create("ImageButton", options.Name or "IconAction", options.Parent, {
+                Size=options.Size or UDim2.fromOffset(40,40),Position=options.Position or UDim2.new(),
+                Image="",AutoButtonColor=false,BorderSizePixel=0,Selectable=true,ClipsDescendants=false})
+            rounded(root,9)
+            local c=controller(root)
+            c.Hint=tostring(options.Tooltip or options.Name or "Action") c.Active=options.Active==true
+            local asset=Midnight:GetIcon(options.Icon or "package") or Midnight:GetIcon("circle-help")
+            local image=create("ImageLabel","ActionIcon",root,{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),
+                Size=UDim2.fromOffset(20,20),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Fit,
+                Image=asset and asset.Image or "",ImageRectOffset=asset and asset.ImageRectOffset or Vector2.zero,
+                ImageRectSize=asset and asset.ImageRectSize or Vector2.zero})
+            c.Icon=image
+            local scale=create("UIScale","CenteredPress",image,{Scale=1})
+            local screen=options.TooltipParent or root:FindFirstAncestorWhichIsA("ScreenGui")
+            local tip=create("TextLabel","ActionTooltip",screen or root,{Visible=false,AnchorPoint=Vector2.new(0.5,1),
+                Size=UDim2.fromOffset(230,36),Text=c.Hint,TextSize=12,Font=Enum.Font.GothamMedium,
+                TextWrapped=true,BorderSizePixel=0,ZIndex=100,BackgroundTransparency=0.03})
+            rounded(tip,8) c.Tooltip=tip
+            function c:Paint()
+                if not self.Alive then return end
+                local t=Midnight.Theme local panel=t.Panel or t.Background
+                local base=self.Active and panel:Lerp(t.Accent,0.27) or panel:Lerp(t.Accent,self.Over and 0.16 or 0.06)
+                root.BackgroundColor3=base image.ImageColor3=ink(base)
+                tip.BackgroundColor3=panel tip.TextColor3=ink(panel)
+            end
+            function c:SetActive(active) self.Active=active==true self:Paint() end
+            function c:SetTooltip(text) self.Hint=tostring(text) tip.Text=self.Hint end
+            function c:HideTooltip() tip.Visible=false end
+            function c:ShowTooltip()
+                if not self.Alive or not root.Visible then return end
+                local camera=workspace.CurrentCamera if not camera then return end
+                local view=camera.ViewportSize
+                tip.Position=UDim2.fromOffset(math.clamp(root.AbsolutePosition.X+root.AbsoluteSize.X/2,120,math.max(120,view.X-120)),
+                    math.max(40,root.AbsolutePosition.Y-8))
+                tip.Visible=true
+            end
+            c:Connect(root.MouseEnter,function() c.Over=true c:Paint() c:ShowTooltip() end)
+            c:Connect(root.MouseLeave,function() c.Over=false c:Paint() c:HideTooltip() c:Animate(scale,{Scale=1}) end)
+            c:Connect(root.SelectionGained,function() c:ShowTooltip() end)
+            c:Connect(root.SelectionLost,function() c:HideTooltip() end)
+            c:Connect(root.InputBegan,function(input)
+                if input.UserInputType==Enum.UserInputType.Touch then c:ShowTooltip() end
+            end)
+            c:Connect(root.MouseButton1Down,function() c:Animate(scale,{Scale=0.88}) end)
+            c:Connect(root.MouseButton1Up,function() c:Animate(scale,{Scale=1}) end)
+            c:Connect(root:GetPropertyChangedSignal("Visible"),function() if not root.Visible then c:HideTooltip() end end)
+            c:Connect(root.Activated,function()
+                c:HideTooltip()
+                if type(options.Callback)=="function" then
+                    local ok,err=pcall(options.Callback)
+                    if not ok then warn("[Midnight UI] Icon action: "..tostring(err)) end
+                end
+            end)
+            c:Paint() return c
+        end
+        local lastTheme=Midnight.Theme
+        local paintConnection=RS.Heartbeat:Connect(function()
+            if lastTheme~=Midnight.Theme then
+                lastTheme=Midnight.Theme
+                for c in pairs(controls) do if c.Alive then c:Paint() end end
+            end
+        end)
+        local oldDestroy=Midnight.Destroy
+        function Midnight:Destroy(...)
+            paintConnection:Disconnect()
+            local list={} for c in pairs(controls) do list[#list+1]=c end
+            for _,c in ipairs(list) do c:Destroy() end
+            if oldDestroy then return oldDestroy(self,...) end
+        end
+    end
 end
 
 return Midnight
