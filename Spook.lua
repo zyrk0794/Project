@@ -1,8 +1,9 @@
 --[[
-    Midnight Spooky Hunter 1.16.1 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.16.2 - Lumber Tycoon 2
     Search only: stop on the first selected Spooky/Sinister, regardless of volume.
     DismemberTree: axe cuts on every section, bounded junction refinement,
     then mill only physically isolated single WoodSections >= 5 studs3.
+    Sawmill: exact inlet alignment, drift-only correction, latched intake handoff.
     Failed sections, pieces and trees are skipped with bounded waits.
     Requires the existing Midnight UI library and companion hop loader.
     Syntax and mocked behavior checked; live Roblox validation still required.
@@ -105,7 +106,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.16.1", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.16.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -2644,6 +2645,39 @@ function H:CutDismemberSection(state,job,token)
     until os.clock()>=deadline
     error("Branch cut not confirmed before timeout",0)
 end
+function H:SawmillInputFrame(model,section,inlet)
+    -- Match the inlet's actual orientation. Do not add a guessed 90-degree
+    -- rotation; WoodSection and the model pivot need not share the same frame.
+    local sectionFromPivot=model:GetPivot():ToObjectSpace(section.CFrame)
+    return inlet.CFrame*sectionFromPivot:Inverse()
+end
+function H:SawmillInputError(section,inlet)
+    local distance=(section.Position-inlet.Position).Magnitude
+    local up=section.CFrame.UpVector:Dot(inlet.CFrame.UpVector)
+    local right=section.CFrame.RightVector:Dot(inlet.CFrame.RightVector)
+    return distance<=0.35 and up>=0.995 and right>=0.995,distance,math.min(up,right)
+end
+function H:WatchMillIntake(model,section,logs,job,token)
+    local initialVolume=section.Size.X*section.Size.Y*section.Size.Z
+    local handedOff=false
+    local function observe()
+        if handedOff or not job.FeedSent then return handedOff end
+        if not livePart(section) or not under(model,logs) or not under(section,model)
+            or section.Anchored or section.Size.X*section.Size.Y*section.Size.Z<initialVolume-0.01 then
+            handedOff=true job.IntakeObserved=true
+        end
+        return handedOff
+    end
+    local connections={}
+    token:Finally(function()
+        for _,connection in ipairs(connections) do connection:Disconnect() end
+    end)
+    for _,signal in ipairs({section.AncestryChanged,model.AncestryChanged,
+        section:GetPropertyChangedSignal("Size"),section:GetPropertyChangedSignal("Anchored")}) do
+        connections[#connections+1]=signal:Connect(observe)
+    end
+    return observe
+end
 function H:MillDismemberPiece(state,job,token)
     local model,mill,inlet=job.Model,state.Mill,state.Inlet
     local logs=S.Workspace:FindFirstChild("LogModels")
@@ -2652,7 +2686,7 @@ function H:MillDismemberPiece(state,job,token)
     assert(not self.BlockedMills[mill],"Sawmill has an unconfirmed previous input")
     local function checkMill()
         token:Check()
-        assert(under(mill,S.Workspace) and owned(mill) and livePart(inlet),"Sawmill no longer available")
+        assert(under(mill,S.Workspace) and owned(mill) and livePart(inlet) and under(inlet,mill),"Sawmill no longer available")
     end
     checkMill()
     assert(under(model,logs) and owned(model),"Piece is no longer owned")
@@ -2676,6 +2710,7 @@ function H:MillDismemberPiece(state,job,token)
     local deadline=os.clock()+self.Config.MillTimeout
     local nextFeed,stableSince,lastOutputs=0,nil,nil
     local handedOff=false
+    local observeIntake=self:WatchMillIntake(model,part,logs,job,token)
     local function consumed()
         return not under(model,logs) or self:WoodVolume(model)<=0
     end
@@ -2683,20 +2718,32 @@ function H:MillDismemberPiece(state,job,token)
         checkMill()
         local gone=consumed()
         if not gone then assert(owned(model),"Piece changed owner") end
-        if gone or (livePart(part) and part.Anchored) or (not gone and self:WoodVolume(model)<volume-0.01) then
+        if gone or observeIntake() or (job.FeedSent and not gone and self:WoodVolume(model)<volume-0.01) then
             handedOff=true
         end
         if not handedOff and os.clock()>=nextFeed and (job.FeedAttempts or 0)<3 then
             checkDetached()
             assert(livePart(part) and under(part,model),"Input changed during placement")
-            local relative=model:GetPivot():ToObjectSpace(part.CFrame)
-            -- WoodSection's long Y axis points through the inlet.
-            local target=inlet.CFrame*CFrame.Angles(math.pi/2,0,0)*relative:Inverse()
-            self:Teleport(inlet.CFrame+inlet.CFrame.RightVector*6+Vector3.new(0,2,0))
-            drag:FireServer(model)
-            self:DampWood(model) model:PivotTo(target)
-            job.FeedAttempts=(job.FeedAttempts or 0)+1
-            job.FeedSent=true nextFeed=os.clock()+0.75
+            local aligned,distance,axisDot=self:SawmillInputError(part,inlet)
+            job.InletError=distance job.InletAxisDot=axisDot
+            -- One initial handoff. Further placements only correct real drift;
+            -- never repeatedly reset an already aligned piece's velocity/position.
+            if not job.FeedSent or not aligned then
+                local target=self:SawmillInputFrame(model,part,inlet)
+                self:Teleport(inlet.CFrame+inlet.CFrame.RightVector*6+Vector3.new(0,2,0))
+                if not observeIntake() then
+                    checkMill() checkDetached()
+                    drag:FireServer(model)
+                    if not observeIntake() then
+                        self:DampWood(model)
+                        job.FeedSent=true
+                        model:PivotTo(target)
+                        job.FeedAttempts=(job.FeedAttempts or 0)+1
+                        job.Aligned,job.InletError,job.InletAxisDot=self:SawmillInputError(part,inlet)
+                    end
+                end
+            end
+            nextFeed=os.clock()+0.75
         end
         local candidates,total,observed={},0,{}
         for _,candidate in ipairs(outputs:GetChildren()) do
@@ -2859,6 +2906,10 @@ function H:BuildReport()
                 state.Phase,#state.Outputs,state.Small,state.Attached,state.RefinementAttempts or 0,state.Failures))
             for piece,job in ipairs(state.FeedJobs) do
                 table.insert(lines,string.format("Piece %d: %s",piece,job.Error or job.FeedState or (job.SkippedSmall and "Below 5 studs3" or "Pending")))
+                if job.FeedSent then
+                    table.insert(lines,string.format("Intake: placements=%d; offset=%.3f; axisDot=%.4f; handoff=%s",
+                        job.FeedAttempts or 0,job.InletError or -1,job.InletAxisDot or -1,tostring(job.IntakeObserved==true)))
+                end
             end
         end
     end
