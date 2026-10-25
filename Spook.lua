@@ -1,11 +1,13 @@
 --[[
-    Midnight Spooky Hunter 1.16.2 - Lumber Tycoon 2
+    Midnight Spooky Hunter 1.16.3 - Lumber Tycoon 2
     Search only: stop on the first selected Spooky/Sinister, regardless of volume.
     DismemberTree: axe cuts on every section, bounded junction refinement,
     then mill only physically isolated single WoodSections >= 5 studs3.
-    Sawmill: exact inlet alignment, drift-only correction, latched intake handoff.
+    Sawmill: approach wood, repeat ClientIsDragging at 10 Hz, require stable
+    isnetworkowner confirmation, hold above mill and feed with ownership checks.
+    Intake stops dragging, positioning and character support; failures skip ahead.
     Failed sections, pieces and trees are skipped with bounded waits.
-    Requires the existing Midnight UI library and companion hop loader.
+    Requires isnetworkowner, the existing Midnight UI library and companion hop loader.
     Syntax and mocked behavior checked; live Roblox validation still required.
 ]]
 local S = {}
@@ -106,7 +108,7 @@ local DEFAULT = { TargetSpecies = "Both", GrowSinister = false, GrowthStableSeco
     TrackerFreshness = 30, TrackerMinAge = 0, TrackerBackoff = 120,
     ServerSearchTimeout = 8, ServerRetryDelay = 2, LoadTimeout = 180, MetadataTimeout = 30,
     ChopTimeout = 75, MillTimeout = 80, TaskTimeout = 900, FullCycle = true, AntiAfk = true }
-local H = { Version = "1.16.2", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
+local H = { Version = "1.16.3", Alive = true, Running = false, Busy = false, Connections = {}, Logs = {}, ActivityEntries = {},
     Config = table.clone(DEFAULT), VisitRecords = {}, Visited = {}, ServerHistory = {}, FailedServers = {}, PendingWood = {},
     Stats = { Servers = 0, Trees = 0, Planks = 0, Skipped = 0, Scanned = 0, FoundServers = 0,
         FoundTrees = 0, Harvested = 0, TrackerScans = 0, TrackerFinds = 0, StandardScans = 0, StandardFinds = 0 },
@@ -2334,18 +2336,21 @@ function H:Move(model,destination,token)
         if self.LastMove==record then
             self.MoveDiagnostic=string.format("Last transfer: placements=%d; settled=%s; elapsed=%.2fs",
                 record.Placements,tostring(record.Settled),os.clock()-record.Started)
-                ..string.format("; control=%s; TestPing replies=%d",record.NetworkStatus or "Not checked",record.SyncReplies or 0)
+                ..string.format("; control=%s; dragRequests=%d",record.NetworkStatus or "Not checked",record.DragRequests or 0)
         end
     end)
-    local drag=self:Remote("Interaction","ClientIsDragging")
     local part=partOf(model)
-    self:AcquireWood(model,part,token,record)
+    local acquired,control=self:AcquireWood(model,part,token,record)
+    assert(acquired,"Wood control ended before transport")
     local restore=self:QuietWood(model,token)
     -- Do not let gravity carry the wood through the plot while collisions are off.
     local suspended=false
     local suspension=S.RunService.PreSimulation:Connect(function()
         if suspended and self.Alive and self.Running and token.Generation==self.Generation
-            and model.Parent and owned(model) then self:DampWood(model) end
+            and model.Parent and owned(model) then
+            local ok,controlled=pcall(control.Owns,control)
+            if ok and controlled then self:DampWood(model) end
+        end
     end)
     local function releaseSuspension()
         suspended=false
@@ -2358,6 +2363,11 @@ function H:Move(model,destination,token)
     repeat
         token:Check()
         assert(model.Parent and owned(model) and livePart(part),"Wood ownership changed")
+        if not control:Owns() then
+            suspended=false
+            assert(control:Acquire(),"Wood control ended during transport")
+        end
+        control:AssertOwned()
         local distance=(model:GetPivot().Position-destination.Position).Magnitude
         if placements>0 then assert(distance<35,"Wood became unstable during transfer") end
         if placements==0 or (distance>1.5 and os.clock()>=nextPlacement) then
@@ -2365,8 +2375,8 @@ function H:Move(model,destination,token)
             self:DampWood(model)
             -- Avatar and wood move in the same scheduler step. Never fly the
             -- tree through intervening scenery or repeat a long teleport burst.
-            self:Teleport(destination*relative+Vector3.new(5,3,0))
-            drag:FireServer(model)
+            self:Teleport(destination*relative+Vector3.new(0,5,0))
+            control:Pulse() control:AssertOwned()
             model:PivotTo(destination)
             self:DampWood(model)
             suspended=true
@@ -2386,9 +2396,11 @@ function H:Move(model,destination,token)
         token:Sleep(0.15)
         assert(model.Parent and owned(model),"Wood changed after placement")
         assert((model:GetPivot().Position-destination.Position).Magnitude<5,"Wood shifted after placement")
+        control:AssertOwned()
         self:DampWood(model)
     end
     record.Settled=true
+    control:Stop()
 end
 local function worldBoundsSize(frame,size)
     local right,up,back=frame.RightVector,frame.UpVector,frame.LookVector
@@ -2645,6 +2657,132 @@ function H:CutDismemberSection(state,job,token)
     until os.clock()>=deadline
     error("Branch cut not confirmed before timeout",0)
 end
+function H:WoodApproachFrame(part)
+    local _,humanoid,avatar=self:Character()
+    local height=worldBoundsSize(part.CFrame,part.Size).Y/2
+    local clearance=humanoid.HipHeight+avatar.Size.Y/2+0.5
+    return CFrame.new(part.Position+Vector3.new(0,height+clearance,0))*avatar.CFrame.Rotation
+end
+function H:SawmillStandFrame(mill,inlet)
+    local _,humanoid,avatar=self:Character()
+    local bounds,size=mill:GetBoundingBox()
+    local top=bounds.Position.Y+worldBoundsSize(bounds,size).Y/2
+    local y=math.max(top,inlet.Position.Y)+humanoid.HipHeight+avatar.Size.Y/2+0.5
+    return CFrame.new(inlet.Position.X,y,inlet.Position.Z)*avatar.CFrame.Rotation
+end
+function H:HoldSawmillStand(token)
+    local _,humanoid,avatar=self:Character()
+    local rotation=humanoid.AutoRotate
+    local movers={}
+    local released=false
+    local function release()
+        if released then return end
+        released=true
+        for _,mover in ipairs(movers) do mover:Destroy() end
+        if humanoid.Parent then humanoid.AutoRotate=rotation end
+    end
+    token:Finally(release)
+    -- Scope the character support to this one input. The wood is never anchored.
+    local position=Instance.new("BodyPosition") movers[#movers+1]=position
+    position.Name="MidnightSawmillStand" position.MaxForce=Vector3.new(1e7,1e7,1e7)
+    position.P=50000 position.D=2000 position.Position=avatar.Position position.Parent=avatar
+    local orientation=Instance.new("BodyGyro") movers[#movers+1]=orientation
+    orientation.Name="MidnightSawmillFacing" orientation.MaxTorque=Vector3.new(1e7,1e7,1e7)
+    orientation.P=50000 orientation.D=2000 orientation.CFrame=avatar.CFrame orientation.Parent=avatar
+    humanoid.AutoRotate=false
+    return release
+end
+function H:StartWoodControl(model,part,token,diagnostic,finished)
+    diagnostic=diagnostic or {}
+    local checker=cap("isnetworkowner",isnetworkowner)
+        or (type(synAPI)=="table" and synAPI.isnetworkowner)
+    assert(type(checker)=="function","isnetworkowner unavailable - cannot confirm network ownership; piece skipped")
+    local drag=self:Remote("Interaction","ClientIsDragging")
+    local control={Active=true,NextDrag=0,StableSince=nil,Done=false,Failure=nil,Acquisitions=0}
+    local connection
+    function control:Stop()
+        self.Active=false self.StableSince=nil
+        if connection then connection:Disconnect() connection=nil end
+    end
+    token:Finally(function() control:Stop() end)
+    function control:Validate()
+        if finished and finished() then self.Done=true self:Stop() return false end
+        assert(livePart(part) and under(part,model) and under(model,S.Workspace) and owned(model),
+            "Wood changed while controlling it")
+        assert(not part.Anchored,"Wood is anchored before confirmed intake")
+        return true
+    end
+    function control:Owns()
+        if self.Failure then error(self.Failure,0) end
+        if not self.Active or not self:Validate() then return false end
+        local ok,result=pcall(checker,part)
+        if not ok or type(result)~="boolean" then
+            self.Failure="isnetworkowner check failed - no unconfirmed movement allowed"
+            self:Stop() error(self.Failure,0)
+        end
+        if result then self.StableSince=self.StableSince or os.clock()
+        else self.StableSince=nil end
+        diagnostic.NetworkStatus=result and "Network owner confirmed" or "Waiting for network ownership"
+        diagnostic.NetworkConfirmed=result
+        return result
+    end
+    function control:AssertOwned()
+        token:Check()
+        assert(self:Owns(),"Network ownership lost before moving wood")
+    end
+    function control:Pulse()
+        if not self.Active then return end
+        if not H.Alive or not H.Running or token.Generation~=H.Generation then self:Stop() return end
+        assert(os.clock()<token.Deadline,"Wood control deadline reached")
+        if not self:Validate() then return end
+        if os.clock()>=self.NextDrag then
+            -- Same model argument as the supplied Cobalt call; not a name lookup.
+            drag:FireServer(model)
+            self.NextDrag=os.clock()+0.1
+            diagnostic.DragRequests=(diagnostic.DragRequests or 0)+1
+            diagnostic.LastDrag=os.clock()
+        end
+        self:Owns()
+    end
+    connection=S.RunService.Heartbeat:Connect(function()
+        local ok,err=pcall(control.Pulse,control)
+        if not ok then control.Failure=cleanError(err) control:Stop() end
+    end)
+    function control:Acquire()
+        token:Check()
+        if self.Done then return false end
+        assert(self.Active,self.Failure or "Wood control stopped")
+        assert(self.Acquisitions<3,"Network ownership recovery limit reached")
+        self.Acquisitions=self.Acquisitions+1
+        diagnostic.OwnershipAttempts=self.Acquisitions
+        self.StableSince=nil
+        local requestsBefore=diagnostic.DragRequests or 0
+        local deadline=os.clock()+12
+        local nextApproach=0
+        repeat
+            token:Check()
+            if self.Failure then error(self.Failure,0) end
+            if not self:Validate() then return false end
+            if os.clock()>=nextApproach then
+                local target=H:WoodApproachFrame(part)
+                local _,_,avatar=H:Character()
+                if nextApproach==0 or (avatar.Position-target.Position).Magnitude>2 then H:Teleport(target) end
+                nextApproach=os.clock()+0.35
+            end
+            self:Pulse()
+            if self.Done then return false end
+            if self:Owns() and self.StableSince and os.clock()-self.StableSince>=0.25
+                and (diagnostic.DragRequests or 0)-requestsBefore>=3 then
+                diagnostic.OwnershipWait=12-(deadline-os.clock())
+                return true
+            end
+            token:Sleep(0.05)
+        until os.clock()>=deadline
+        self:Stop()
+        error("Network ownership not confirmed within 12 seconds - piece skipped",0)
+    end
+    return control
+end
 function H:SawmillInputFrame(model,section,inlet)
     -- Match the inlet's actual orientation. Do not add a guessed 90-degree
     -- rotation; WoodSection and the model pivot need not share the same frame.
@@ -2704,13 +2842,16 @@ function H:MillDismemberPiece(state,job,token)
     job.InputVolume=volume job.Outputs={} job.MillStarted=os.clock()
     local before={}
     for _,item in ipairs(outputs:GetChildren()) do before[item]=true end
-    self:AcquireWood(model,part,token,job)
-    checkMill() checkDetached()
-    local drag=self:Remote("Interaction","ClientIsDragging")
+    local observeIntake=self:WatchMillIntake(model,part,logs,job,token)
+    local acquired,control=self:AcquireWood(model,part,token,job,observeIntake)
     local deadline=os.clock()+self.Config.MillTimeout
     local nextFeed,stableSince,lastOutputs=0,nil,nil
-    local handedOff=false
-    local observeIntake=self:WatchMillIntake(model,part,logs,job,token)
+    local handedOff=not acquired
+    local releaseStand
+    local function releasePosition()
+        if releaseStand then releaseStand() releaseStand=nil end
+    end
+    token:Finally(releasePosition)
     local function consumed()
         return not under(model,logs) or self:WoodVolume(model)<=0
     end
@@ -2721,20 +2862,40 @@ function H:MillDismemberPiece(state,job,token)
         if gone or observeIntake() or (job.FeedSent and not gone and self:WoodVolume(model)<volume-0.01) then
             handedOff=true
         end
-        if not handedOff and os.clock()>=nextFeed and (job.FeedAttempts or 0)<3 then
+        if handedOff then
+            control:Stop() releasePosition()
+        else
+            -- Maintain ClientIsDragging even while correctly aligned, and
+            -- recover near the actual piece if physics ownership is lost.
+            control:Pulse()
+            if control.Done then handedOff=true releasePosition()
+            elseif not control:Owns() then
+                releasePosition()
+                if not control:Acquire() then handedOff=true end
+                checkMill()
+                if observeIntake() then handedOff=true end
+                if handedOff then control:Stop() end
+            end
+        end
+        if not handedOff and os.clock()>=nextFeed and ((job.FeedAttempts or 0)<12 or not releaseStand) then
             checkDetached()
             assert(livePart(part) and under(part,model),"Input changed during placement")
             local aligned,distance,axisDot=self:SawmillInputError(part,inlet)
             job.InletError=distance job.InletAxisDot=axisDot
-            -- One initial handoff. Further placements only correct real drift;
-            -- never repeatedly reset an already aligned piece's velocity/position.
-            if not job.FeedSent or not aligned then
+            -- Approach/drag/verify first. Then move the character above the
+            -- sawmill and the controlled piece into the inlet without yielding.
+            if not releaseStand or not job.FeedSent or not aligned then
                 local target=self:SawmillInputFrame(model,part,inlet)
-                self:Teleport(inlet.CFrame+inlet.CFrame.RightVector*6+Vector3.new(0,2,0))
+                control:AssertOwned()
+                if not releaseStand then
+                    self:Teleport(self:SawmillStandFrame(mill,inlet))
+                    control:AssertOwned()
+                    releaseStand=self:HoldSawmillStand(token)
+                end
                 if not observeIntake() then
-                    checkMill() checkDetached()
-                    drag:FireServer(model)
-                    if not observeIntake() then
+                    checkMill() checkDetached() control:Pulse()
+                    control:AssertOwned()
+                    if (not job.FeedSent or not aligned) and (job.FeedAttempts or 0)<12 then
                         self:DampWood(model)
                         job.FeedSent=true
                         model:PivotTo(target)
@@ -2743,7 +2904,7 @@ function H:MillDismemberPiece(state,job,token)
                     end
                 end
             end
-            nextFeed=os.clock()+0.75
+            nextFeed=os.clock()+0.25
         end
         local candidates,total,observed={},0,{}
         for _,candidate in ipairs(outputs:GetChildren()) do
@@ -2906,9 +3067,10 @@ function H:BuildReport()
                 state.Phase,#state.Outputs,state.Small,state.Attached,state.RefinementAttempts or 0,state.Failures))
             for piece,job in ipairs(state.FeedJobs) do
                 table.insert(lines,string.format("Piece %d: %s",piece,job.Error or job.FeedState or (job.SkippedSmall and "Below 5 studs3" or "Pending")))
-                if job.FeedSent then
-                    table.insert(lines,string.format("Intake: placements=%d; offset=%.3f; axisDot=%.4f; handoff=%s",
-                        job.FeedAttempts or 0,job.InletError or -1,job.InletAxisDot or -1,tostring(job.IntakeObserved==true)))
+                if job.FeedSent or job.OwnershipAttempts then
+                    table.insert(lines,string.format("Intake: placements=%d; offset=%.3f; axisDot=%.4f; handoff=%s; dragRequests=%d; ownership=%s",
+                        job.FeedAttempts or 0,job.InletError or -1,job.InletAxisDot or -1,tostring(job.IntakeObserved==true),
+                        job.DragRequests or 0,job.NetworkStatus or "Not checked"))
                 end
             end
         end
@@ -2922,40 +3084,11 @@ function H:BuildReport()
     if self.Config.BotKey~="" then text=text:gsub(self.Config.BotKey:gsub("([^%w])","%%%1"),"[client key]") end
     return text
 end
--- Executor ownership checks are advisory. Ancestor's supplied implementation
--- effectively uses four TestPing replies instead. Confirm actual stage results
--- (separation, intake, output) rather than treating either signal as proof.
+-- Game Owner metadata and ping replies are not network ownership evidence.
 function H:AcquireWood(model,part,token,diagnostic,finished)
-    diagnostic=diagnostic or {}
-    local networkOwner=cap("isnetworkowner",isnetworkowner)
-    local drag=self:Remote("Interaction","ClientIsDragging")
-    local complete,confirmed=false,false
-    local lastDrag=-math.huge
-    local function refresh()
-        token:Check()
-        if finished and finished() then complete=true return end
-        assert(livePart(part) and under(part,model) and under(model,S.Workspace) and owned(model),
-            "Wood changed while acquiring control")
-        assert(not part.Anchored,"Selected wood is anchored")
-        local _,_,avatar=self:Character()
-        diagnostic.AvatarDistance=(avatar.Position-part.Position).Magnitude
-        if diagnostic.AvatarDistance>9 then self:Teleport(part.CFrame+Vector3.new(5,3,0)) end
-        if os.clock()-lastDrag>=0.15 then
-            drag:FireServer(model) lastDrag=os.clock() diagnostic.LastDrag=lastDrag
-        end
-        if networkOwner then
-            local ok,result=pcall(networkOwner,part)
-            if not ok then networkOwner=nil confirmed=false
-            else confirmed=result==true end
-        end
-        diagnostic.NetworkStatus=confirmed and "Executor confirmed" or "Unconfirmed - synchronizing"
-    end
-    refresh()
-    if complete then return false end
-    self:SyncPhysics(token,confirmed and 1 or 4,diagnostic,refresh)
-    if complete then return false end
-    diagnostic.NetworkStatus=confirmed and "Executor confirmed" or "Ancestor synchronization - result pending"
-    return true
+    local control=self:StartWoodControl(model,part,token,diagnostic,finished)
+    local acquired=control:Acquire()
+    return acquired,control
 end
 
 function H:PlankPlacement(plank,center)
