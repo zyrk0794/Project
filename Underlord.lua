@@ -1,6 +1,6 @@
--- Underlord Classic 1.2: standalone UI library.
+-- Velthra 1.3: standalone UI library; legacy profile compatibility retained.
 -- UI only; no game hooks, remotes, detection bypass, or external code downloads.
-local Underlord = { version = "Classic 1.2" }
+local Underlord = { version = "Velthra 1.3" }
 
 local HttpService = game:GetService("HttpService")
 local TextService = game:GetService("TextService")
@@ -35,7 +35,7 @@ local defaults = {
 	headerFont = Enum.Font.Code,
 	textSize = 13,
 	hoverDuration = 0.06,
-    glow = true, glowIntensity = 0.55,
+    glow = true, glowIntensity = 0.70, animations = true, animationSpeed = 1.2,
 	fadeOutDuration = 0.09,
 	fadeInDuration = 0.12,
 	toggleKey = Enum.KeyCode.RightShift,
@@ -488,7 +488,7 @@ local function buildHeader(window, options)
     local header = frame(window.root, "Header", { Size = UDim2.new(1, 0, 0, 27), Active = true })
     window.title = label(window, header, "", { Name = "Title", Position = UDim2.fromOffset(10, 0),
         Size = UDim2.new(1, -48, 1, 0), TextSize = 13, RichText = true })
-    window.titlePrefix, window.titleAccent = "UNDER", "LORD"
+    window.titlePrefix, window.titleAccent = "VEL", "THRA"
     window.titleVersion = options.subtitle or "BARRICADED"
     local hide = button(window, header, "-", { Name = "Hide", Position = UDim2.new(1, -29, 0, 3), Size = UDim2.fromOffset(23, 20) })
     textHover(window, hide)
@@ -520,8 +520,10 @@ local function buildWindow(window, parent, options)
 	shadow(window.host, 22, 7, 3, 0.25)
 	window.root = create("CanvasGroup", window.host, {
 		Name = "Window", BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 		BackgroundColor3 = window.theme.background, BackgroundTransparency = 0,
 	})
+	window.motionScale = create("UIScale", window.root, { Scale = 1 })
 	window.popupLayer = frame(window.host, "PopupLayer", { Size = UDim2.fromScale(1, 1), ZIndex = 300 })
 	window.visibilityCover = button(window, window.root, "", {
 		Name = "VisibilityCover", BackgroundTransparency = 1, BackgroundColor3 = window.theme.accent,
@@ -590,8 +592,12 @@ local function createField(window, parent, width, text, maxLength)
         TextStrokeTransparency = window.theme.glow == false and 1 or 0.96 - 0.25 * window.theme.glowIntensity, TextSize = window.theme.textSize,
 		AutoLocalize = false, TextScaled = false,
 		Text = limitText(text, maxLength), ClearTextOnFocus = false, MultiLine = false, TextWrapped = false,
+        ClipsDescendants = true, TextTruncate = Enum.TextTruncate.AtEnd, TextXAlignment = Enum.TextXAlignment.Left,
 	})
 	field:SetAttribute("MaxLength", maxLength)
+    create("UIPadding", field, { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4) })
+    connect(window, field.Focused, function() field.TextTruncate = Enum.TextTruncate.None end)
+    connect(window, field.FocusLost, function() field.TextTruncate = Enum.TextTruncate.AtEnd end)
 	connect(window, field:GetPropertyChangedSignal("Text"), function()
 		local limited = limitText(field.Text, maxLength)
 		if field.Text ~= limited then field.Text = limited end
@@ -1094,18 +1100,31 @@ Window.setVisible = function(self, isVisible)
     self.pointer = nil
     closePopup(self, true)
     if self.cancelKeyCapture then self.cancelKeyCapture() end
+    local focused = UserInputService:GetFocusedTextBox()
+    if focused and focused:IsDescendantOf(self.gui) then focused:ReleaseFocus() end
+    if not self.hiddenStrokes then
+        self.hiddenStrokes = {}
+        for _, object in ipairs(self.root:GetDescendants()) do
+            if object:IsA("UIStroke") then
+                self.hiddenStrokes[object] = object.Enabled ~= false
+                object.Enabled = false
+            end
+        end
+    end
     local shown = self.shownPosition or self.host.Position
-    local hidden = UDim2.new(shown.X.Scale, shown.X.Offset, shown.Y.Scale, shown.Y.Offset + 8)
+    local hidden = UDim2.new(shown.X.Scale, shown.X.Offset, shown.Y.Scale, shown.Y.Offset + 6)
     if isVisible and not self.host.Visible then
         self.host.Position, self.root.GroupTransparency = hidden, 1
+        self.motionScale.Scale = 0.985
     end
     self.host.Visible = true
-    self.popupLayer.Visible = isVisible
-    self.visibilityCover.Visible = not isVisible
+    self.popupLayer.Visible = false
+    self.visibilityCover.Visible = true
     self.isVisibilityAnimating = true
-    self.chrome.Visible = false
-    local base = 0.18
-    animate(self, self.host, { Position = isVisible and shown or hidden }, base)
+    self.chrome.Visible = true
+    local base = isVisible and 0.18 or 0.14
+    animate(self, self.host, { Position = isVisible and shown or hidden }, base, Enum.EasingStyle.Quint)
+    animate(self, self.motionScale, { Scale = isVisible and 1 or 0.985 }, base, Enum.EasingStyle.Quint)
     animate(self, self.root, { GroupTransparency = isVisible and 0 or 1 }, base)
     local function finish()
         if self.isDestroyed or self.visibilityRevision ~= revision then return end
@@ -1113,6 +1132,13 @@ Window.setVisible = function(self, isVisible)
         self.isVisibilityAnimating = false
         self.host.Visible = isVisible
         self.chrome.Visible = isVisible
+        self.popupLayer.Visible = isVisible
+        if isVisible and self.hiddenStrokes then
+            for stroke, enabled in pairs(self.hiddenStrokes) do
+                if stroke.Parent then stroke.Enabled = enabled end
+            end
+            self.hiddenStrokes = nil
+        end
         if isVisible then self.host.Position = self.shownPosition or shown end
         self.visibilityCover.Visible = false
     end
