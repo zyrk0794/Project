@@ -1,6 +1,6 @@
--- Velthra 1.4: standalone UI library; legacy profile compatibility retained.
+-- Velthra 1.5: standalone UI library; legacy profile compatibility retained.
 -- UI only; no game hooks, remotes, detection bypass, or external code downloads.
-local Underlord = { version = "Velthra 1.4" }
+local Underlord = { version = "Velthra 1.5" }
 
 local HttpService = game:GetService("HttpService")
 local TextService = game:GetService("TextService")
@@ -1101,15 +1101,8 @@ Window.setVisible = function(self, isVisible)
     if self.cancelKeyCapture then self.cancelKeyCapture() end
     local focused = UserInputService:GetFocusedTextBox()
     if focused and focused:IsDescendantOf(self.gui) then focused:ReleaseFocus() end
-    if not self.hiddenStrokes then
-        self.hiddenStrokes = {}
-        for _, object in ipairs(self.root:GetDescendants()) do
-            if object:IsA("UIStroke") then
-                self.hiddenStrokes[object] = object.Enabled ~= false
-                object.Enabled = false
-            end
-        end
-    end
+    -- Descendant borders stay in the same fading group as their frames/text.
+    -- Never reveal them separately at the end of the visibility transition.
     local shown = self.shownPosition or self.host.Position
     local hidden = UDim2.new(shown.X.Scale, shown.X.Offset, shown.Y.Scale, shown.Y.Offset + 6)
     if isVisible and not self.host.Visible then
@@ -1130,12 +1123,6 @@ Window.setVisible = function(self, isVisible)
         self.host.Visible = isVisible
         self.chrome.Visible = isVisible
         self.popupLayer.Visible = isVisible
-        if isVisible and self.hiddenStrokes then
-            for stroke, enabled in pairs(self.hiddenStrokes) do
-                if stroke.Parent then stroke.Enabled = enabled end
-            end
-            self.hiddenStrokes = nil
-        end
         if isVisible then self.host.Position = self.shownPosition or shown end
         self.visibilityCover.Visible = false
     end
