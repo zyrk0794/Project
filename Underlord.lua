@@ -1,6 +1,6 @@
--- Velthra 1.3: standalone UI library; legacy profile compatibility retained.
+-- Velthra 1.4: standalone UI library; legacy profile compatibility retained.
 -- UI only; no game hooks, remotes, detection bypass, or external code downloads.
-local Underlord = { version = "Velthra 1.3" }
+local Underlord = { version = "Velthra 1.4" }
 
 local HttpService = game:GetService("HttpService")
 local TextService = game:GetService("TextService")
@@ -523,7 +523,6 @@ local function buildWindow(window, parent, options)
         AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 		BackgroundColor3 = window.theme.background, BackgroundTransparency = 0,
 	})
-	window.motionScale = create("UIScale", window.root, { Scale = 1 })
 	window.popupLayer = frame(window.host, "PopupLayer", { Size = UDim2.fromScale(1, 1), ZIndex = 300 })
 	window.visibilityCover = button(window, window.root, "", {
 		Name = "VisibilityCover", BackgroundTransparency = 1, BackgroundColor3 = window.theme.accent,
@@ -1115,7 +1114,6 @@ Window.setVisible = function(self, isVisible)
     local hidden = UDim2.new(shown.X.Scale, shown.X.Offset, shown.Y.Scale, shown.Y.Offset + 6)
     if isVisible and not self.host.Visible then
         self.host.Position, self.root.GroupTransparency = hidden, 1
-        self.motionScale.Scale = 0.985
     end
     self.host.Visible = true
     self.popupLayer.Visible = false
@@ -1124,7 +1122,6 @@ Window.setVisible = function(self, isVisible)
     self.chrome.Visible = true
     local base = isVisible and 0.18 or 0.14
     animate(self, self.host, { Position = isVisible and shown or hidden }, base, Enum.EasingStyle.Quint)
-    animate(self, self.motionScale, { Scale = isVisible and 1 or 0.985 }, base, Enum.EasingStyle.Quint)
     animate(self, self.root, { GroupTransparency = isVisible and 0 or 1 }, base)
     local function finish()
         if self.isDestroyed or self.visibilityRevision ~= revision then return end
@@ -1778,6 +1775,25 @@ Window.loadConfig = function(self, name, shouldNotify)
 	local isSuccess, json = pcall(self.storage.read, "Underlord_" .. name .. ".json")
 	if not isSuccess then return false, tostring(json) end
 	return self:importConfig(json, shouldNotify)
+end
+
+Window.deleteConfig = function(self, name)
+    if type(name) ~= "string" or not name:match("^[%w_-]+$") then
+        return false, "Invalid profile name."
+    end
+    if not self.storage or type(self.storage.delete) ~= "function" then
+        return false, "Profile deletion unavailable: delfile is required."
+    end
+    local path = "Underlord_" .. name .. ".json"
+    if type(self.storage.exists) == "function" then
+        local checked, exists = pcall(self.storage.exists, path)
+        if not checked then return false, tostring(exists) end
+        if not exists then return false, "Profile not found." end
+    end
+    local called, result, message = pcall(self.storage.delete, path)
+    if not called then return false, tostring(result) end
+    if result == false then return false, tostring(message or "Could not delete profile.") end
+    return true
 end
 
 Window.createToggleButton = function(self)
