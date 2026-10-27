@@ -1,6 +1,6 @@
--- Velthra 1.5: standalone UI library; legacy profile compatibility retained.
+-- Velthra 1.6: standalone UI library; legacy profile compatibility retained.
 -- UI only; no game hooks, remotes, detection bypass, or external code downloads.
-local Underlord = { version = "Velthra 1.5" }
+local Underlord = { version = "Velthra 1.6" }
 
 local HttpService = game:GetService("HttpService")
 local TextService = game:GetService("TextService")
@@ -102,7 +102,11 @@ local function animate(window, instance, properties, duration, easingStyle, easi
 		previous:Cancel()
 	end
 
-	local tween = TweenService:Create(instance,
+    if window.instantControlUpdates then
+        for property, value in pairs(properties) do instance[property] = value end
+        duration = 0
+    end
+    local tween = TweenService:Create(instance,
 		TweenInfo.new(motionDuration(window, duration or window.theme.hoverDuration), easingStyle or Enum.EasingStyle.Quad, easingDirection or Enum.EasingDirection.Out),
 		properties)
 
@@ -1290,7 +1294,7 @@ Section.addToggle = function(self, options)
 	local handle = { instance = control }
 	function handle:set(nextState, shouldNotify)
 		nextState = nextState == true
-		if nextState == isEnabled then return end
+		if nextState == isEnabled then refresh(); return end
 		isEnabled = nextState
 		refresh()
 		if shouldNotify ~= false then dispatch(options.callback, isEnabled) end
@@ -1525,25 +1529,50 @@ Window.importConfig = function(self, json, shouldNotify)
 		return updates
 	end)
 	if not isSuccess then return false, tostring(result) end
-	for _, update in ipairs(result) do update.control:set(update.setting, shouldNotify == true) end
-	return true
+    local previous = self.instantControlUpdates
+    self.instantControlUpdates = true
+    local applied, message = pcall(function()
+        for _, update in ipairs(result) do update.control:set(update.setting, shouldNotify == true) end
+    end)
+    self.instantControlUpdates = previous
+    if not applied then return false, tostring(message) end
+    return true
 end
 
 Window.reset = function(self, shouldNotify)
 	for _, control in ipairs(self.controls) do control:reset(shouldNotify) end
 end
 
+Window.refreshControls = function(self)
+    if self.isDestroyed then return false, "Window has been destroyed." end
+    local previous = self.instantControlUpdates
+    self.instantControlUpdates = true
+    local refreshed, message = pcall(function()
+        for _, control in ipairs(self.controls) do
+            if not control.isDestroyed and control.get and control.set then
+                control:set(control:get(), false)
+            end
+        end
+    end)
+    self.instantControlUpdates = previous
+    if not refreshed then return false, tostring(message) end
+    return true
+end
+
 Window.setAccent = function(self, accent)
 	assert(typeof(accent) == "Color3", "Expected Color3.")
 	if self.isDestroyed then return end
 	local previous = self.theme.accent
+	if previous == accent then return end
 	self.theme.accent = accent
 	for _, instance in ipairs(self.gui:GetDescendants()) do
 		local properties = self.targets[instance] or {}
 		local replacements = {}
 		for _, property in ipairs({ "Color", "BackgroundColor3", "TextColor3", "ImageColor3", "TextStrokeColor3" }) do
 			local isReadable, current = pcall(function() return instance[property] end)
-			if instance.Name ~= "Swatch" and isReadable and (current == previous or properties[property] == previous) then
+			local intended = properties[property]
+            if intended == nil then intended = current end
+            if instance.Name ~= "Swatch" and isReadable and intended == previous then
 				replacements[property] = accent
 			end
 		end
