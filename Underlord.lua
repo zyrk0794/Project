@@ -1,6 +1,6 @@
--- Velthra 1.6: standalone UI library; legacy profile compatibility retained.
+-- Velthra 1.7: standalone UI library; legacy profile compatibility retained.
 -- UI only; no game hooks, remotes, detection bypass, or external code downloads.
-local Underlord = { version = "Velthra 1.6" }
+local Underlord = { version = "Velthra 1.7" }
 
 local HttpService = game:GetService("HttpService")
 local TextService = game:GetService("TextService")
@@ -619,6 +619,8 @@ local function createSliderView(section, options)
     local field = createField(window, row, 43, "0", 24)
     field.Position = UDim2.new(1, -1, 0, 9)
     field.Size = UDim2.fromOffset(43, 16)
+    field.TextXAlignment = Enum.TextXAlignment.Center
+    field.TextYAlignment = Enum.TextYAlignment.Center
     local hitbox = button(window, row, "", { Name = "Slider", Position = UDim2.fromOffset(1, 21), Size = UDim2.new(1, -2, 0, 11),
         BackgroundTransparency = 0, BackgroundColor3 = Color3.fromRGB(26, 26, 29) })
     outline(hitbox, window.theme.outline)
